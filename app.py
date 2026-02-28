@@ -7,12 +7,17 @@ st.set_page_config(page_title="APR分配報告ツール", page_icon="💰")
 st.title("💰 APR収益分配・メール報告")
 st.write("今日のAPRを入力して、3人にメールで報告します。")
 
-# --- 設定項目（サイドバー） ---
+# # --- 設定項目（Secretsから自動読み込み） ---
 with st.sidebar:
     st.header("メール送信設定")
-    sender_email = st.text_input("あなたのGmailアドレス", placeholder="example@gmail.com")
-    sender_password = st.text_input("アプリパスワード (16桁)", type="password", placeholder="xxxx xxxx xxxx xxxx")
-    st.info("Googleアカウントのセキュリティ設定から取得した16桁のコードを入力してください。")
+    # Secretsがあればそれを使い、なければ空欄にする設定
+    default_sender = st.secrets.get("SENDER_EMAIL", "")
+    default_password = st.secrets.get("SENDER_PASSWORD", "")
+    default_recipients = st.secrets.get("RECIPIENTS", "person1@example.com, person2@example.com, person3@example.com")
+
+    sender_email = st.text_input("あなたのGmailアドレス", value=default_sender)
+    sender_password = st.text_input("アプリパスワード (16桁)", value=default_password, type="password")
+    emails_input = st.text_area("報告先メールアドレス", value=default_recipients)
 
 # --- メイン入力エリア ---
 st.subheader("計算データ")
