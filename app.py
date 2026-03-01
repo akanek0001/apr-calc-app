@@ -6,74 +6,93 @@ import pandas as pd
 from datetime import datetime
 
 # --- ページ設定 ---
-st.set_page_config(page_title="APR分配報告ツール", page_icon="💰")
-st.title("💰 APR収益分配・報告 & 記録")
+st.set_page_config(page_title="マルチプロジェクトAPR管理", page_icon="🏦")
+st.title("🏦 プロジェクト別 APR報告 & 記録")
 
 # --- Googleスプレッドシート接続 ---
 try:
     conn = st.connection("gsheets", type=GSheetsConnection)
 except Exception as e:
-    st.error("Googleスプレッドシートへの接続に失敗しました。Secretsの設定を確認してください。")
+    st.error("Secretsまたはスプレッドシートへの接続を確認してください。")
     st.stop()
 
-# --- 設定項目（Secretsから自動読み込み） ---
+# --- プロジェクト設定の読み込み ---
+try:
+    settings_df = conn.read(worksheet="Settings")
+except Exception as e:
+    st.error("Settingsシートが見つかりません。")
+    st.stop()
+
+# --- サイドバー：プロジェクト切り替え ---
 with st.sidebar:
-    st.header("メール送信設定")
-    default_sender = st.secrets.get("SENDER_EMAIL", "")
-    default_password = st.secrets.get("SENDER_PASSWORD", "")
-    default_recipients = st.secrets.get("RECIPIENTS", "person1@example.com, person2@example.com, person3@example.com")
+    st.header("📁 プロジェクト選択")
+    project_list = settings_df["Project_Name"].tolist()
+    selected_project_name = st.selectbox("運用中のプロジェクトを選択", project_list)
+    
+    # 選択されたプロジェクトの情報を抽出
+    p_info = settings_df[settings_df["Project_Name"] == selected_project_name].iloc[0]
+    
+    st.divider()
+    st.header("📧 メール認証情報")
+    # ここは共通の送信元情報をSecretsから取得
+    sender_email = st.text_input("送信元Gmail", value=st.secrets.get("SENDER_EMAIL", ""))
+    sender_password = st.text_input("アプリパスワード", type="password", value=st.secrets.get("SENDER_PASSWORD", ""))
 
-    sender_email = st.text_input("あなたのGmailアドレス", value=default_sender)
-    sender_password = st.text_input("アプリパスワード", value=default_password, type="password")
-    emails_input = st.text_area("報告先メールアドレス", value=default_recipients)
-    recipient_emails = [e.strip() for e in emails_input.split(",")]
+# --- メイン画面：選択されたプロジェクトの情報を表示 ---
+st.subheader(f"📍 現在のプロジェクト: {selected_project_name}")
 
-# --- メイン入力エリア ---
-st.subheader("計算データ")
-col1, col2 = st.columns(2)
-with col1:
-    principal = st.number_input("運用元本 ($)", value=14148.0, step=1.0)
-with col2:
-    today_apr = st.number_input("本日のAPR (%)", value=297.23, step=0.01)
+col_a, col_b = st.columns(2)
+with col_a:
+    # 設定値からデフォルトを読み込みつつ、微調整も可能
+    principal = st.number_input("運用元本 ($)", value=float(p_info["Principal"]), step=100.0)
+with col_b:
+    num_people = st.number_input("分配人数", value=int(p_info["Num_People"]), min_value=1)
 
-# --- 計算ロジック ---
+today_apr = st.number_input("本日のAPR (%)", value=297.23, step=0.01)
+
+# --- 計算 ---
 total_daily_yield = principal * (today_apr / 100) / 365
-split_amount = total_daily_yield / 3
+split_amount = total_daily_yield / num_people
 
 st.divider()
-st.write("### 送信・記録内容のプレビュー")
-st.info(f"全体の本日収益: **${total_daily_yield:,.2f}**\n\n1人あたりの分配額: **${split_amount:,.2f}**")
+st.metric(label="本日の総収益", value=f"${total_daily_yield:,.2f}")
+st.metric(label=f"1人あたりの配分 ({num_people}名)", value=f"${split_amount:,.2f}")
 
-# --- 送信＆記録ボタン ---
-if st.button("メール送信 ＆ シートに記録"):
+# 送信先メールアドレスの確認
+recipient_emails = [e.strip() for e in str(p_info["Recipients"]).split(",")]
+st.write(f"📩 送信先: `{', '.join(recipient_emails)}`")
+
+# --- 実行ボタン ---
+if st.button(f"{selected_project_name} の報告を実行"):
     try:
         # 1. メール送信
-        subject = f"Profit Report: {today_apr}%"
-        body = f"Daily Profit Report\n\nTotal: ${total_daily_yield:,.2f}\nEach: ${split_amount:,.2f}\nAPR: {today_apr}%"
+        subject = f"【{selected_project_name}】Profit Report: {today_apr}%"
+        body = f"Project: {selected_project_name}\nTotal Profit: ${total_daily_yield:,.2f}\nSplit: ${split_amount:,.2f}\nAPR: {today_apr}%"
         full_message = f"From: {sender_email}\r\nTo: {', '.join(recipient_emails)}\r\nSubject: {subject}\r\nDate: {formatdate(localtime=True)}\r\n\r\n{body}"
-
+        
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(sender_email, sender_password)
-            server.sendmail(sender_email, recipient_emails, full_message.encode("ascii", "ignore"))
+            server.sendmail(sender_email, recipient_emails, full_message.encode("utf-8", "ignore"))
         
-        # 2. スプレッドシート記録
+        # 2. プロジェクト専用のシートに記録
         new_row = pd.DataFrame([{
             "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "Principal": principal,
             "APR": today_apr,
             "Total_Yield": round(total_daily_yield, 2),
             "Split_Amount": round(split_amount, 2)
         }])
-
-        # 既存データの取得（空の場合は新規作成）
+        
+        # プロジェクト名と同じ名前のシートを読み書き
         try:
-            existing_data = conn.read()
+            existing_data = conn.read(worksheet=selected_project_name)
             updated_data = pd.concat([existing_data, new_row], ignore_index=True)
         except:
             updated_data = new_row
+            
+        conn.update(worksheet=selected_project_name, data=updated_data)
         
-        conn.update(data=updated_data)
-
-        st.success("✅ メール送信とシートへの記録が完了しました！")
+        st.success(f"✅ {selected_project_name} の記録と送信が完了しました！")
         st.balloons()
         
     except Exception as e:
