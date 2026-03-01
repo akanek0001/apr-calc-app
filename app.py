@@ -19,8 +19,19 @@ except Exception as e:
 # --- プロジェクト設定の読み込み ---
 try:
     settings_df = conn.read(worksheet="Settings")
+    # すべての列名の前後スペースを消し、小文字に統一して判定しやすくする
+    settings_df.columns = settings_df.columns.str.strip()
+    
+    # もし Project_Name という列名がなければ、1番左の列を使うようにする
+    if "Project_Name" in settings_df.columns:
+        project_col = "Project_Name"
+    else:
+        # 安全策：列名が何であれ、1番目の列をプロジェクト名として扱う
+        project_col = settings_df.columns[0]
+        
+    project_list = settings_df[project_col].tolist()
 except Exception as e:
-    st.error("Settingsシートが見つかりません。")
+    st.error(f"Settingsシートの読み込みに失敗しました: {e}")
     st.stop()
 
 # --- サイドバー：プロジェクト切り替え ---
