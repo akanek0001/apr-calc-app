@@ -56,8 +56,13 @@ try:
     
     # --- 列名に頼らず「場所(列番号)」で取得 ---
     # 1列目(B):人数, 3列目(D):元本, 4列目(E):率, 5列目(F):Wallet, 2列目(C):メール
-    num_people = safe_int(p_info.iloc[1], 1)
+    #num_people = safe_int(p_info.iloc[1], 1)
 
+# --- 人数を強制的に「1人」に固定します ---
+num_people = 1 
+
+
+    
     base_principals = [safe_float(p) for p in split_val(p_info.iloc[3], num_people)]
     rate_list = [safe_float(r, 1.0) for r in split_val(p_info.iloc[4], num_people)]
     wallet_list = split_val(p_info.iloc[5], num_people)
