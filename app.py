@@ -58,9 +58,6 @@ try:
     # 1列目(B):人数, 3列目(D):元本, 4列目(E):率, 5列目(F):Wallet, 2列目(C):メール
     #num_people = safe_int(p_info.iloc[1], 1)
 
-# --- 人数を強制的に「1人」に固定します ---
-num_people = 1 
-
 
     
     base_principals = [safe_float(p) for p in split_val(p_info.iloc[3], num_people)]
