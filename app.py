@@ -1,121 +1,105 @@
 import streamlit as st
-import smtplib
-from email.utils import formatdate
 from streamlit_gsheets import GSheetsConnection
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 
-# --- ページ設定 ---
-st.set_page_config(page_title="マルチプロジェクトAPR管理", page_icon="🏦")
-st.title("🏦 プロジェクト別 APR報告 & 記録")
+st.set_page_config(page_title="複利元本推移管理", page_icon="📈")
+st.title("📈 複利運用・元本推移管理")
 
-# --- Googleスプレッドシート接続 ---
+# --- 接続設定 ---
 try:
     conn = st.connection("gsheets", type=GSheetsConnection)
-except Exception as e:
-    st.error("Secretsまたはスプレッドシートへの接続を確認してください。")
-    st.stop()
-
-# --- プロジェクト設定の読み込み ---
-# --- プロジェクト設定の読み込み ---
-try:
     settings_df = conn.read(worksheet="Settings")
-    
-    # 【デバッグ用】実際に読み込めている列名を画面に表示（確認したら消せます）
-    if settings_df.empty:
-        st.error("Settingsシートが空っぽです。1行目に見出し、2行目にデータを入れてください。")
-        st.stop()
-    
-    # 全ての列名から前後の空白を除去
     settings_df.columns = [str(c).strip() for c in settings_df.columns]
-    
-    # Project_Name という列がなくてもエラーにせず、一番左の列を使う
-    available_columns = settings_df.columns.tolist()
-    
-    if "Project_Name" in available_columns:
-        project_col = "Project_Name"
-    else:
-        # 見つからない場合は一番左の列を「プロジェクト名」とみなす
-        project_col = available_columns[0]
-        st.warning(f"『Project_Name』列が見つからないため、代わりに『{project_col}』列を使用します。")
-        
-    project_list = settings_df[project_col].astype(str).tolist()
-
+    p_col = settings_df.columns[0]
+    project_list = settings_df[p_col].astype(str).tolist()
 except Exception as e:
-    st.error(f"スプレッドシートの読み込みに失敗しました。シート名が『Settings』であるか確認してください。エラー詳細: {e}")
+    st.error("設定シートの読み込みに失敗しました。")
     st.stop()
 
-# --- サイドバー：プロジェクト切り替え ---
-with st.sidebar:
-    st.header("📁 プロジェクト選択")
-    project_list = settings_df["Project_Name"].tolist()
-    selected_project_name = st.selectbox("運用中のプロジェクトを選択", project_list)
+# --- プロジェクト選択 ---
+selected_project = st.sidebar.selectbox("プロジェクトを選択", project_list)
+p_info = settings_df[settings_df[p_col] == selected_project].iloc[0]
+
+# 設定パース用関数
+def split_val(val): return [x.strip() for x in str(val).split(",") if x.strip()]
+
+base_principal = float(p_info.get("Principal", 0.0))
+num_people = int(p_info.get("Num_People", 1))
+apr_list = [float(a) for a in split_val(p_info.get("Individual_APRs", ""))]
+comp_list = [c.upper() == "TRUE" for c in split_val(p_info.get("Individual_Compounding", ""))]
+
+# --- 履歴データの読み込み ---
+try:
+    hist_data = conn.read(worksheet=selected_project)
+    hist_data["Date"] = pd.to_datetime(hist_data["Date"])
+except:
+    hist_data = pd.DataFrame()
+
+# --- 1. 本日の元本組み込み計算 ---
+st.subheader("📅 本日の元本と収益")
+
+indiv_base_p = base_principal / num_people
+current_principals = []
+today_yields = []
+
+for i in range(num_people):
+    unpaid_yield = 0.0
+    if comp_list[i] and not hist_data.empty:
+        # Paid_Flagsが0（未払い）の収益を合計して元本に組み込む
+        for _, row in hist_data.iterrows():
+            flags = str(row["Paid_Flags"]).split(",")
+            if i < len(flags) and flags[i] == "0":
+                unpaid_yield += float(str(row["Breakdown"]).split(",")[i])
     
-    # 選択されたプロジェクトの情報を抽出
-    p_info = settings_df[settings_df["Project_Name"] == selected_project_name].iloc[0]
+    current_p = indiv_base_p + unpaid_yield
+    current_principals.append(current_p)
     
-    st.divider()
-    st.header("📧 メール認証情報")
-    # ここは共通の送信元情報をSecretsから取得
-    sender_email = st.text_input("送信元Gmail", value=st.secrets.get("SENDER_EMAIL", ""))
-    sender_password = st.text_input("アプリパスワード", type="password", value=st.secrets.get("SENDER_PASSWORD", ""))
+    # 収益計算
+    daily_y = (current_p * (apr_list[i] / 100)) / 365
+    today_yields.append(round(daily_y, 4))
 
-# --- メイン画面：選択されたプロジェクトの情報を表示 ---
-st.subheader(f"📍 現在のプロジェクト: {selected_project_name}")
+total_current_p = sum(current_principals)
+total_today_yield = sum(today_yields)
 
-col_a, col_b = st.columns(2)
-with col_a:
-    # 設定値からデフォルトを読み込みつつ、微調整も可能
-    principal = st.number_input("運用元本 ($)", value=float(p_info["Principal"]), step=100.0)
-with col_b:
-    num_people = st.number_input("分配人数", value=int(p_info["Num_People"]), min_value=1)
+st.metric("本日の計算元本合計 (組み込み後)", f"${total_current_p:,.2f}", 
+          delta=f"+${total_current_p - base_principal:,.2f} (累計組み込み額)")
 
-today_apr = st.number_input("本日のAPR (%)", value=297.23, step=0.01)
-
-# --- 計算 ---
-total_daily_yield = principal * (today_apr / 100) / 365
-split_amount = total_daily_yield / num_people
+if st.button("本日の収益を確定・記録する"):
+    new_row = pd.DataFrame([{
+        "Date": datetime.now().strftime("%Y-%m-%d"),
+        "Principal_Used": round(total_current_p, 2),
+        "Compounded_Total": round(total_current_p - base_principal, 2), # 元本の増加分
+        "Breakdown": ", ".join(map(str, today_yields)),
+        "Total_Yield": round(total_today_yield, 4),
+        "Paid_Flags": ",".join(["0"] * num_people)
+    }])
+    updated_hist = pd.concat([hist_data, new_row], ignore_index=True)
+    conn.update(worksheet=selected_project, data=updated_hist)
+    st.success("記録完了しました！")
+    st.rerun()
 
 st.divider()
-st.metric(label="本日の総収益", value=f"${total_daily_yield:,.2f}")
-st.metric(label=f"1人あたりの配分 ({num_people}名)", value=f"${split_amount:,.2f}")
 
-# 送信先メールアドレスの確認
-recipient_emails = [e.strip() for e in str(p_info["Recipients"]).split(",")]
-st.write(f"📩 送信先: `{', '.join(recipient_emails)}`")
+# --- 2. 週単位の元本推移確認 (ここが追加ポイント) ---
+st.subheader("📊 週単位の元本増加レポート")
 
-# --- 実行ボタン ---
-if st.button(f"{selected_project_name} の報告を実行"):
-    try:
-        # 1. メール送信
-        subject = f"【{selected_project_name}】Profit Report: {today_apr}%"
-        body = f"Project: {selected_project_name}\nTotal Profit: ${total_daily_yield:,.2f}\nSplit: ${split_amount:,.2f}\nAPR: {today_apr}%"
-        full_message = f"From: {sender_email}\r\nTo: {', '.join(recipient_emails)}\r\nSubject: {subject}\r\nDate: {formatdate(localtime=True)}\r\n\r\n{body}"
-        
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(sender_email, sender_password)
-            server.sendmail(sender_email, recipient_emails, full_message.encode("utf-8", "ignore"))
-        
-        # 2. プロジェクト専用のシートに記録
-        new_row = pd.DataFrame([{
-            "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "Principal": principal,
-            "APR": today_apr,
-            "Total_Yield": round(total_daily_yield, 2),
-            "Split_Amount": round(split_amount, 2)
-        }])
-        
-        # プロジェクト名と同じ名前のシートを読み書き
-        try:
-            existing_data = conn.read(worksheet=selected_project_name)
-            updated_data = pd.concat([existing_data, new_row], ignore_index=True)
-        except:
-            updated_data = new_row
-            
-        conn.update(worksheet=selected_project_name, data=updated_data)
-        
-        st.success(f"✅ {selected_project_name} の記録と送信が完了しました！")
-        st.balloons()
-        
-    except Exception as e:
-        st.error(f"エラーが発生しました: {e}")
+if not hist_data.empty:
+    # 日付でグルーピング（週単位：月曜始まり）
+    report_df = hist_data.copy()
+    report_df['Week'] = report_df['Date'].dt.to_period('W').apply(lambda r: r.start_time)
+    
+    # 週ごとの最終的な元本と、その週の総収益を算出
+    weekly_summary = report_df.groupby('Week').agg({
+        'Principal_Used': 'last',      # その週の終わりの元本額
+        'Total_Yield': 'sum'           # その週に発生した収益合計
+    }).sort_index(ascending=False)
+    
+    # 前週からの増加額を計算
+    weekly_summary['Weekly_Increase'] = weekly_summary['Principal_Used'].diff(periods=-1)
+    
+    # 表示用の整形
+    weekly_summary.columns = ["週末時点の元本", "週間の発生収益", "前週比(元本増加)"]
+    st.table(weekly_summary.head(12).style.format("${:,.2f}"))
+else:
+    st.info("データが蓄積されると、ここに週次レポートが表示されます。")
