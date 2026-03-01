@@ -17,21 +17,32 @@ except Exception as e:
     st.stop()
 
 # --- プロジェクト設定の読み込み ---
+# --- プロジェクト設定の読み込み ---
 try:
     settings_df = conn.read(worksheet="Settings")
-    # すべての列名の前後スペースを消し、小文字に統一して判定しやすくする
-    settings_df.columns = settings_df.columns.str.strip()
     
-    # もし Project_Name という列名がなければ、1番左の列を使うようにする
-    if "Project_Name" in settings_df.columns:
+    # 【デバッグ用】実際に読み込めている列名を画面に表示（確認したら消せます）
+    if settings_df.empty:
+        st.error("Settingsシートが空っぽです。1行目に見出し、2行目にデータを入れてください。")
+        st.stop()
+    
+    # 全ての列名から前後の空白を除去
+    settings_df.columns = [str(c).strip() for c in settings_df.columns]
+    
+    # Project_Name という列がなくてもエラーにせず、一番左の列を使う
+    available_columns = settings_df.columns.tolist()
+    
+    if "Project_Name" in available_columns:
         project_col = "Project_Name"
     else:
-        # 安全策：列名が何であれ、1番目の列をプロジェクト名として扱う
-        project_col = settings_df.columns[0]
+        # 見つからない場合は一番左の列を「プロジェクト名」とみなす
+        project_col = available_columns[0]
+        st.warning(f"『Project_Name』列が見つからないため、代わりに『{project_col}』列を使用します。")
         
-    project_list = settings_df[project_col].tolist()
+    project_list = settings_df[project_col].astype(str).tolist()
+
 except Exception as e:
-    st.error(f"Settingsシートの読み込みに失敗しました: {e}")
+    st.error(f"スプレッドシートの読み込みに失敗しました。シート名が『Settings』であるか確認してください。エラー詳細: {e}")
     st.stop()
 
 # --- サイドバー：プロジェクト切り替え ---
