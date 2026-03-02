@@ -5,7 +5,7 @@ from datetime import datetime
 import requests
 import json
 import re
- 
+
 # --- 1. ページ設定 ---
 st.set_page_config(page_title="APR管理システム", layout="wide", page_icon="🏦")
 
@@ -39,13 +39,15 @@ def send_line_multimedia(token, user_id, text, image_url=None):
     try:
         res = requests.post(url, headers=headers, data=json.dumps(payload), timeout=10)
         return res.status_code
-    except: return 500
+    except Exception as e:
+        return str(e)
 
 # --- 3. メインロジック ---
-st.title("🏦 APR管理システム（画像投稿完結型）")
+st.title("🏦 APR管理システム（送信デバッグ版）")
 
 try:
     conn = st.connection("gsheets", type=GSheetsConnection)
+    # API制限回避のため ttl=60 に設定
     settings_df = conn.read(worksheet="Settings", ttl=60)
     line_id_df = conn.read(worksheet="LineID", ttl=60)
     
@@ -63,18 +65,20 @@ try:
     rate_list = [to_f(r) for r in split_val(p_info.iloc[4], num_people)]
     is_compound = str(p_info.iloc[5]).upper() in ["TRUE", "はい", "YES", "1"]
 
-    # LINE ID取得
+    # LINE ID取得 (LineIDシートからUから始まるIDを探す)
     user_ids = []
     if not line_id_df.empty:
-        user_ids = line_id_df.iloc[:, -1].dropna().unique().tolist()
+        # シート全体から "U" で始まる文字列を検索
+        all_cells = line_id_df.values.flatten().astype(str)
+        user_ids = [str(x).strip() for x in all_cells if str(x).startswith('U')]
 
     # 履歴取得
     try:
-        hist_df = conn.read(worksheet=selected_project, ttl=0)
+        hist_df = conn.read(worksheet=selected_project, ttl=60)
     except:
         hist_df = pd.DataFrame(columns=["Date", "Type", "Total_Amount", "Breakdown", "Note"])
 
-    # 累計計算
+    # 累計計算ロジック (簡略化)
     total_earned = [0.0] * num_people
     total_withdrawn = [0.0] * num_people
     if not hist_df.empty:
@@ -96,55 +100,53 @@ try:
         st.subheader("本日の報告作成")
         total_apr = st.number_input("本日のAPR (%)", value=100.0)
         
-        # --- 画像アップロード & URL変換 ---
         uploaded_file = st.file_uploader("運用画面のスクショをアップロード", type=['png', 'jpg', 'jpeg'])
         
-        final_img_url = None
         if uploaded_file:
             st.image(uploaded_file, caption="プレビュー", width=300)
             if st.button("画像を確定してURL生成"):
-                with st.spinner("LINE用に画像を変換中..."):
-                    try:
-                        api_key = st.secrets["imgbb"]["api_key"]
-                        files = {"image": uploaded_file.getvalue()}
-                        res = requests.post("https://api.imgbb.com/1/upload", params={"key": api_key}, files=files)
-                        final_img_url = res.json()["data"]["url"]
-                        st.session_state["img_url"] = final_img_url
-                        st.success("画像の準備が整いました！")
-                    except:
-                        st.error("APIキーが無効、または未設定です。Secretsを確認してください。")
+                try:
+                    api_key = st.secrets["imgbb"]["api_key"]
+                    files = {"image": uploaded_file.getvalue()}
+                    res = requests.post("https://api.imgbb.com/1/upload", params={"key": api_key}, files=files)
+                    st.session_state["img_url"] = res.json()["data"]["url"]
+                    st.success(f"画像準備完了: {st.session_state['img_url']}")
+                except:
+                    st.error("ImgBBの設定エラー")
 
-        # 送信ボタン
-        if st.button("収益保存 ＆ 画像付きLINE一斉通知"):
+        if st.button("収益保存 ＆ LINE送信実行"):
             today_yields = [round((p * (total_apr * 0.67 * rate_list[i] / 100)) / 365, 4) for i, p in enumerate(calc_principals)]
             
-            # 1. 履歴保存
+            # 保存
             new_row = pd.DataFrame([{"Date": datetime.now().strftime("%Y-%m-%d"), "Type": "収益", "Total_Amount": sum(today_yields), "Breakdown": ",".join(map(str, today_yields)), "Note": f"APR:{total_apr}%"}])
             updated_hist = pd.concat([hist_df, new_row], ignore_index=True)
             conn.update(worksheet=selected_project, data=updated_hist)
             
-            # 2. LINE送信
-            if "line" in st.secrets:
+            # --- 送信デバッグログを表示 ---
+            st.divider()
+            st.write("🔍 **送信ログ:**")
+            
+            if "line" not in st.secrets:
+                st.error("Secretsに [line] セクションが見つかりません。")
+            else:
                 token = st.secrets["line"]["channel_access_token"]
-                now_str = datetime.now().strftime("%Y/%m/%d %H:%M")
-                msg = f"🏦 【運用収益報告書】\nプロジェクト: {selected_project}\n日時: {now_str}\n"
-                msg += f"━━━━━━━━━━━━━━\n本日のAPR: {total_apr}%\n"
-                for i in range(num_people):
-                    msg += f"・No.{i+1}: +${today_yields[i]:,.4f} (元本:${calc_principals[i]+today_yields[i]:,.2f})\n"
-                msg += f"━━━━━━━━━━━━━━"
+                msg = f"🏦 【運用報告】\nAPR: {total_apr}%\n" + "\n".join([f"No.{i+1}: +${v:,.4f}" for i,v in enumerate(today_yields)])
+                img_url = st.session_state.get("img_url")
 
-                img_to_send = st.session_state.get("img_url")
-                success = 0
+                if not user_ids:
+                    st.warning("LineIDシートから 'U' で始まるIDが見つかりませんでした。")
+                
+                success_count = 0
                 for uid in user_ids:
-                    if send_line_multimedia(token, uid, msg, img_to_send) == 200:
-                        success += 1
-                st.success(f"報告完了！ {success}名に送信しました。")
-                if "img_url" in st.session_state: del st.session_state["img_url"]
+                    status = send_line_multimedia(token, uid, msg, img_url)
+                    if status == 200:
+                        st.write(f"✅ 送信成功: {uid}")
+                        success_count += 1
+                    else:
+                        st.error(f"❌ 送信失敗: {uid} (エラーコード: {status})")
+                
+                st.success(f"最終結果: {success_count}名に送信完了")
             st.rerun()
-
-    with tab2:
-        st.subheader("出金精算")
-        # (前回同様の出金ロジック...)
 
 except Exception as e:
     st.error(f"システムエラー: {e}")
