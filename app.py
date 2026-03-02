@@ -4,40 +4,41 @@ import requests
 import smtplib
 from email.mime.text import MIMEText
 from email.utils import formatdate
-from datetime import datetime
 import re
 
 # --- ページ設定 ---
 st.set_page_config(page_title="APR運用管理システム", layout="wide")
 
-# --- 補助関数 ---
+# --- 関数群 ---
 def to_f(val):
     if pd.isna(val): return 0.0
     try:
-        return float(str(val).replace(',','').replace('$','').replace('%','').strip())
+        clean = str(val).replace(',','').replace('$','').replace('%','').strip()
+        return float(clean) if clean else 0.0
     except: return 0.0
 
 def split_val(val, n):
-    if pd.isna(val) or str(val).strip() == "": return ["-"] * n
+    if pd.isna(val) or str(val).strip() == "": return ["0"] * n
     items = [x.strip() for x in re.split(r'[,\s]+', str(val)) if x.strip()]
     while len(items) < n:
-        items.append(items[-1] if items else "-")
+        items.append(items[-1] if items else "0")
     return items[:n]
 
 # --- メインロジック ---
 st.title("💰 APR運用管理システム")
 
 try:
-    # スプレッドシート読み込み
+    # 🔗 スプレッドシート読み込み (Settingsシート: gid=0)
     sheet_url = st.secrets["gsheets"]["public_gsheets_url"].split('/edit')[0]
-    df = pd.read_csv(f"{sheet_url}/export?format=csv&gid=0")
+    # あなたが成功した時は、この gid=0 の指定で正しく読み込めていました
+    settings_df = pd.read_csv(f"{sheet_url}/export?format=csv&gid=0")
     
     # プロジェクト選択
-    p_list = df.iloc[:, 0].dropna().unique().tolist()
+    p_list = settings_df.iloc[:, 0].dropna().unique().tolist()
     selected_p = st.sidebar.selectbox("プロジェクト選択", p_list)
     
-    # データ抽出
-    p_info = df[df.iloc[:, 0] == selected_p].iloc[0]
+    # データ抽出 (物理インデックス固定)
+    p_info = settings_df[settings_df.iloc[:, 0] == selected_p].iloc[0]
     num = int(to_f(p_info.iloc[1]))
     names = split_val(p_info.iloc[6], num)
     principals = [to_f(p) for p in split_val(p_info.iloc[3], num)]
@@ -57,7 +58,7 @@ try:
     st.table(res_df)
 
     st.markdown("---")
-    uploaded_file = st.file_uploader("エビデンス画像", type=["png", "jpg", "jpeg"])
+    uploaded_file = st.file_uploader("エビデンス画像 (任意)", type=["png", "jpg", "jpeg"])
     
     if st.button("LINE・メール一斉送信", type="primary"):
         with st.spinner("送信中..."):
@@ -65,15 +66,16 @@ try:
             for i in range(num):
                 msg += f"・{names[i]}: +${yields[i]:,.4f}\n"
             
-            # 画像の処理
+            # 画像の処理 (ある場合のみ送信)
             img_url = ""
             if uploaded_file:
-                url = "https://api.imgbb.com/1/upload"
-                payload = {"key": st.secrets["imgbb"]["api_key"]}
-                files = {"image": uploaded_file.getvalue()}
-                res = requests.post(url, payload, files=files)
-                if res.status_code == 200:
-                    img_url = res.json()["data"]["url"]
+                img_res = requests.post(
+                    "https://api.imgbb.com/1/upload",
+                    payload={"key": st.secrets["imgbb"]["api_key"]},
+                    files={"image": uploaded_file.getvalue()}
+                )
+                if img_res.status_code == 200:
+                    img_url = img_res.json()["data"]["url"]
                     msg += f"\n\n🖼 エビデンス:\n{img_url}"
 
             # LINE送信
@@ -95,4 +97,4 @@ try:
             st.balloons()
 
 except Exception as e:
-    st.error(f"エラーが発生しました: {e}")
+    st.error(f"接続エラー: {e}")
