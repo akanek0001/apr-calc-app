@@ -6,6 +6,47 @@ import requests
 import json
 import re
 
+import streamlit as st
+from streamlit_gsheets import GSheetsConnection
+import pandas as pd
+from datetime import datetime
+
+# --- LINE Webhook 受信 & スプレッドシート自動保存 ---
+def handle_webhook_and_save(conn, settings_df):
+    # URLに ?webhook=1 が付いている時だけ動作
+    if "webhook" in st.query_params:
+        try:
+            # LINEからのデータ取得
+            import json
+            # Streamlitで生のPOSTボディを取得するのは難しいため、
+            # 簡易的にヘッダーやログから取得するロジック、または
+            # 外部APIゲートウェイ(Make等)を挟むのが一般的ですが、
+            # ここではロジックの構成を示します。
+            
+            # --- 疑似ロジック：受信したIDを特定 ---
+            # 実際には LINE Messaging API から送られてくる JSON を解析します
+            line_data = st.context.headers  # 実際の実装ではリクエストボディを解析
+            
+            # もし新しいIDが見つかったら
+            new_user_id = "取得したUxxxx..." 
+            
+            # スプレッドシートの空いている行を探して書き込み
+            #（例：名前が一致する行、または新しい行）
+            if new_user_id not in settings_df["Line_User_ID"].values:
+                # ここで conn.update を使ってスプレッドシートの特定のセルを更新
+                # st.success(f"新しく {new_user_id} を登録しました")
+                pass
+        except Exception as e:
+            pass
+
+# --- メイン画面での表示 ---
+st.sidebar.subheader("🤖 ID自動回収モード")
+if st.sidebar.checkbox("Webhookを有効化"):
+    st.sidebar.info("このURLをLINE DevelopersのWebhook URLに設定してください:")
+    st.sidebar.code(f"https://your-app.streamlit.app/?webhook=1")
+
+
+
 # --- ページ設定 ---
 st.set_page_config(page_title="APR管理システム", layout="wide", page_icon="🏦")
 st.title("🏦 APR管理システム（複利・出金管理版）")
