@@ -28,26 +28,27 @@ def split_val(val, n):
 st.title("💰 APR運用管理システム")
 
 try:
-    # スプレッドシート読み込み (当時のデフォルト設定)
-    base_url = st.secrets["gsheets"]["public_gsheets_url"].split('/edit')[0]
-    df = pd.read_csv(f"{base_url}/export?format=csv&gid=0")
+    # スプレッドシート読み込み
+    sheet_url = st.secrets["gsheets"]["public_gsheets_url"].split('/edit')[0]
+    df = pd.read_csv(f"{sheet_url}/export?format=csv&gid=0")
 
     # プロジェクト選択
     p_list = df.iloc[:, 0].dropna().unique().tolist()
     selected_p = st.sidebar.selectbox("プロジェクト選択", p_list)
 
-    # データ抽出 (当時の物理インデックス: 1:人数, 3:元本, 4:比率, 6:名前)
+    # データ抽出
     p_info = df[df.iloc[:, 0] == selected_p].iloc[0]
     num = int(to_f(p_info.iloc[1]))
     
+    # 【成功時の列インデックス】
     names = split_val(p_info.iloc[6], num)
     principals = [to_f(p) for p in split_val(p_info.iloc[3], num)]
     rates = [to_f(r) for r in split_val(p_info.iloc[4], num)]
 
-    st.subheader(f"📊 {selected_p} 収益計算")
+    st.subheader("📊 収益計算")
     apr = st.number_input("本日のAPR (%)", value=100.0, step=0.1)
     
-    # 計算 (元本 * APR% * 0.77 * 比率 / 365)
+    # 成功時の計算ロジック
     yields = [(p * (apr / 100) * 0.77 * rates[i]) / 365 for i, p in enumerate(principals)]
     total_y = sum(yields)
 
@@ -77,7 +78,7 @@ try:
             msg += "-"*15 + "\n"
             msg += f"💰 合計: +${total_y:,.4f}"
 
-            # 画像処理 (ある場合のみ実行)
+            # 画像がある場合のみImgBBへ
             if uploaded_file:
                 img_res = requests.post(
                     "https://api.imgbb.com/1/upload",
@@ -103,7 +104,7 @@ try:
                 smtp.login(conf["user"], conf["password"])
                 smtp.send_message(mail)
                 
-            st.success("完了しました")
+            st.success("全ての送信が完了しました！")
 
 except Exception as e:
     st.error(f"エラー: {e}")
