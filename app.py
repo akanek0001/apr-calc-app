@@ -3,140 +3,86 @@ import pandas as pd
 import requests
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 
-# --- 1. ページ設定 ---
+# --- 1. ページ基本設定 ---
 st.set_page_config(page_title="APR管理システム", layout="wide", page_icon="🏦")
 
-# --- 2. ユーティリティ ---
+# --- 2. 補助関数 ---
 def to_f(val):
-    if pd.isna(val) or str(val).strip() == "": return 0.0
+    if pd.isna(val) or str(val).strip() == "" or str(val).lower() == "nan": return 0.0
     try:
         clean = str(val).replace(',','').replace('$','').replace('%','').strip()
         return float(clean) if clean else 0.0
     except: return 0.0
 
 def split_val(val, n):
-    if pd.isna(val) or str(val).strip() == "" or str(val).lower() == "nan": return ["0"] * n
-    items = [x.strip() for x in re.split(r'[,\s]+', str(val)) if x.strip()]
+    if pd.isna(val) or str(val).strip() == "" or str(val).lower() == "nan": return ["-"] * n
+    items = [x.strip() for x in re.split(r'[,\s\n\r]+', str(val)) if x.strip()]
     while len(items) < n:
-        items.append(items[-1] if items else "0")
+        items.append(items[-1] if items else "-")
     return items[:n]
 
-def send_line_multimedia(token, user_id, text, image_url=None):
-    if not user_id or str(user_id) == "nan": return 400
-    url = "https://api.line.me/v2/bot/message/push"
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
-    messages = [{"type": "text", "text": text}]
-    if image_url:
-        messages.append({"type": "image", "originalContentUrl": image_url, "previewImageUrl": image_url})
-    payload = {"to": str(user_id), "messages": messages}
-    try:
-        res = requests.post(url, headers=headers, data=json.dumps(payload), timeout=10)
-        return res.status_code
-    except: return 500
-
 # --- 3. メインロジック ---
-st.title("🏦 APR資産運用管理システム")
+st.title("💰 APR資産運用管理システム")
 
 try:
-    # GoogleシートのURL取得（secretsから）
+    # GoogleシートのURL取得
     base_url = st.secrets["gsheets"]["public_gsheets_url"].split('/edit')[0]
     
-    # Settingsシートの読み込み（gid=0 または 特定のgid）
-    settings_df = pd.read_csv(f"{base_url}/export?format=csv&gid=0") 
-    # LineIDシートの読み込み（gidを指定してください。例: gid=12345678）
-    # ※gidが不明な場合は、スプレッドシートのタブを切り替えた時のURL末尾の数字を確認してください
-    line_id_url = f"{base_url}/export?format=csv&gid={st.secrets['gsheets'].get('lineid_gid', '0')}"
-    line_id_df = pd.read_csv(line_id_url)
-
-    if settings_df.empty:
-        st.error("Settingsシートが読み込めません。")
-        st.stop()
-
-    project_list = settings_df.iloc[:, 0].dropna().astype(str).unique().tolist()
-    selected_project = st.sidebar.selectbox("プロジェクトを選択", project_list)
-    p_info = settings_df[settings_df.iloc[:, 0] == selected_project].iloc[0]
-
-    # 設定値の抽出
-    num_people = int(to_f(p_info.iloc[1]))
-    base_principals = [to_f(p) for p in split_val(p_info.iloc[3], num_people)]
-    rate_list = [to_f(r) for r in split_val(p_info.iloc[4], num_people)]
-    is_compound = str(p_info.iloc[5]).upper() in ["TRUE", "はい", "YES", "1"]
-
-    # メンバー名の取得（G列/Index 6）
-    member_names = split_val(p_info.iloc[6], num_people)
-
-    # 履歴シートの読み込み（プロジェクト名と同じシート名を想定）
-    # 注意: CSV直接読み込みでは「シート名」指定が難しいため、
-    # 履歴保存を本格的に行う場合は、元のURL形式を維持する必要があります。
-    # ここでは表示用に読み込みを試みます。
-    try:
-        hist_url = f"{base_url}/export?format=csv&gid={st.secrets['gsheets'].get(selected_project+'_gid', '0')}"
-        hist_df = pd.read_csv(hist_url)
-    except:
-        hist_df = pd.DataFrame(columns=["Date", "Type", "Total_Amount", "Breakdown", "Note"])
-
-    # --- 評価額の計算ロジック ---
-    total_earned = [0.0] * num_people
-    total_withdrawn = [0.0] * num_people
-    total_deposited = [0.0] * num_people
+    # 【最重要】header=0 で1行目を項目名として固定。これで見出しの読み込みミスを防ぎます。
+    df = pd.read_csv(f"{base_url}/export?format=csv&gid=0", header=0)
     
-    if not hist_df.empty:
-        for _, row in hist_df.iterrows():
-            try:
-                rtype = str(row["Type"])
-                rbreakdown = str(row["Breakdown"])
-                vals = [to_f(v) for v in rbreakdown.split(",")]
-                for i in range(num_people):
-                    if i < len(vals):
-                        if rtype == "収益": total_earned[i] += vals[i]
-                        elif rtype == "出金": total_withdrawn[i] += vals[i]
-                        elif rtype == "入金": total_deposited[i] += vals[i]
-            except: continue
+    # 列名の前後空白を削除し、大文字小文字を無視して一致しやすくする
+    df.columns = [str(c).strip() for c in df.columns]
 
-    calc_principals = [(base_principals[i] + total_earned[i] + total_deposited[i] - total_withdrawn[i]) if is_compound else (base_principals[i] + total_deposited[i] - total_withdrawn[i]) for i in range(num_people)]
+    # プロジェクト名が A列（Project_Name）にあることを前提にリスト化
+    # 日付列などを拾わないよう、列名を直接指定して抽出します
+    if "Project_Name" in df.columns:
+        project_list = df["Project_Name"].dropna().unique().tolist()
+    else:
+        # 万が一列名が認識できない場合は1列目(0番目)を使用
+        project_list = df.iloc[:, 0].dropna().unique().tolist()
 
-    tab1, tab2 = st.tabs(["📈 収益確定・報告", "💸 入出金・精算"])
+    selected_project = st.sidebar.selectbox("プロジェクトを選択", project_list)
+    
+    # 選択したプロジェクトの行を特定
+    p_info = df[df.iloc[:, 0] == selected_project].iloc[0]
 
-    with tab1:
-        st.subheader("📊 本日の運用報告作成")
-        total_apr = st.number_input("本日のAPR (%)", value=100.0, step=0.1)
-        uploaded_file = st.file_uploader("エビデンス画像をアップロード", type=['png', 'jpg', 'jpeg'])
-        
-        # 収益計算（表示用）
-        today_yields = [round((p * (total_apr * 0.77 * rate_list[i] / 100)) / 365, 4) for i, p in enumerate(calc_principals)]
-        
-        res_display = pd.DataFrame({
-            "メンバー": member_names,
-            "現在元本": [f"${p:,.2f}" for p in calc_principals],
-            "本日収益": [f"${y:,.4f}" for y in today_yields]
-        })
-        st.table(res_display)
+    # --- あなたのシート項目名に完全準拠 ---
+    num_p = int(to_f(p_info["Num_People"]))
+    names = split_val(p_info["MemberNames"], num_p)
+    principals = [to_f(p) for p in split_val(p_info["IndividualPrincipals"], num_p)]
+    rates = [to_f(r) for r in split_val(p_info["ProfitRates"], num_p)]
 
-        if st.button("収益を確定してLINE送信"):
-            # ※注意: pandasのCSV読み込みではスプレッドシートへの「書き込み」ができません。
-            # 書き込みには Google Sheets API への認証か、以前使用していたGAS経由の送信が必要です。
-            st.info("データ保存にはGoogle Sheets APIの設定が必要です。現在は表示とLINE送信のみ実行します。")
-            
-            if "line" in st.secrets:
-                # LINE送信ロジック（そのまま維持）
-                token = st.secrets["line"]["channel_access_token"]
-                # LineIDシートからU...で始まるIDを抽出
-                user_ids = [str(x).strip() for x in line_id_df.values.flatten() if str(x).startswith('U')]
-                
-                msg = f"🏦 【収益報告】\nプロジェクト: {selected_project}\nAPR: {total_apr}%\n"
-                for i in range(num_people):
-                    msg += f"・{member_names[i]}: +${today_yields[i]:,.4f}\n"
-                
-                success = 0
-                for uid in set(user_ids):
-                    if send_line_multimedia(token, uid, msg) == 200: success += 1
-                st.success(f"{success}名に送信完了")
+    # --- 画面表示 ---
+    st.subheader(f"📊 {selected_project} 本日の計算")
+    apr = st.number_input("本日のAPR (%)", value=100.0, step=0.1)
+    
+    # 計算 (手数料 0.77)
+    yields = [round((p * (apr * 0.77 * rates[i] / 100)) / 365, 4) for i, p in enumerate(principals)]
+    
+    res_df = pd.DataFrame({
+        "メンバー": names,
+        "元本 ($)": [f"${p:,.2f}" for p in principals],
+        "分配比率": rates,
+        "本日収益 ($)": [f"${y:,.4f}" for y in yields]
+    })
+    res_df.index = range(1, len(res_df) + 1)
+    st.table(res_df)
+    st.metric("総収益合計", f"${sum(yields):,.4f}")
 
-    with tab2:
-        st.subheader("💸 入出金記録（手動管理用）")
-        st.write("現在、このアプリからは表示のみ可能です。記録の追加はスプレッドシート本体で行ってください。")
+    # LINE送信 (H列: LineID)
+    if st.button("🚀 LINE報告送信", type="primary"):
+        line_ids = [uid.strip() for uid in re.split(r'[,\s]+', str(p_info["LineID"])) if uid.strip().startswith('U')]
+        if line_ids:
+            token = st.secrets["line"]["channel_access_token"]
+            msg = f"🏦 【{selected_project}】収益報告\n" + "-"*10 + f"\n合計: ${sum(yields):,.4f}"
+            for uid in set(line_ids):
+                requests.post("https://api.line.me/v2/bot/message/push", 
+                              headers={"Authorization": f"Bearer {token}"},
+                              json={"to": uid, "messages": [{"type": "text", "text": msg}]})
+            st.success("送信完了")
 
 except Exception as e:
     st.error(f"システムエラー: {e}")
