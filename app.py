@@ -64,7 +64,6 @@ try:
     # LINE ID取得 (LineIDシートの全列からIDらしきものを探す)
     user_ids = []
     if not line_id_df.empty:
-        # Line_User_ID列があれば優先、なければ一番右の列
         if "Line_User_ID" in line_id_df.columns:
             user_ids = line_id_df["Line_User_ID"].dropna().unique().tolist()
         else:
@@ -83,7 +82,6 @@ try:
     if not hist_df.empty:
         for _, row in hist_df.iterrows():
             try:
-                # 列名ではなく位置で取得 (Type:B列=1, Breakdown:D列=3)
                 rtype = str(row.iloc[1])
                 rbreakdown = str(row.iloc[3])
                 vals = [to_f(v) for v in rbreakdown.split(",")]
@@ -97,10 +95,8 @@ try:
     calc_principals = []
     for i in range(num_people):
         if is_compound:
-            # 複利：初期元本 + 累計収益 - 累計出金
             calc_principals.append(base_principals[i] + total_earned[i] - total_withdrawn[i])
         else:
-            # 単利：初期元本固定
             calc_principals.append(base_principals[i])
 
     # --- 表示エリア ---
@@ -112,7 +108,6 @@ try:
         total_apr = st.number_input("本日の全体のAPR (%)", value=100.0, step=0.01)
         net_factor = 0.67
         
-        # 収益計算
         today_yields = [round((p * (total_apr * net_factor * rate_list[i] / 100)) / 365, 4) for i, p in enumerate(calc_principals)]
         
         cols = st.columns(num_people)
@@ -131,16 +126,39 @@ try:
             updated_hist = pd.concat([hist_df, new_row], ignore_index=True)
             conn.update(worksheet=selected_project, data=updated_hist)
             
+            # LINE送信処理
             if "line" in st.secrets:
                 token = st.secrets["line"]["channel_access_token"]
-                msg = f"【収益報告】\n{selected_project}\nAPR:{total_apr}%\n" + "-"*10 + "\n"
-                for i in range(num_people):
-                    msg += f"No.{i+1}: +${today_yields[i]:,.4f}\n(現元本:${calc_principals[i]+today_yields[i]:,.2f})\n"
+                now_str = datetime.now().strftime("%Y/%m/%d %H:%M")
+                mode_str = "【複利運用】" if is_compound else "【単利運用】"
                 
-                success = 0
+                msg = f"🏦 【運用収益報告書】\n"
+                msg += f"プロジェクト: {selected_project}\n"
+                msg += f"報告日時: {now_str}\n\n"
+                msg += f"━━━━━━━━━━━━━━\n"
+                msg += f"📊 本日の運用結果\n"
+                msg += f"━━━━━━━━━━━━━━\n"
+                msg += f"本日のAPR: {total_apr}%\n\n"
+                msg += f"💰 各メンバー収益明細\n"
+                
+                for i in range(num_people):
+                    new_p = calc_principals[i] + today_yields[i]
+                    msg += f"・No.{i+1}: +${today_yields[i]:,.4f}\n"
+                    msg += f"  (現在元本: ${new_p:,.2f})\n"
+                
+                msg += f"\n━━━━━━━━━━━━━━\n"
+                msg += f"💡 運用状況メモ\n"
+                msg += f"現在のモード: {mode_str}\n"
+                if is_compound:
+                    msg += f"※収益は次回の元本に組み入れられます。\n"
+                msg += f"━━━━━━━━━━━━━━"
+                
+                success_count = 0
                 for uid in user_ids:
-                    if send_line_message(token, uid, msg) == 200: success += 1
-                st.success(f"保存完了。{success}名のユーザーに通知しました。")
+                    if send_line_message(token, uid, msg) == 200:
+                        success_count += 1
+                st.success(f"報告書を送信しました（成功: {success_count}名）")
+            
             st.rerun()
 
     with tab2:
