@@ -131,16 +131,7 @@ try:
             updated_hist = pd.concat([hist_df, new_row], ignore_index=True)
             conn.update(worksheet=selected_project, data=updated_hist)
             
-          [line]
-channel_access_token = "EYZpry+KdabiZ1B/G8PlQkyLW5/BK/qjccWqFAMfYV7/H3NMzgMoJy5mX8HtgYypmYIx/eDNNet4qDKa3EkNaYVLReb9pRwExD+kEyT2EyzVhwU+UppXQrHpRNQHK4duaIfQ56zewqW32knrDNYnaQdB04t89/1O/w1cDnyilFU="
-user_id = "U352695b567963ba0e6c5be7fe0aade88"
-
-# メール送信設定
-[gmail]
-user = "akanek@gmail.com"
-password = "qdlwdfnbgvtcsxvc"  # スペースを詰めたもの
- 
-            if "line" in st.secrets:
+                     if "line" in st.secrets:
                 token = st.secrets["line"]["channel_access_token"]
                 
                 # --- 報告書の作成 ---
@@ -174,7 +165,6 @@ password = "qdlwdfnbgvtcsxvc"  # スペースを詰めたもの
                     if send_line_message(token, uid, msg) == 200:
                         success_count += 1
                 st.success(f"報告書を送信しました（送信成功: {success_count}名）")
-
 
 
     with tab2:
