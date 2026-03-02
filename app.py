@@ -4,74 +4,84 @@ import requests
 import smtplib
 from email.mime.text import MIMEText
 from email.utils import formatdate
+from datetime import datetime
 import re
 
-# --- ページ設定 ---
-st.set_page_config(page_title="APR運用管理システム", layout="wide")
+# --- ページ基本設定 ---
+st.set_page_config(page_title="APR管理システム", layout="wide")
 
-# --- 関数群 ---
+# --- 以前のデータ処理関数 ---
 def to_f(val):
     if pd.isna(val): return 0.0
     try:
-        clean = str(val).replace(',','').replace('$','').replace('%','').strip()
-        return float(clean) if clean else 0.0
+        return float(str(val).replace(',','').replace('$','').replace('%','').strip())
     except: return 0.0
 
 def split_val(val, n):
-    if pd.isna(val) or str(val).strip() == "": return ["0"] * n
+    if pd.isna(val) or str(val).strip() == "": return ["-"] * n
     items = [x.strip() for x in re.split(r'[,\s]+', str(val)) if x.strip()]
     while len(items) < n:
-        items.append(items[-1] if items else "0")
+        items.append(items[-1] if items else "-")
     return items[:n]
 
 # --- メインロジック ---
 st.title("💰 APR運用管理システム")
 
 try:
-    # 🔗 スプレッドシート読み込み (Settingsシート: gid=0)
-    sheet_url = st.secrets["gsheets"]["public_gsheets_url"].split('/edit')[0]
-    # あなたが成功した時は、この gid=0 の指定で正しく読み込めていました
-    settings_df = pd.read_csv(f"{sheet_url}/export?format=csv&gid=0")
-    
+    # スプレッドシート読み込み (当時のデフォルト設定)
+    base_url = st.secrets["gsheets"]["public_gsheets_url"].split('/edit')[0]
+    df = pd.read_csv(f"{base_url}/export?format=csv&gid=0")
+
     # プロジェクト選択
-    p_list = settings_df.iloc[:, 0].dropna().unique().tolist()
+    p_list = df.iloc[:, 0].dropna().unique().tolist()
     selected_p = st.sidebar.selectbox("プロジェクト選択", p_list)
-    
-    # データ抽出 (物理インデックス固定)
-    p_info = settings_df[settings_df.iloc[:, 0] == selected_p].iloc[0]
+
+    # データ抽出 (当時の物理インデックス: 1:人数, 3:元本, 4:比率, 6:名前)
+    p_info = df[df.iloc[:, 0] == selected_p].iloc[0]
     num = int(to_f(p_info.iloc[1]))
+    
     names = split_val(p_info.iloc[6], num)
     principals = [to_f(p) for p in split_val(p_info.iloc[3], num)]
     rates = [to_f(r) for r in split_val(p_info.iloc[4], num)]
 
-    st.subheader("📊 収益計算")
+    st.subheader(f"📊 {selected_p} 収益計算")
     apr = st.number_input("本日のAPR (%)", value=100.0, step=0.1)
-    fee = 0.77
     
-    yields = [(p * (apr/100) * fee * rates[i]) / 365 for i, p in enumerate(principals)]
-    
+    # 計算 (元本 * APR% * 0.77 * 比率 / 365)
+    yields = [(p * (apr / 100) * 0.77 * rates[i]) / 365 for i, p in enumerate(principals)]
+    total_y = sum(yields)
+
+    # テーブル表示
     res_df = pd.DataFrame({
-        "名前": names,
+        "メンバー": names,
         "元本 ($)": [f"{p:,.2f}" for p in principals],
+        "分配比率": rates,
         "本日収益 ($)": [f"{y:,.4f}" for y in yields]
     })
+    res_df.index = range(1, len(res_df) + 1)
     st.table(res_df)
+    st.metric("総収益合計", f"${total_y:,.4f}")
 
+    # 通知送信 (画像は任意)
     st.markdown("---")
     uploaded_file = st.file_uploader("エビデンス画像 (任意)", type=["png", "jpg", "jpeg"])
     
-    if st.button("LINE・メール一斉送信", type="primary"):
+    if st.button("🚀 LINE・メール一斉送信", type="primary"):
         with st.spinner("送信中..."):
-            msg = f"🏦 【{selected_p}】 収益報告\nAPR: {apr}%\n" + "-"*15 + "\n"
+            msg = f"🏦 【{selected_p}】 収益報告\n"
+            msg += f"📅 {datetime.now().strftime('%Y/%m/%d %H:%M')}\n"
+            msg += f"📈 APR: {apr}%\n"
+            msg += "-"*15 + "\n"
             for i in range(num):
                 msg += f"・{names[i]}: +${yields[i]:,.4f}\n"
-            
-            # 画像の処理 (ある場合のみ送信)
-            img_url = ""
+            msg += "-"*15 + "\n"
+            msg += f"💰 合計: +${total_y:,.4f}"
+
+            # 画像処理 (ある場合のみ実行)
             if uploaded_file:
                 img_res = requests.post(
                     "https://api.imgbb.com/1/upload",
-                    payload={"key": st.secrets["imgbb"]["api_key"]},
+                    data={"key": st.secrets["imgbb"]["api_key"]},
                     files={"image": uploaded_file.getvalue()}
                 )
                 if img_res.status_code == 200:
@@ -93,8 +103,7 @@ try:
                 smtp.login(conf["user"], conf["password"])
                 smtp.send_message(mail)
                 
-            st.success("送信完了しました！")
-            st.balloons()
+            st.success("完了しました")
 
 except Exception as e:
-    st.error(f"接続エラー: {e}")
+    st.error(f"エラー: {e}")
