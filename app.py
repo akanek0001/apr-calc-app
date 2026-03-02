@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import requests
 import json
 import re
- 
+
 # --- 1. ページ設定 ---
 st.set_page_config(page_title="APR管理システム", layout="wide", page_icon="🏦")
 
@@ -38,7 +38,7 @@ def send_line_multimedia(token, user_id, text, image_url=None):
     except: return 500
 
 # --- 3. メインロジック ---
-st.title("🏦 APR資産運用管理システム（画像保存版）")
+st.title("🏦 APR資産運用管理システム")
 
 try:
     conn = st.connection("gsheets", type=GSheetsConnection)
@@ -68,8 +68,11 @@ try:
     except:
         hist_df = pd.DataFrame(columns=["Date", "Type", "Total_Amount", "Breakdown", "Note"])
 
+    # 累計計算 (収益、出金、入金)
     total_earned = [0.0] * num_people
     total_withdrawn = [0.0] * num_people
+    total_deposited = [0.0] * num_people
+    
     if not hist_df.empty:
         for _, row in hist_df.iterrows():
             try:
@@ -79,12 +82,15 @@ try:
                     if i < len(vals):
                         if rtype == "収益": total_earned[i] += vals[i]
                         elif rtype == "出金": total_withdrawn[i] += vals[i]
+                        elif rtype == "入金": total_deposited[i] += vals[i]
             except: continue
 
-    calc_principals = [(base_principals[i] + total_earned[i] - total_withdrawn[i]) if is_compound else base_principals[i] for i in range(num_people)]
+    # 最新元本の計算 (初期値 + 収益 + 入金 - 出金)
+    calc_principals = [(base_principals[i] + total_earned[i] + total_deposited[i] - total_withdrawn[i]) if is_compound else (base_principals[i] + total_deposited[i] - total_withdrawn[i]) for i in range(num_people)]
 
-    tab1, tab2 = st.tabs(["📈 収益確定・報告", "💸 出金・精算"])
+    tab1, tab2 = st.tabs(["📈 収益確定・報告", "💸 入出金・精算"])
 
+    # --- タブ1: 収益報告 ---
     with tab1:
         st.subheader("📊 本日の運用報告作成")
         total_apr = st.number_input("本日のAPR (%)", value=100.0, step=0.1)
@@ -103,53 +109,58 @@ try:
         today_yields = [round((p * (total_apr * 0.67 * rate_list[i] / 100)) / 365, 4) for i, p in enumerate(calc_principals)]
 
         if st.button("収益を確定してLINE送信"):
-            img_url = st.session_state.get("img_url", "")
-            
-            # --- 【修正】スプレッドシートの Note 欄に画像URLを含めて保存 ---
-            new_row = pd.DataFrame([{
-                "Date": datetime.now().strftime("%Y-%m-%d"),
-                "Type": "収益",
-                "Total_Amount": sum(today_yields),
-                "Breakdown": ",".join(map(str, today_yields)),
-                "Note": f"APR:{total_apr}% | Image: {img_url}"
-            }])
+            new_row = pd.DataFrame([{"Date": datetime.now().strftime("%Y-%m-%d"), "Type": "収益", "Total_Amount": sum(today_yields), "Breakdown": ",".join(map(str, today_yields)), "Note": f"APR:{total_apr}%"}])
             conn.update(worksheet=selected_project, data=pd.concat([hist_df, new_row], ignore_index=True))
             
-            # LINE送信
             if "line" in st.secrets:
                 jst_now = datetime.utcnow() + timedelta(hours=9)
                 now_str = jst_now.strftime("%Y/%m/%d %H:%M")
-                
                 msg = f"🏦 【資産運用収益報告書】\n━━━━━━━━━━━━━━\nプロジェクト: {selected_project}\n報告日時: {now_str}\n━━━━━━━━━━━━━━\n\n📈 本日の結果\nAPR: {total_apr}%\nモード: {'複利運用' if is_compound else '単利運用'}\n\n💰 収益明細\n"
                 for i in range(num_people):
                     msg += f"・No.{i+1}: +${today_yields[i]:,.4f}\n  (元本: ${calc_principals[i]+today_yields[i]:,.2f})\n"
                 msg += f"\n━━━━━━━━━━━━━━\n※画像エビデンスを添付いたします。\nご確認のほどお願い申し上げます。"
 
+                img_url = st.session_state.get("img_url")
                 success = 0
                 for uid in user_ids:
                     if send_line_multimedia(st.secrets["line"]["channel_access_token"], uid, msg, img_url) == 200: success += 1
                 st.success(f"{success}名に送信完了")
-            
-            # 完了後、セッションの画像をクリア
-            if "img_url" in st.session_state: del st.session_state["img_url"]
             st.rerun()
 
+    # --- タブ2: 入出金管理 ---
     with tab2:
-        # (出金管理ロジックは変更なし)
-        st.subheader("💸 出金・精算の記録")
+        st.subheader("💸 入金・出金の記録")
         target_no = st.selectbox("メンバーを選択", [f"No.{i+1}" for i in range(num_people)])
         idx = int(target_no.split(".")[1]) - 1
-        st.info(f"現在の出金可能額: **${calc_principals[idx]:,.2f}**")
-        withdraw_amt = st.number_input("出金額 ($)", min_value=0.0, max_value=calc_principals[idx], step=10.0)
-        memo = st.text_input("備考", value="出金精算")
-        if st.button("出金データを保存"):
-            if withdraw_amt > 0:
-                w_list = [0.0] * num_people
-                w_list[idx] = withdraw_amt
-                new_row = pd.DataFrame([{"Date": datetime.now().strftime("%Y-%m-%d"), "Type": "出金", "Total_Amount": withdraw_amt, "Breakdown": ",".join(map(str, w_list)), "Note": memo}])
+        st.info(f"現在の評価額（元本）: **${calc_principals[idx]:,.2f}**")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            trans_type = st.radio("種別を選択", ["入金（預け入れ）", "出金（引き出し）"])
+        with col2:
+            amount = st.number_input("金額 ($)", min_value=0.0, step=10.0)
+            memo = st.text_input("備考", value="元本調整")
+
+        if st.button("記録を保存"):
+            if amount > 0:
+                val_list = [0.0] * num_people
+                val_list[idx] = amount
+                
+                type_label = "入金" if "入金" in trans_type else "出金"
+                
+                new_row = pd.DataFrame([{
+                    "Date": datetime.now().strftime("%Y-%m-%d"), 
+                    "Type": type_label, 
+                    "Total_Amount": amount, 
+                    "Breakdown": ",".join(map(str, val_list)), 
+                    "Note": memo
+                }])
+                
                 conn.update(worksheet=selected_project, data=pd.concat([hist_df, new_row], ignore_index=True))
-                st.success(f"記録完了")
+                st.success(f"No.{idx+1} の {type_label}（${amount}）を記録しました。")
                 st.rerun()
+            else:
+                st.warning("金額を入力してください。")
 
 except Exception as e:
     st.error(f"システムエラー: {e}")
