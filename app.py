@@ -2,12 +2,13 @@ import streamlit as st
 from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 from datetime import datetime
-import requests # LINE送信に必要
+import requests
+import json
 import re
 
 # --- ページ設定 ---
 st.set_page_config(page_title="APR管理システム", layout="wide", page_icon="🏦")
-st.title("🏦 APR管理システム（LINE通知版）")
+st.title("🏦 APR管理システム（LINE Messaging API版）")
 
 # --- 便利関数 ---
 def to_f(val):
@@ -23,12 +24,18 @@ def split_val(val, n):
         items.append(items[-1] if items else "0")
     return items
 
-# --- LINE送信関数 ---
-def send_line_notification(token, message):
-    url = "https://notify-api.line.me/api/notify"
-    headers = {"Authorization": f"Bearer {token}"}
-    data = {"message": message}
-    response = requests.post(url, headers=headers, data=data)
+# --- LINE Messaging API送信関数 ---
+def send_line_message(token, user_id, text):
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}"
+    }
+    payload = {
+        "to": user_id,
+        "messages": [{"type": "text", "text": text}]
+    }
+    response = requests.post(url, headers=headers, data=json.dumps(payload))
     return response.status_code
 
 # --- メインロジック ---
@@ -65,18 +72,11 @@ try:
         current_principals.append(base_principals[i] + unpaid_amount)
 
     # --- 画面表示 ---
-    st.subheader(f"📊 {selected_project} の運用状況")
     total_apr = st.number_input("本日の全体のAPR (%)", value=100.0, step=0.01)
-    
     net_apr_factor = 0.67
     today_yields = [round((p * (total_apr * net_apr_factor * rate_list[i] / 100)) / 365, 4) for i, p in enumerate(current_principals)]
     
     st.info(f"💡 33%控除済み（実質 {total_apr * net_apr_factor:.2f}%）")
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("確定人数", f"{num_people} 名")
-    c2.metric("総元本（複利込）", f"${sum(current_principals):,.2f}")
-    c3.metric("総分配額", f"${sum(today_yields):,.4f}")
 
     # --- 確定・LINE送信ボタン ---
     if st.button("収益を確定してLINEで通知"):
@@ -93,29 +93,23 @@ try:
             
             # B. LINE通知処理
             if "line" in st.secrets:
-                line_token = st.secrets["line"]["token"]
+                line_token = st.secrets["line"]["channel_access_token"]
+                line_user_id = st.secrets["line"]["user_id"]
                 
-                # 全員分のレポートを一つのメッセージにまとめる
-                report_msg = f"\n【収益報告】{selected_project}\n"
+                report_msg = f"【収益報告】\n{selected_project}\n"
                 report_msg += f"本日のAPR: {total_apr}%\n"
                 report_msg += f"------------------\n"
-                
                 for i in range(num_people):
                     report_msg += f"No.{i+1}: ${today_yields[i]:,.4f}\n"
-                    report_msg += f"(元本: ${current_principals[i]:,.2f})\n"
-                
                 report_msg += f"------------------\n"
-                report_msg += f"※33%控除後の金額です"
+                report_msg += "※33%控除適用済み"
                 
-                status = send_line_notification(line_token, report_msg)
+                status = send_line_message(line_token, line_user_id, report_msg)
                 
                 if status == 200:
-                    st.success("履歴を保存し、LINEに通知を送りました！")
+                    st.success("LINEに通知を送りました！")
                 else:
-                    st.error(f"履歴は保存されましたが、LINE送信に失敗しました（Code:{status}）")
-            else:
-                st.warning("SecretsにLINEトークンが設定されていません。")
-            
+                    st.error(f"LINE送信エラー（Code:{status}）")
             st.rerun()
 
 except Exception as e:
