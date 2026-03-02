@@ -1,117 +1,170 @@
 import streamlit as st
+from streamlit_gsheets import GSheetsConnection
 import pandas as pd
-import requests
-import re
 from datetime import datetime
+import requests
+import json
+import re
 
 # --- 1. ページ設定 ---
 st.set_page_config(page_title="APR管理システム", layout="wide", page_icon="🏦")
 
-# --- 2. ユーティリティ関数 ---
+# --- 2. ユーティリティ (エラーガード付き) ---
 def to_f(val):
-    if pd.isna(val) or str(val).strip() == "" or str(val).lower() == "nan": return 0.0
+    if pd.isna(val): return 0.0
     try:
         clean = str(val).replace(',','').replace('$','').replace('%','').strip()
         return float(clean) if clean else 0.0
     except: return 0.0
 
 def split_val(val, n):
-    if pd.isna(val) or str(val).strip() == "" or str(val).lower() == "nan": return ["-"] * n
-    items = [x.strip() for x in re.split(r'[,\s\n\r]+', str(val)) if x.strip()]
+    if pd.isna(val) or str(val).strip() == "": return ["0"] * n
+    items = [x.strip() for x in re.split(r'[,\s]+', str(val)) if x.strip()]
     while len(items) < n:
-        items.append(items[-1] if items else "-")
+        items.append(items[-1] if items else "0")
     return items[:n]
 
-st.title("💰 APR資産運用管理システム")
+def send_line_message(token, user_id, text):
+    if not user_id or str(user_id) == "nan": return 400
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+    payload = {"to": str(user_id), "messages": [{"type": "text", "text": text}]}
+    try:
+        res = requests.post(url, headers=headers, data=json.dumps(payload), timeout=10)
+        return res.status_code
+    except: return 500
+
+# --- 3. メインロジック ---
+st.title("🏦 APR管理システム 最終安定版")
 
 try:
-    # --- 3. スプレッドシート読み込み (Settings & LineID) ---
-    raw_url = st.secrets["gsheets"]["public_gsheets_url"]
-    base_url = raw_url.split('/edit')[0]
+    conn = st.connection("gsheets", type=GSheetsConnection)
     
-    # Settingsシート (GID: 465185900)
-    settings_gid = "465185900" 
-    df_settings = pd.read_csv(f"{base_url}/export?format=csv&gid={settings_gid}", header=0)
-    df_settings.columns = [str(c).strip() for c in df_settings.columns]
+    # シート読み込み
+    settings_df = conn.read(worksheet="Settings", ttl=0)
+    line_id_df = conn.read(worksheet="LineID", ttl=0)
+    
+    if settings_df.empty:
+        st.error("Settingsシートが空です。データを入力してください。")
+        st.stop()
 
-    # LineIDシート
-    line_id_url = f"{base_url}/gviz/tq?tqx=out:csv&sheet=LineID"
-    df_line = pd.read_csv(line_id_url, header=0)
-    df_line.columns = [str(c).strip() for c in df_line.columns]
-
-    # プロジェクト選択
-    p_col = "Project_Name"
-    project_list = df_settings[p_col].dropna().unique().tolist()
+    # プロジェクト選択 (A列)
+    project_list = settings_df.iloc[:, 0].dropna().astype(str).unique().tolist()
     selected_project = st.sidebar.selectbox("プロジェクトを選択", project_list)
-    p_info = df_settings[df_settings[p_col] == selected_project].iloc[0]
+    p_info = settings_df[settings_df.iloc[:, 0] == selected_project].iloc[0]
 
-    # --- 4. データの抽出 (複利・メンバー等) ---
-    num_p = int(to_f(p_info.get("Num_People", 1)))
-    member_names = split_val(p_info.get("MemberNames", ""), num_p)
-    base_principals = [to_f(p) for p in split_val(p_info.get("IndividualPrincipals", "0"), num_p)]
-    rate_list = [to_f(r) for r in split_val(p_info.get("ProfitRates", "0"), num_p)]
+    # 設定値の抽出
+    num_people = int(to_f(p_info.iloc[1]))      # B列: 人数
+    base_principals = [to_f(p) for p in split_val(p_info.iloc[3], num_people)] # D列: 初期元本
+    rate_list = [to_f(r) for r in split_val(p_info.iloc[4], num_people)]       # E列: 配分比率
     
-    # 複利(IsCompound)の判定
-    is_compound = str(p_info.get("IsCompound", "FALSE")).upper() in ["TRUE", "はい", "YES", "1"]
+    # 複利判定 (F列: TRUEなら複利)
+    is_compound = str(p_info.iloc[5]).upper() in ["TRUE", "はい", "YES", "1"]
 
-    # --- 5. 計算と表示 ---
-    st.subheader(f"📊 {selected_project} 本日の収益計算")
-    total_apr = st.number_input("本日のAPR (%)", value=100.0, step=0.1)
-    
-    today_yields = [round((p * (total_apr * 0.77 * rate_list[i] / 100)) / 365, 4) for i, p in enumerate(base_principals)]
-    
-    res_display = pd.DataFrame({
-        "メンバー": member_names,
-        "元本 ($)": [f"${p:,.2f}" for p in base_principals],
-        "分配比率": rate_list,
-        "本日収益 ($)": [f"${y:,.4f}" for y in today_yields]
-    })
-    st.table(res_display)
-    
-    col1, col2 = st.columns(2)
-    col1.metric("総収益合計", f"${sum(today_yields):,.4f}")
-    col2.info(f"🔄 複利運用設定: {'ON' if is_compound else 'OFF'}")
+    # LINE ID取得 (LineIDシートの全列からIDらしきものを探す)
+    user_ids = []
+    if not line_id_df.empty:
+        # Line_User_ID列があれば優先、なければ一番右の列
+        if "Line_User_ID" in line_id_df.columns:
+            user_ids = line_id_df["Line_User_ID"].dropna().unique().tolist()
+        else:
+            user_ids = line_id_df.iloc[:, -1].dropna().unique().tolist()
 
-    # --- 6. 画像 & LINE送信 ---
-    st.markdown("---")
-    uploaded_file = st.file_uploader("🖼️ エビデンス画像をアップロード", type=['png', 'jpg', 'jpeg'])
-    
-    if st.button("🚀 LINE報告を一斉送信", type="primary"):
-        with st.spinner("送信中..."):
-            line_token = st.secrets["line"]["channel_access_token"]
-            imgbb_key = st.secrets["imgbb"]["api_key"]
+    # 履歴読み込み
+    try:
+        hist_df = conn.read(worksheet=selected_project, ttl=0)
+    except:
+        hist_df = pd.DataFrame(columns=["Date", "Type", "Total_Amount", "Breakdown", "Note"])
+
+    # 収益・出金の累計計算
+    total_earned = [0.0] * num_people
+    total_withdrawn = [0.0] * num_people
+
+    if not hist_df.empty:
+        for _, row in hist_df.iterrows():
+            try:
+                # 列名ではなく位置で取得 (Type:B列=1, Breakdown:D列=3)
+                rtype = str(row.iloc[1])
+                rbreakdown = str(row.iloc[3])
+                vals = [to_f(v) for v in rbreakdown.split(",")]
+                for i in range(num_people):
+                    if i < len(vals):
+                        if rtype == "収益": total_earned[i] += vals[i]
+                        elif rtype == "出金": total_withdrawn[i] += vals[i]
+            except: continue
+
+    # 元本計算 (複利モードの適用)
+    calc_principals = []
+    for i in range(num_people):
+        if is_compound:
+            # 複利：初期元本 + 累計収益 - 累計出金
+            calc_principals.append(base_principals[i] + total_earned[i] - total_withdrawn[i])
+        else:
+            # 単利：初期元本固定
+            calc_principals.append(base_principals[i])
+
+    # --- 表示エリア ---
+    st.sidebar.info(f"計算モード: {'✅ 複利' if is_compound else '💡 単利'}")
+    tab1, tab2 = st.tabs(["📈 収益の確定", "💸 出金の記録"])
+
+    with tab1:
+        st.subheader(f"【{selected_project}】本日の収益")
+        total_apr = st.number_input("本日の全体のAPR (%)", value=100.0, step=0.01)
+        net_factor = 0.67
+        
+        # 収益計算
+        today_yields = [round((p * (total_apr * net_factor * rate_list[i] / 100)) / 365, 4) for i, p in enumerate(calc_principals)]
+        
+        cols = st.columns(num_people)
+        for i, col in enumerate(cols):
+            col.metric(f"No.{i+1} 元本", f"${calc_principals[i]:,.2f}")
+            col.write(f"収益: +${today_yields[i]:,.4f}")
+
+        if st.button("収益を保存して全員にLINE通知"):
+            new_row = pd.DataFrame([{
+                "Date": datetime.now().strftime("%Y-%m-%d"),
+                "Type": "収益",
+                "Total_Amount": sum(today_yields),
+                "Breakdown": ",".join(map(str, today_yields)),
+                "Note": f"APR:{total_apr}%"
+            }])
+            updated_hist = pd.concat([hist_df, new_row], ignore_index=True)
+            conn.update(worksheet=selected_project, data=updated_hist)
             
-            msg = f"🏦 【{selected_project}】 収益報告\n📈 APR: {total_apr}%\n"
-            msg += f"🔄 複利運用: {'あり' if is_compound else 'なし'}\n" + "-"*15 + "\n"
-            for i in range(num_p):
-                msg += f"・{member_names[i]}: +${today_yields[i]:,.4f}\n"
-            msg += "-"*15 + "\n💰 合計: +${sum(today_yields):,.4f}"
-
-            img_url = None
-            if uploaded_file:
-                res_img = requests.post("https://api.imgbb.com/1/upload", params={"key": imgbb_key}, files={"image": uploaded_file.getvalue()})
-                if res_img.status_code == 200: img_url = res_img.json()["data"]["url"]
-
-            target_ids_row = df_line[df_line["Project_Name"] == selected_project]
-            if not target_ids_row.empty:
-                raw_ids = str(target_ids_row.iloc[0]["LineID"])
-                user_ids = list(set(re.findall(r'U[a-fA-F0-9]{32}', raw_ids)))
+            if "line" in st.secrets:
+                token = st.secrets["line"]["channel_access_token"]
+                msg = f"【収益報告】\n{selected_project}\nAPR:{total_apr}%\n" + "-"*10 + "\n"
+                for i in range(num_people):
+                    msg += f"No.{i+1}: +${today_yields[i]:,.4f}\n(現元本:${calc_principals[i]+today_yields[i]:,.2f})\n"
                 
-                if user_ids:
-                    success = 0
-                    for uid in user_ids:
-                        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {line_token}"}
-                        payload = {"to": uid, "messages": [{"type": "text", "text": msg}]}
-                        if img_url:
-                            payload["messages"].append({"type": "image", "originalContentUrl": img_url, "previewImageUrl": img_url})
-                        
-                        res = requests.post("https://api.line.me/v2/bot/message/push", headers=headers, json=payload)
-                        if res.status_code == 200: success += 1
-                    st.success(f"{success} 名に送信完了しました。")
-                else:
-                    st.error("有効なLINE IDが見つかりません。")
-            else:
-                st.error(f"LineIDシートにプロジェクト名 '{selected_project}' がありません。")
+                success = 0
+                for uid in user_ids:
+                    if send_line_message(token, uid, msg) == 200: success += 1
+                st.success(f"保存完了。{success}名のユーザーに通知しました。")
+            st.rerun()
+
+    with tab2:
+        st.subheader("出金・精算の記録")
+        target_no = st.selectbox("メンバー", [f"No.{i+1}" for i in range(num_people)])
+        idx = int(target_no.split(".")[1]) - 1
+        st.warning(f"出金可能額: ${calc_principals[idx]:,.2f}")
+        amt = st.number_input("出金額 ($)", min_value=0.0, max_value=calc_principals[idx], step=1.0)
+        
+        if st.button("出金を確定"):
+            if amt > 0:
+                withdrawals = [0.0] * num_people
+                withdrawals[idx] = amt
+                new_row = pd.DataFrame([{
+                    "Date": datetime.now().strftime("%Y-%m-%d"),
+                    "Type": "出金",
+                    "Total_Amount": amt,
+                    "Breakdown": ",".join(map(str, withdrawals)),
+                    "Note": f"Member {idx+1} Withdrawal"
+                }])
+                updated_hist = pd.concat([hist_df, new_row], ignore_index=True)
+                conn.update(worksheet=selected_project, data=updated_hist)
+                st.success("出金を記録しました。")
+                st.rerun()
 
 except Exception as e:
-    st.error(f"エラー: {e}")
+    st.error(f"システムエラーが発生しました: {e}")
