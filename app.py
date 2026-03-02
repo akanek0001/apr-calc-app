@@ -7,12 +7,12 @@ from email.utils import formatdate
 from datetime import datetime
 import re
 
-# --- ページ設定 ---
-st.set_page_config(page_title="APR管理システム", layout="wide")
+# --- 1. ページ基本設定 ---
+st.set_page_config(page_title="APR運用管理システム", layout="wide")
 
-# --- 補助関数 ---
+# --- 2. 補助関数（当時のロジック） ---
 def to_f(val):
-    if pd.isna(val): return 0.0
+    if pd.isna(val) or str(val).strip() == "": return 0.0
     try:
         return float(str(val).replace(',','').replace('$','').replace('%','').strip())
     except: return 0.0
@@ -24,27 +24,33 @@ def split_val(val, n):
         items.append(items[-1] if items else "-")
     return items[:n]
 
-# --- メインロジック ---
+# --- 3. メインロジック ---
 st.title("🏦 APR資産運用管理システム")
 
 try:
     # スプレッドシート読み込み
     base_url = st.secrets["gsheets"]["public_gsheets_url"].split('/edit')[0]
-    df = pd.read_csv(f"{base_url}/export?format=csv&gid=0")
+    
+    # 【ここが修正ポイント】
+    # ヘッダーを自動認識させず、物理的な列位置で確実に取得する
+    df = pd.read_csv(f"{base_url}/export?format=csv&gid=0", header=0)
 
     # プロジェクト選択
     p_list = df.iloc[:, 0].dropna().unique().tolist()
     selected_p = st.sidebar.selectbox("プロジェクト選択", p_list)
 
-    # データの抽出 (物理インデックス固定)
+    # データの抽出 (当時の正確な物理インデックス)
     row = df[df.iloc[:, 0] == selected_p].iloc[0]
+    
+    # 0:Project, 1:Num, 2:Total, 3:Principals, 4:Rates, 5:Compound, 6:Names
     num = int(to_f(row.iloc[1]))
     
-    names = split_val(row.iloc[6], num)
-    principals = [to_f(x) for x in split_val(row.iloc[3], num)]
-    rates = [to_f(x) for x in split_val(row.iloc[4], num)]
+    # 各データの取得（名前が数値にならないようstrに強制変換）
+    names = split_val(str(row.iloc[6]), num)
+    principals = [to_f(x) for x in split_val(str(row.iloc[3]), num)]
+    rates = [to_f(x) for x in split_val(str(row.iloc[4]), num)]
 
-    # 収益計算
+    # 4. 収益計算
     st.subheader(f"📊 {selected_p} 収益計算")
     apr = st.number_input("本日のAPR (%)", value=100.0, step=0.1)
     
@@ -52,7 +58,7 @@ try:
     yields = [(p * (apr / 100) * 0.77 * rates[i]) / 365 for i, p in enumerate(principals)]
     total_y = sum(yields)
 
-    # テーブル表示
+    # 5. テーブル表示
     res_df = pd.DataFrame({
         "メンバー": names,
         "元本 ($)": [f"{p:,.2f}" for p in principals],
@@ -63,13 +69,12 @@ try:
     st.table(res_df)
     st.metric("総収益合計", f"${total_y:,.4f}")
 
-    # 通知セクション
+    # 6. 通知セクション（画像は任意）
     st.markdown("---")
     uploaded_file = st.file_uploader("エビデンス画像（任意）", type=["png", "jpg", "jpeg"])
     
     if st.button("🚀 LINE & Gmail 通知を一斉送信", type="primary"):
         with st.spinner("送信中..."):
-            # メッセージ作成
             msg = f"🏦 【{selected_p}】 収益報告\n"
             msg += f"📅 {datetime.now().strftime('%Y/%m/%d %H:%M')}\n"
             msg += f"📈 本日APR: {apr}%\n"
