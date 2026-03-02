@@ -6,15 +6,14 @@ import re
 
 # --- ページ設定 ---
 st.set_page_config(page_title="APR管理システム", layout="wide")
-st.title("🏦 APR管理システム（運用復帰版）")
+st.title("🏦 APR管理システム（人数固定・安定版）")
 
-# データ分割用関数
-def get_exact_list(val, n):
-    items = [x.strip() for x in re.split(r'[,\s]+', str(val)) if x.strip()]
-    items = items[:n]
-    while len(items) < n:
-        items.append(items[-1] if items else "0")
-    return items
+def safe_float(val):
+    try:
+        clean = str(val).replace(',','').replace('$','').replace('%','').strip()
+        return float(clean) if clean else 0.0
+    except:
+        return 0.0
 
 try:
     # 1. スプレッドシート接続
@@ -28,40 +27,40 @@ try:
     # 3. データの取得
     p_info = df[df.iloc[:, 0] == selected_project].iloc[0]
 
-    # --- B列から「本当の人数」を読み取る ---
-    num_val = re.sub(r'\D', '', str(p_info.iloc[1]))
-    num_people = int(num_val) if num_val else 1
+    # --- 【重要】B列(2列目)の数字を読み取る。失敗したら1名にする ---
+    raw_num = str(p_info.iloc[1]).strip()
+    num_people = int(float(raw_num)) if raw_num and raw_num.replace('.','').isdigit() else 1
 
-    # D列から「全員分の元本」を読み取って合計する
-    def to_f(val):
-        try:
-            return float(str(val).replace(',','').replace('$','').strip())
-        except:
-            return 0.0
+    # --- 【重要】D列(4列目)から元本を取得し、B列の「人数分だけ」を取り出す ---
+    raw_p_data = str(p_info.iloc[3])
+    # カンマまたはスペースで区切られたデータをリスト化
+    p_list_all = [x.strip() for x in re.split(r'[,\s]+', raw_p_data) if x.strip()]
+    
+    # B列の人数(num_people)の数だけ、先頭からデータを取り出す（足りなければ0で埋める）
+    final_principals = []
+    for i in range(num_people):
+        if i < len(p_list_all):
+            final_principals.append(safe_float(p_list_all[i]))
+        else:
+            final_principals.append(0.0)
 
-    # カンマ区切りの数値をリスト化
-    raw_principals = get_exact_list(p_info.iloc[3], num_people)
-    principal_list = [to_f(p) for p in raw_principals]
-    total_principal = sum(principal_list)
+    total_principal = sum(final_principals)
 
     # --- 表示 ---
-    st.subheader(f"📊 {selected_project} の運用状況")
+    st.subheader(f"📊 {selected_project} の状況")
     
     col1, col2, col3 = st.columns(3)
-    col1.metric("確定人数", f"{num_people} 名")
+    col1.metric("確定人数 (B列参照)", f"{num_people} 名")
     col2.metric("総運用元本", f"${total_principal:,.2f}")
     
-    # 平均APRの入力
     total_apr = st.number_input("全体のAPR (%)", value=100.0, step=0.01)
-    
-    # 全員の収益合計を計算
     total_yield = round((total_principal * (total_apr / 100)) / 365, 4)
     col3.metric("本日の総収益", f"${total_yield:,.4f}")
 
-    # 個別内訳の確認用（デバッグ用）
-    with st.expander("メンバー別内訳を確認"):
-        for i, p in enumerate(principal_list):
-            st.write(f"No.{i+1}: 元本 ${p:,.2f} / 予想収益 ${round((p * (total_apr/100))/365, 4):,.4f}")
+    # 内訳の表示（ここを見れば、正しく読み込めているか分かります）
+    with st.expander("データ読み込みの内訳（確認用）"):
+        st.write(f"B列の人数: {num_people}")
+        st.write(f"読み込んだ元本リスト: {final_principals}")
 
     if st.button("収益データを履歴に保存"):
         try:
@@ -72,13 +71,13 @@ try:
         new_data = pd.DataFrame([{
             "Date": datetime.now().strftime("%Y-%m-%d"),
             "Total_Principal": total_principal,
-            "Breakdown": ", ".join(map(str, [round((p * (total_apr/100))/365, 4) for p in principal_list])),
+            "Breakdown": ", ".join(map(str, [round((p * (total_apr/100))/365, 4) for p in final_principals])),
             "Paid_Flags": ",".join(["0"] * num_people)
         }])
         
         updated_df = pd.concat([hist_df, new_data], ignore_index=True)
         conn.update(worksheet=selected_project, data=updated_df)
-        st.success(f"{selected_project} の履歴を更新しました！")
+        st.success(f"保存完了しました。")
         st.rerun()
 
 except Exception as e:
