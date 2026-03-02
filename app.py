@@ -6,7 +6,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.header import Header
 import re
-
+ 
 # --- ページ設定 ---
 st.set_page_config(page_title="APR管理システム", layout="wide", page_icon="🏦")
 st.title("🏦 APR管理システム（33%控除・実質分配版）")
