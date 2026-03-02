@@ -6,10 +6,10 @@ from email.mime.text import MIMEText
 from datetime import datetime
 import re
 
-# --- ページ基本設定 ---
-st.set_page_config(page_title="APR管理システム", layout="wide")
+# --- ページ設定 ---
+st.set_page_config(page_title="APR運用管理システム", layout="wide")
 
-# --- 以前のデータ処理関数 ---
+# --- 補助関数 ---
 def to_f(val):
     if pd.isna(val): return 0.0
     try:
@@ -27,33 +27,31 @@ def split_val(val, n):
 st.title("💰 APR運用管理システム")
 
 try:
-    # 🔗 スプレッドシート読み込み
+    # 1. スプレッドシート読み込み (当時のデフォルト設定)
     sheet_url = st.secrets["gsheets"]["public_gsheets_url"].split('/edit')[0]
-    # 【ここが最重要】header=None にすることで、1行目から正確にカウントします
-    df = pd.read_csv(f"{sheet_url}/export?format=csv&gid=0", header=None)
+    df = pd.read_csv(f"{sheet_url}/export?format=csv&gid=0")
 
-    # 1行目が項目名(Project等)の場合、それを飛ばしてリスト化
-    p_list = df.iloc[1:, 0].dropna().unique().tolist()
+    # 2. プロジェクト選択
+    p_list = df.iloc[:, 0].dropna().unique().tolist()
     selected_p = st.sidebar.selectbox("プロジェクト選択", p_list)
 
-    # データ抽出 (以前成功していた時の物理インデックス)
-    # 0:Project, 1:Num, 3:Principals, 4:Rates, 6:Names
+    # 3. データ抽出 (以前成功していた時の物理インデックス)
+    # A:0(Project), B:1(Num), D:3(Principals), E:4(Rates), G:6(Names)
     p_info = df[df.iloc[:, 0] == selected_p].iloc[0]
     num = int(to_f(p_info.iloc[1]))
     
-    # データのズレを物理的に解消
-    names = split_val(str(p_info.iloc[6]), num)
-    principals = [to_f(p) for p in split_val(str(p_info.iloc[3]), num)]
-    rates = [to_f(r) for r in split_val(str(p_info.iloc[4]), num)]
+    names = split_val(p_info.iloc[6], num)
+    principals = [to_f(p) for p in split_val(p_info.iloc[3], num)]
+    rates = [to_f(r) for r in split_val(p_info.iloc[4], num)]
 
     st.subheader(f"📊 {selected_p} 収益計算")
     apr = st.number_input("本日のAPR (%)", value=100.0, step=0.1)
     
-    # 計算式
+    # 計算 (元本 * APR% * 0.77 * 比率 / 365)
     yields = [(p * (apr / 100) * 0.77 * rates[i]) / 365 for i, p in enumerate(principals)]
     total_y = sum(yields)
 
-    # テーブル表示
+    # 表示用データフレーム
     res_df = pd.DataFrame({
         "メンバー": names,
         "元本 ($)": [f"{p:,.2f}" for p in principals],
@@ -64,7 +62,7 @@ try:
     st.table(res_df)
     st.metric("総収益合計", f"${total_y:,.4f}")
 
-    # 通知送信 (画像は任意)
+    # 4. 通知送信 (画像は任意)
     st.markdown("---")
     uploaded_file = st.file_uploader("エビデンス画像 (任意)", type=["png", "jpg", "jpeg"])
     
@@ -98,12 +96,13 @@ try:
             conf = st.secrets["gmail"]
             mail = MIMEText(msg)
             mail['Subject'] = f"【{selected_p}】収益報告"
-            mail['From'], mail['To'] = conf["user"], conf["user"]
+            mail['From'] = conf["user"]
+            mail['To'] = conf["user"]
             with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
                 smtp.login(conf["user"], conf["password"])
                 smtp.send_message(mail)
                 
-            st.success("完了しました！")
+            st.success("送信完了しました！")
 
 except Exception as e:
     st.error(f"エラー: {e}")
