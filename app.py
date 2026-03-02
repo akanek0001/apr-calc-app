@@ -3,7 +3,7 @@ from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 from datetime import datetime, timedelta
 import requests
-import json 
+import json
 import re
 
 # --- 1. ページ設定 ---
@@ -58,17 +58,29 @@ try:
     rate_list = [to_f(r) for r in split_val(p_info.iloc[4], num_people)]
     is_compound = str(p_info.iloc[5]).upper() in ["TRUE", "はい", "YES", "1"]
 
+    # LINE ID および 個人名の取得
     user_ids = []
+    member_names = []
     if not line_id_df.empty:
+        # 1列目を名前、2列目以降にあるUから始まるものをIDとして取得
+        member_names = line_id_df.iloc[:, 0].dropna().astype(str).tolist()
         all_cells = line_id_df.values.flatten().astype(str)
         user_ids = sorted(list(set([str(x).strip() for x in all_cells if str(x).startswith('U')])))
+
+    # 人数と名前のリストを合わせる（足りない場合はNo.で補完）
+    display_names = []
+    for i in range(num_people):
+        if i < len(member_names):
+            display_names.append(f"{member_names[i]}")
+        else:
+            display_names.append(f"No.{i+1}")
 
     try:
         hist_df = conn.read(worksheet=selected_project, ttl=60)
     except:
         hist_df = pd.DataFrame(columns=["Date", "Type", "Total_Amount", "Breakdown", "Note"])
 
-    # 累計計算 (収益、出金、入金)
+    # 累計計算
     total_earned = [0.0] * num_people
     total_withdrawn = [0.0] * num_people
     total_deposited = [0.0] * num_people
@@ -115,7 +127,7 @@ try:
                 now_str = jst_now.strftime("%Y/%m/%d %H:%M")
                 msg = f"🏦 【資産運用収益報告書】\n━━━━━━━━━━━━━━\nプロジェクト: {selected_project}\n報告日時: {now_str}\n━━━━━━━━━━━━━━\n\n📈 本日の結果\nAPR: {total_apr}%\nモード: {'複利運用' if is_compound else '単利運用'}\n\n💰 収益明細\n"
                 for i in range(num_people):
-                    msg += f"・No.{i+1}: +${today_yields[i]:,.4f}\n  (元本: ${calc_principals[i]+today_yields[i]:,.2f})\n"
+                    msg += f"・{display_names[i]}: +${today_yields[i]:,.4f}\n  (元本: ${calc_principals[i]+today_yields[i]:,.2f})\n"
                 msg += f"\n━━━━━━━━━━━━━━\n※画像エビデンスを添付いたします。\nご確認のほどお願い申し上げます。"
 
                 img_url = st.session_state.get("img_url")
@@ -127,9 +139,11 @@ try:
 
     with tab2:
         st.subheader("💸 入金・出金の記録")
-        target_no = st.selectbox("メンバーを選択", [f"No.{i+1}" for i in range(num_people)])
-        idx = int(target_no.split(".")[1]) - 1
-        st.info(f"現在の評価額（元本）: **${calc_principals[idx]:,.2f}**")
+        # 選択肢を個人名に
+        selected_name = st.selectbox("メンバーを選択", display_names)
+        idx = display_names.index(selected_name)
+        
+        st.info(f"対象者: {selected_name}\n現在の評価額（元本）: **${calc_principals[idx]:,.2f}**")
         
         col1, col2 = st.columns(2)
         with col1:
@@ -144,8 +158,8 @@ try:
                 val_list[idx] = amount
                 type_label = "入金" if "入金" in trans_type else "出金"
                 
-                # --- 【修正ポイント】Note欄に誰の操作か自動で書き込む ---
-                final_memo = f"[{target_no}] {user_memo if user_memo else type_label}"
+                # --- 個人名をNote欄に記録 ---
+                final_memo = f"[{selected_name}] {user_memo if user_memo else type_label}"
                 
                 new_row = pd.DataFrame([{
                     "Date": datetime.now().strftime("%Y-%m-%d"), 
@@ -156,7 +170,7 @@ try:
                 }])
                 
                 conn.update(worksheet=selected_project, data=pd.concat([hist_df, new_row], ignore_index=True))
-                st.success(f"{target_no} の {type_label}（${amount}）を記録しました。")
+                st.success(f"{selected_name} 様の {type_label}（${amount}）を記録しました。")
                 st.rerun()
             else:
                 st.warning("金額を入力してください。")
