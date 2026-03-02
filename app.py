@@ -1,10 +1,10 @@
 import streamlit as st
 from streamlit_gsheets import GSheetsConnection
 import pandas as pd
-from datetime import datetime, timedelta  # timedeltaを追加
+from datetime import datetime, timedelta
 import requests
 import json
-import re 
+import re
 
 # --- 1. ページ設定 ---
 st.set_page_config(page_title="APR管理システム", layout="wide", page_icon="🏦")
@@ -38,7 +38,7 @@ def send_line_multimedia(token, user_id, text, image_url=None):
     except: return 500
 
 # --- 3. メインロジック ---
-st.title("🏦 APR資産運用管理システム")
+st.title("🏦 APR資産運用管理システム（画像保存版）")
 
 try:
     conn = st.connection("gsheets", type=GSheetsConnection)
@@ -103,30 +103,39 @@ try:
         today_yields = [round((p * (total_apr * 0.67 * rate_list[i] / 100)) / 365, 4) for i, p in enumerate(calc_principals)]
 
         if st.button("収益を確定してLINE送信"):
-            # 保存
-            new_row = pd.DataFrame([{"Date": datetime.now().strftime("%Y-%m-%d"), "Type": "収益", "Total_Amount": sum(today_yields), "Breakdown": ",".join(map(str, today_yields)), "Note": f"APR:{total_apr}%"}])
+            img_url = st.session_state.get("img_url", "")
+            
+            # --- 【修正】スプレッドシートの Note 欄に画像URLを含めて保存 ---
+            new_row = pd.DataFrame([{
+                "Date": datetime.now().strftime("%Y-%m-%d"),
+                "Type": "収益",
+                "Total_Amount": sum(today_yields),
+                "Breakdown": ",".join(map(str, today_yields)),
+                "Note": f"APR:{total_apr}% | Image: {img_url}"
+            }])
             conn.update(worksheet=selected_project, data=pd.concat([hist_df, new_row], ignore_index=True))
             
             # LINE送信
             if "line" in st.secrets:
-                # --- 【重要】日本時間(JST)への修正 ---
                 jst_now = datetime.utcnow() + timedelta(hours=9)
                 now_str = jst_now.strftime("%Y/%m/%d %H:%M")
-                # ------------------------------------
                 
                 msg = f"🏦 【資産運用収益報告書】\n━━━━━━━━━━━━━━\nプロジェクト: {selected_project}\n報告日時: {now_str}\n━━━━━━━━━━━━━━\n\n📈 本日の結果\nAPR: {total_apr}%\nモード: {'複利運用' if is_compound else '単利運用'}\n\n💰 収益明細\n"
                 for i in range(num_people):
                     msg += f"・No.{i+1}: +${today_yields[i]:,.4f}\n  (元本: ${calc_principals[i]+today_yields[i]:,.2f})\n"
                 msg += f"\n━━━━━━━━━━━━━━\n※画像エビデンスを添付いたします。\nご確認のほどお願い申し上げます。"
 
-                img_url = st.session_state.get("img_url")
                 success = 0
                 for uid in user_ids:
                     if send_line_multimedia(st.secrets["line"]["channel_access_token"], uid, msg, img_url) == 200: success += 1
                 st.success(f"{success}名に送信完了")
+            
+            # 完了後、セッションの画像をクリア
+            if "img_url" in st.session_state: del st.session_state["img_url"]
             st.rerun()
 
     with tab2:
+        # (出金管理ロジックは変更なし)
         st.subheader("💸 出金・精算の記録")
         target_no = st.selectbox("メンバーを選択", [f"No.{i+1}" for i in range(num_people)])
         idx = int(target_no.split(".")[1]) - 1
