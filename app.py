@@ -4,7 +4,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 import requests
 import json
-import re 
+import re
 
 # --- 1. ページ設定 ---
 st.set_page_config(page_title="APR管理システム", layout="wide", page_icon="🏦")
@@ -85,12 +85,10 @@ try:
                         elif rtype == "入金": total_deposited[i] += vals[i]
             except: continue
 
-    # 最新元本の計算 (初期値 + 収益 + 入金 - 出金)
     calc_principals = [(base_principals[i] + total_earned[i] + total_deposited[i] - total_withdrawn[i]) if is_compound else (base_principals[i] + total_deposited[i] - total_withdrawn[i]) for i in range(num_people)]
 
     tab1, tab2 = st.tabs(["📈 収益確定・報告", "💸 入出金・精算"])
 
-    # --- タブ1: 収益報告 ---
     with tab1:
         st.subheader("📊 本日の運用報告作成")
         total_apr = st.number_input("本日のAPR (%)", value=100.0, step=0.1)
@@ -127,7 +125,6 @@ try:
                 st.success(f"{success}名に送信完了")
             st.rerun()
 
-    # --- タブ2: 入出金管理 ---
     with tab2:
         st.subheader("💸 入金・出金の記録")
         target_no = st.selectbox("メンバーを選択", [f"No.{i+1}" for i in range(num_people)])
@@ -139,25 +136,27 @@ try:
             trans_type = st.radio("種別を選択", ["入金（預け入れ）", "出金（引き出し）"])
         with col2:
             amount = st.number_input("金額 ($)", min_value=0.0, step=10.0)
-            memo = st.text_input("備考", value="元本調整")
+            user_memo = st.text_input("備考", value="")
 
         if st.button("記録を保存"):
             if amount > 0:
                 val_list = [0.0] * num_people
                 val_list[idx] = amount
-                
                 type_label = "入金" if "入金" in trans_type else "出金"
+                
+                # --- 【修正ポイント】Note欄に誰の操作か自動で書き込む ---
+                final_memo = f"[{target_no}] {user_memo if user_memo else type_label}"
                 
                 new_row = pd.DataFrame([{
                     "Date": datetime.now().strftime("%Y-%m-%d"), 
                     "Type": type_label, 
                     "Total_Amount": amount, 
                     "Breakdown": ",".join(map(str, val_list)), 
-                    "Note": memo
+                    "Note": final_memo
                 }])
                 
                 conn.update(worksheet=selected_project, data=pd.concat([hist_df, new_row], ignore_index=True))
-                st.success(f"No.{idx+1} の {type_label}（${amount}）を記録しました。")
+                st.success(f"{target_no} の {type_label}（${amount}）を記録しました。")
                 st.rerun()
             else:
                 st.warning("金額を入力してください。")
