@@ -2,82 +2,105 @@ import streamlit as st
 from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 from datetime import datetime
+import smtplib
+from email.mime.text import MIMEText
+from email.header import Header
 import re
 
 # --- ページ設定 ---
 st.set_page_config(page_title="APR管理システム", layout="wide")
-st.title("🏦 APR管理システム（人数固定・安定版）")
+st.title("🏦 APR管理システム（フル機能版）")
 
-def safe_float(val):
+# --- 便利関数 ---
+def to_f(val):
     try:
         clean = str(val).replace(',','').replace('$','').replace('%','').strip()
         return float(clean) if clean else 0.0
-    except:
-        return 0.0
+    except: return 0.0
 
+def split_val(val, n):
+    items = [x.strip() for x in re.split(r'[,\s]+', str(val)) if x.strip()]
+    items = items[:n]
+    while len(items) < n:
+        items.append(items[-1] if items else "0")
+    return items
+
+# --- メインロジック ---
 try:
-    # 1. スプレッドシート接続
     conn = st.connection("gsheets", type=GSheetsConnection)
     df = conn.read(worksheet="Settings")
     
-    # 2. プロジェクト選択
     project_list = df.iloc[:, 0].dropna().astype(str).tolist()
     selected_project = st.sidebar.selectbox("プロジェクトを選択", project_list)
-    
-    # 3. データの取得
     p_info = df[df.iloc[:, 0] == selected_project].iloc[0]
 
-    # --- 【重要】B列(2列目)の数字を読み取る。失敗したら1名にする ---
+    # 設定の読み込み
     raw_num = str(p_info.iloc[1]).strip()
     num_people = int(float(raw_num)) if raw_num and raw_num.replace('.','').isdigit() else 1
-
-    # --- 【重要】D列(4列目)から元本を取得し、B列の「人数分だけ」を取り出す ---
-    raw_p_data = str(p_info.iloc[3])
-    # カンマまたはスペースで区切られたデータをリスト化
-    p_list_all = [x.strip() for x in re.split(r'[,\s]+', raw_p_data) if x.strip()]
     
-    # B列の人数(num_people)の数だけ、先頭からデータを取り出す（足りなければ0で埋める）
-    final_principals = []
+    base_principals = [to_f(p) for p in split_val(p_info.iloc[3], num_people)]
+    rate_list = [to_f(r) for r in split_val(p_info.iloc[4], num_people)]
+    email_list = split_val(p_info.iloc[2], num_people)
+    wallet_list = split_val(p_info.iloc[5], num_people)
+
+    # 履歴の読み込み（複利計算用）
+    try:
+        hist_df = conn.read(worksheet=selected_project)
+    except:
+        hist_df = pd.DataFrame()
+
+    # 複利計算ロジック
+    current_principals = []
     for i in range(num_people):
-        if i < len(p_list_all):
-            final_principals.append(safe_float(p_list_all[i]))
-        else:
-            final_principals.append(0.0)
+        unpaid_amount = 0.0
+        if not hist_df.empty and "Paid_Flags" in hist_df.columns:
+            for _, row in hist_df.iterrows():
+                flags = str(row["Paid_Flags"]).split(",")
+                if i < len(flags) and flags[i].strip() == "0":
+                    breakdown = str(row["Breakdown"]).split(",")
+                    if i < len(breakdown):
+                        unpaid_amount += to_f(breakdown[i])
+        current_principals.append(base_principals[i] + unpaid_amount)
 
-    total_principal = sum(final_principals)
+    # --- 画面表示 ---
+    st.subheader(f"📊 {selected_project} の運用状況")
+    total_apr = st.number_input("本日のAPR (%)", value=100.0, step=0.01)
 
-    # --- 表示 ---
-    st.subheader(f"📊 {selected_project} の状況")
+    today_yields = [round((p * (total_apr * rate_list[i] / 100)) / 365, 4) for i, p in enumerate(current_principals)]
     
-    col1, col2, col3 = st.columns(3)
-    col1.metric("確定人数 (B列参照)", f"{num_people} 名")
-    col2.metric("総運用元本", f"${total_principal:,.2f}")
-    
-    total_apr = st.number_input("全体のAPR (%)", value=100.0, step=0.01)
-    total_yield = round((total_principal * (total_apr / 100)) / 365, 4)
-    col3.metric("本日の総収益", f"${total_yield:,.4f}")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("確定人数", f"{num_people} 名")
+    c2.metric("運用総元本", f"${sum(current_principals):,.2f}")
+    c3.metric("本日の総収益", f"${sum(today_yields):,.4f}")
 
-    # 内訳の表示（ここを見れば、正しく読み込めているか分かります）
-    with st.expander("データ読み込みの内訳（確認用）"):
-        st.write(f"B列の人数: {num_people}")
-        st.write(f"読み込んだ元本リスト: {final_principals}")
-
-    if st.button("収益データを履歴に保存"):
-        try:
-            hist_df = conn.read(worksheet=selected_project)
-        except:
-            hist_df = pd.DataFrame()
-            
-        new_data = pd.DataFrame([{
+    if st.button("収益を確定してメール送信"):
+        # 1. 履歴保存
+        new_row = pd.DataFrame([{
             "Date": datetime.now().strftime("%Y-%m-%d"),
-            "Total_Principal": total_principal,
-            "Breakdown": ", ".join(map(str, [round((p * (total_apr/100))/365, 4) for p in final_principals])),
+            "Total_Principal": round(sum(current_principals), 2),
+            "Breakdown": ", ".join(map(str, today_yields)),
             "Paid_Flags": ",".join(["0"] * num_people)
         }])
+        updated_hist = pd.concat([hist_df, new_row], ignore_index=True)
+        conn.update(worksheet=selected_project, data=updated_hist)
         
-        updated_df = pd.concat([hist_df, new_data], ignore_index=True)
-        conn.update(worksheet=selected_project, data=updated_df)
-        st.success(f"保存完了しました。")
+        # 2. メール送信処理
+        if "gmail" in st.secrets:
+            mail_user = st.secrets["gmail"]["user"]
+            mail_pass = st.secrets["gmail"]["password"]
+            
+            for i in range(num_people):
+                msg = MIMEText(f"{selected_project}の収益報告です。\n\n本日の収益: ${today_yields[i]}\n現在の運用元本: ${current_principals[i]}\nWallet: {wallet_list[i]}")
+                msg['Subject'] = Header(f"【収益報告】{selected_project}", 'utf-8')
+                msg['From'] = mail_user
+                msg['To'] = email_list[i]
+                
+                with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+                    smtp.login(mail_user, mail_pass)
+                    smtp.send_message(msg)
+            st.success("履歴を保存し、メールを送信しました！")
+        else:
+            st.warning("履歴は保存しましたが、メール設定(Secrets)がないため送信をスキップしました。")
         st.rerun()
 
 except Exception as e:
