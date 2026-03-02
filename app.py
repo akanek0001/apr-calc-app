@@ -46,8 +46,8 @@ st.title("🏦 APR管理システム（画像投稿完結型）")
 
 try:
     conn = st.connection("gsheets", type=GSheetsConnection)
-    settings_df = conn.read(worksheet="Settings", ttl=0)
-    line_id_df = conn.read(worksheet="LineID", ttl=0)
+    settings_df = conn.read(worksheet="Settings", ttl=60)
+    line_id_df = conn.read(worksheet="LineID", ttl=60)
     
     if settings_df.empty:
         st.error("Settingsシートが空です。")
