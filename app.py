@@ -1,89 +1,123 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime, timedelta
 import requests
+from datetime import datetime
 import re
+import smtplib
+from email.mime.text import MIMEText
+from email.utils import formatdate
 
-# --- 1. 設定 ---
-st.set_page_config(page_title="APR運用システム", layout="wide")
+# --- 1. ページ基本設定 ---
+st.set_page_config(page_title="APR運用管理システム", layout="wide")
 
-# スプレッドシートをCSVとして読み込む関数
-def fetch_data(gid):
-    url = st.secrets["gsheets"]["public_gsheets_url"].split('/edit')[0]
-    csv_url = f"{url}/export?format=csv&gid={gid}"
-    return pd.read_csv(csv_url)
+# --- 2. 便利関数群 ---
+def to_f(val):
+    if pd.isna(val): return 0.0
+    try:
+        clean = str(val).replace(',','').replace('$','').replace('%','').strip()
+        return float(clean) if clean else 0.0
+    except: return 0.0
 
-# --- 2. メインロジック ---
-st.title("💎 APR資産運用管理システム Ultra-Light")
+def split_val(val, n):
+    if pd.isna(val) or str(val).strip() == "": return ["0"] * n
+    items = [x.strip() for x in re.split(r'[,\s]+', str(val)) if x.strip()]
+    while len(items) < n:
+        items.append(items[-1] if items else "0")
+    return items[:n]
+
+def upload_to_imgbb(file):
+    url = "https://api.imgbb.com/1/upload"
+    payload = {"key": st.secrets["imgbb"]["api_key"]}
+    files = {"image": file.getvalue()}
+    res = requests.post(url, payload, files=files)
+    return res.json()["data"]["url"] if res.status_code == 200 else None
+
+def send_gmail(subject, body):
+    conf = st.secrets["gmail"]
+    msg = MIMEText(body)
+    msg['Subject'] = subject
+    msg['From'] = conf["user"]
+    msg['To'] = conf["user"]
+    msg['Date'] = formatdate(localtime=True)
+    
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+        smtp.login(conf["user"], conf["password"])
+        smtp.send_message(msg)
+
+# --- 3. メインシステム ---
+st.title("💰 APR運用管理システム (収益報告版)")
 
 try:
-    # Settingsシート(gid=0)の読み込み
-    settings_df = fetch_data("0")
+    # スプレッドシート読み込み (CSV変換方式)
+    base_url = st.secrets["gsheets"]["public_gsheets_url"].split('/edit')[0]
+    settings_df = pd.read_csv(f"{base_url}/export?format=csv&gid=0")
     
     # プロジェクト選択
     project_list = settings_df.iloc[:, 0].dropna().unique().tolist()
-    selected_project = st.sidebar.selectbox("プロジェクト選択", project_list)
+    selected_p = st.sidebar.selectbox("プロジェクト選択", project_list)
     
-    # 選択プロジェクトのデータ抽出
-    p_idx = settings_df[settings_df.iloc[:, 0] == selected_project].index[0]
-    p_info = settings_df.loc[p_idx]
+    # データ抽出
+    p_info = settings_df[settings_df.iloc[:, 0] == selected_p].iloc[0]
+    num = int(to_f(p_info.iloc[1]))
+    names = split_val(p_info.iloc[6], num)
+    principals = [to_f(p) for p in split_val(p_info.iloc[3], num)]
+    rates = [to_f(r) for r in split_val(p_info.iloc[4], num)]
+
+    # 入力セクション
+    st.subheader("📊 今日の収益計算")
+    col1, col2 = st.columns(2)
+    with col1:
+        apr = st.number_input("本日のAPR (%)", value=100.0, step=0.1)
+    with col2:
+        fee = 0.77
+        st.info(f"手数料係数: {fee}")
+
+    # 収益計算
+    yields = [(p * (apr/100) * fee * rates[i]) / 365 for i, p in enumerate(principals)]
     
-    # 人数・元本・名前などの展開
-    num = int(p_info.iloc[1])
-    names = str(p_info.iloc[6]).split(',')
-    principals = [float(x) for x in str(p_info.iloc[3]).split(',')]
-    rates = [float(x) for x in str(p_info.iloc[4]).split(',')]
+    # 結果表示
+    res_df = pd.DataFrame({
+        "名前": names,
+        "元本 ($)": [f"{p:,.2f}" for p in principals],
+        "本日収益 ($)": [f"{y:,.4f}" for y in yields]
+    })
+    st.table(res_df)
 
-    tab1, tab2, tab3 = st.tabs(["📈 収益報告", "💸 入出金", "👥 ユーザー追加"])
+    # 報告セクション
+    st.markdown("---")
+    st.subheader("🚀 報告・通知")
+    
+    uploaded_file = st.file_uploader("エビデンス画像をアップロード", type=["png", "jpg", "jpeg"])
+    
+    if st.button("通知を一斉送信する", type="primary"):
+        with st.spinner("処理中..."):
+            # 1. メッセージ作成
+            report_msg = f"🏦 【{selected_p}】 収益報告\n"
+            report_msg += f"本日APR: {apr}%\n"
+            report_msg += "------------------\n"
+            for i in range(num):
+                report_msg += f"・{names[i]}: +${yields[i]:,.4f}\n"
+            report_msg += "------------------\n"
+            
+            img_url = ""
+            if uploaded_file:
+                img_url = upload_to_imgbb(uploaded_file)
+                if img_url: report_msg += f"\n🖼 エビデンス:\n{img_url}"
 
-    # --- タブ1: 収益報告 & LINE送信 ---
-    with tab1:
-        st.subheader("本日の収益報告")
-        apr = st.number_input("本日のAPR (%)", value=100.0)
-        uploaded_file = st.file_uploader("エビデンス画像", type=['png', 'jpg'])
-        
-        # 収益計算 (0.77係数)
-        yields = [round((p * (apr * 0.77 * rates[i] / 100)) / 365, 4) for i, p in enumerate(principals)]
-        
-        preview = f"🏦 【{selected_project}】\nAPR: {apr}%\n"
-        for i in range(len(names)):
-            preview += f"・{names[i]}: +${yields[i]:,.4f}\n"
-        st.code(preview)
-
-        if st.button("🚀 LINE送信＆保存", type="primary"):
-            # ここでGASのWebhook URLへデータを飛ばす（LINE送信とスプレッドシート保存を一度に実行）
-            payload = {
-                "type": "report",
-                "project": selected_project,
-                "message": preview,
-                "data": yields
+            # 2. LINE送信
+            line_headers = {
+                "Authorization": f"Bearer {st.secrets['line']['channel_access_token']}",
+                "Content-Type": "application/json"
             }
-            requests.post(st.secrets["gas_url"], json=payload)
-            st.success("送信完了！")
-
-    # --- タブ3: ユーザー追加 ---
-    with tab3:
-        st.subheader("👥 ユーザー追加登録")
-        with st.form("add_user"):
-            new_n = st.text_input("名前")
-            new_p = st.number_input("元本 ($)", value=0.0)
-            if st.form_submit_button("追加を実行"):
-                # 新しいリストを作成してGASへ飛ばす
-                names.append(new_n)
-                principals.append(new_p)
-                rates.append(1.0)
-                
-                payload = {
-                    "type": "add_user",
-                    "project": selected_project,
-                    "names": ",".join(names),
-                    "principals": ",".join([str(x) for x in principals]),
-                    "rates": ",".join([str(x) for x in rates]),
-                    "num": len(names)
-                }
-                requests.post(st.secrets["gas_url"], json=payload)
-                st.success(f"{new_n}様を追加しました。")
-                st.rerun()
+            line_payload = {"messages": [{"type": "text", "text": report_msg}]}
+            requests.post("https://api.line.me/v2/bot/message/broadcast", headers=line_headers, json=line_payload)
+            
+            # 3. Gmail送信
+            send_gmail(f"【{selected_p}】収益報告", report_msg)
+            
+            st.success("LINEおよびGmailへの送信が完了しました！")
+            st.balloons()
 
 except Exception as e:
-    st.error(f"エラー: {e}")
+    st.error(f"接続エラー: {e}")
+    st.info("Secretsの設定とスプレッドシートの共有設定を確認してください。")
