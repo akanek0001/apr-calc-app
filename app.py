@@ -131,17 +131,51 @@ try:
             updated_hist = pd.concat([hist_df, new_row], ignore_index=True)
             conn.update(worksheet=selected_project, data=updated_hist)
             
+          [line]
+channel_access_token = "EYZpry+KdabiZ1B/G8PlQkyLW5/BK/qjccWqFAMfYV7/H3NMzgMoJy5mX8HtgYypmYIx/eDNNet4qDKa3EkNaYVLReb9pRwExD+kEyT2EyzVhwU+UppXQrHpRNQHK4duaIfQ56zewqW32knrDNYnaQdB04t89/1O/w1cDnyilFU="
+user_id = "U352695b567963ba0e6c5be7fe0aade88"
+
+# メール送信設定
+[gmail]
+user = "akanek@gmail.com"
+password = "qdlwdfnbgvtcsxvc"  # スペースを詰めたもの
+ 
             if "line" in st.secrets:
                 token = st.secrets["line"]["channel_access_token"]
-                msg = f"【収益報告】\n{selected_project}\nAPR:{total_apr}%\n" + "-"*10 + "\n"
-                for i in range(num_people):
-                    msg += f"No.{i+1}: +${today_yields[i]:,.4f}\n(現元本:${calc_principals[i]+today_yields[i]:,.2f})\n"
                 
-                success = 0
+                # --- 報告書の作成 ---
+                now_str = datetime.now().strftime("%Y/%m/%d %H:%M")
+                mode_str = "【複利運用】" if is_compound else "【単利運用】"
+                
+                msg = f"🏦 【運用収益報告書】\n"
+                msg += f"プロジェクト: {selected_project}\n"
+                msg += f"報告日時: {now_str}\n\n"
+                msg += f"━━━━━━━━━━━━━━\n"
+                msg += f"📊 本日の運用結果\n"
+                msg += f"━━━━━━━━━━━━━━\n"
+                msg += f"本日のAPR: {total_apr}%\n\n"
+                msg += f"💰 各メンバー収益明細\n"
+                
+                for i in range(num_people):
+                    new_p = calc_principals[i] + today_yields[i]
+                    msg += f"・No.{i+1}: +${today_yields[i]:,.4f}\n"
+                    msg += f"  (現在元本: ${new_p:,.2f})\n"
+                
+                msg += f"\n━━━━━━━━━━━━━━\n"
+                msg += f"💡 運用状況メモ\n"
+                msg += f"現在のモード: {mode_str}\n"
+                if is_compound:
+                    msg += f"※収益は次回の元本に組み入れられます。\n"
+                msg += f"━━━━━━━━━━━━━━"
+                
+                # 送信実行
+                success_count = 0
                 for uid in user_ids:
-                    if send_line_message(token, uid, msg) == 200: success += 1
-                st.success(f"保存完了。{success}名のユーザーに通知しました。")
-            st.rerun()
+                    if send_line_message(token, uid, msg) == 200:
+                        success_count += 1
+                st.success(f"報告書を送信しました（送信成功: {success_count}名）")
+
+
 
     with tab2:
         st.subheader("出金・精算の記録")
