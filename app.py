@@ -7,12 +7,12 @@ from email.utils import formatdate
 from datetime import datetime
 import re
 
-# --- 1. ページ基本設定 ---
+# --- ページ設定 ---
 st.set_page_config(page_title="APR運用管理システム", layout="wide")
 
-# --- 2. 補助関数（当時のロジック） ---
+# --- 補助関数 ---
 def to_f(val):
-    if pd.isna(val) or str(val).strip() == "": return 0.0
+    if pd.isna(val): return 0.0
     try:
         return float(str(val).replace(',','').replace('$','').replace('%','').strip())
     except: return 0.0
@@ -24,98 +24,75 @@ def split_val(val, n):
         items.append(items[-1] if items else "-")
     return items[:n]
 
-# --- 3. メインロジック ---
-st.title("🏦 APR資産運用管理システム")
+# --- メインロジック ---
+st.title("💰 APR運用管理システム")
 
 try:
     # スプレッドシート読み込み
-    base_url = st.secrets["gsheets"]["public_gsheets_url"].split('/edit')[0]
+    sheet_url = st.secrets["gsheets"]["public_gsheets_url"].split('/edit')[0]
+    df = pd.read_csv(f"{sheet_url}/export?format=csv&gid=0")
     
-    # 【ここが修正ポイント】
-    # ヘッダーを自動認識させず、物理的な列位置で確実に取得する
-    df = pd.read_csv(f"{base_url}/export?format=csv&gid=0", header=0)
-
     # プロジェクト選択
     p_list = df.iloc[:, 0].dropna().unique().tolist()
     selected_p = st.sidebar.selectbox("プロジェクト選択", p_list)
-
-    # データの抽出 (当時の正確な物理インデックス)
-    row = df[df.iloc[:, 0] == selected_p].iloc[0]
     
-    # 0:Project, 1:Num, 2:Total, 3:Principals, 4:Rates, 5:Compound, 6:Names
-    num = int(to_f(row.iloc[1]))
-    
-    # 各データの取得（名前が数値にならないようstrに強制変換）
-    names = split_val(str(row.iloc[6]), num)
-    principals = [to_f(x) for x in split_val(str(row.iloc[3]), num)]
-    rates = [to_f(x) for x in split_val(str(row.iloc[4]), num)]
+    # データ抽出
+    p_info = df[df.iloc[:, 0] == selected_p].iloc[0]
+    num = int(to_f(p_info.iloc[1]))
+    names = split_val(p_info.iloc[6], num)
+    principals = [to_f(p) for p in split_val(p_info.iloc[3], num)]
+    rates = [to_f(r) for r in split_val(p_info.iloc[4], num)]
 
-    # 4. 収益計算
-    st.subheader(f"📊 {selected_p} 収益計算")
+    st.subheader("📊 収益計算")
     apr = st.number_input("本日のAPR (%)", value=100.0, step=0.1)
+    fee = 0.77
     
-    # 計算 (元本 * APR% * 0.77 * 比率 / 365)
-    yields = [(p * (apr / 100) * 0.77 * rates[i]) / 365 for i, p in enumerate(principals)]
-    total_y = sum(yields)
-
-    # 5. テーブル表示
+    yields = [(p * (apr/100) * fee * rates[i]) / 365 for i, p in enumerate(principals)]
+    
     res_df = pd.DataFrame({
-        "メンバー": names,
+        "名前": names,
         "元本 ($)": [f"{p:,.2f}" for p in principals],
-        "分配比率": rates,
         "本日収益 ($)": [f"{y:,.4f}" for y in yields]
     })
-    res_df.index = range(1, len(res_df) + 1)
     st.table(res_df)
-    st.metric("総収益合計", f"${total_y:,.4f}")
 
-    # 6. 通知セクション（画像は任意）
     st.markdown("---")
-    uploaded_file = st.file_uploader("エビデンス画像（任意）", type=["png", "jpg", "jpeg"])
+    uploaded_file = st.file_uploader("エビデンス画像", type=["png", "jpg", "jpeg"])
     
-    if st.button("🚀 LINE & Gmail 通知を一斉送信", type="primary"):
+    if st.button("LINE・メール一斉送信", type="primary"):
         with st.spinner("送信中..."):
-            msg = f"🏦 【{selected_p}】 収益報告\n"
-            msg += f"📅 {datetime.now().strftime('%Y/%m/%d %H:%M')}\n"
-            msg += f"📈 本日APR: {apr}%\n"
-            msg += "------------------\n"
+            msg = f"🏦 【{selected_p}】 収益報告\nAPR: {apr}%\n" + "-"*15 + "\n"
             for i in range(num):
                 msg += f"・{names[i]}: +${yields[i]:,.4f}\n"
-            msg += "------------------\n"
-            msg += f"💰 合計収益: +${total_y:,.4f}"
-
-            # 画像がある場合のみImgBBへ
+            
+            # 画像の処理
+            img_url = ""
             if uploaded_file:
-                img_res = requests.post(
-                    "https://api.imgbb.com/1/upload",
-                    data={"key": st.secrets["imgbb"]["api_key"]},
-                    files={"image": uploaded_file.getvalue()}
-                )
-                if img_res.status_code == 200:
-                    img_url = img_res.json()["data"]["url"]
-                    msg += f"\n\n🖼 エビデンス画像:\n{img_url}"
+                url = "https://api.imgbb.com/1/upload"
+                payload = {"key": st.secrets["imgbb"]["api_key"]}
+                files = {"image": uploaded_file.getvalue()}
+                res = requests.post(url, payload, files=files)
+                if res.status_code == 200:
+                    img_url = res.json()["data"]["url"]
+                    msg += f"\n\n🖼 エビデンス:\n{img_url}"
 
             # LINE送信
-            line_headers = {
-                "Authorization": f"Bearer {st.secrets['line']['channel_access_token']}",
-                "Content-Type": "application/json"
-            }
             requests.post("https://api.line.me/v2/bot/message/broadcast", 
-                          headers=line_headers, 
+                          headers={"Authorization": f"Bearer {st.secrets['line']['channel_access_token']}", "Content-Type": "application/json"},
                           json={"messages": [{"type": "text", "text": msg}]})
             
             # Gmail送信
-            g_conf = st.secrets["gmail"]
+            conf = st.secrets["gmail"]
             mail = MIMEText(msg)
             mail['Subject'] = f"【{selected_p}】収益報告"
-            mail['From'] = g_conf["user"]
-            mail['To'] = g_conf["user"]
+            mail['From'] = conf["user"]
+            mail['To'] = conf["user"]
             with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-                smtp.login(g_conf["user"], g_conf["password"])
+                smtp.login(conf["user"], conf["password"])
                 smtp.send_message(mail)
-            
+                
             st.success("送信完了しました！")
             st.balloons()
 
 except Exception as e:
-    st.error(f"エラー: {e}")
+    st.error(f"エラーが発生しました: {e}")
