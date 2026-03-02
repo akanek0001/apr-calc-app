@@ -8,7 +8,7 @@ import re
 
 # --- 1. ページ設定 ---
 st.set_page_config(page_title="APR管理システム", layout="wide", page_icon="🏦")
-
+　
 # --- 2. ユーティリティ ---
 def to_f(val):
     if pd.isna(val): return 0.0
