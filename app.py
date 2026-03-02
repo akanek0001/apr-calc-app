@@ -8,7 +8,7 @@ import re
 
 # --- 1. ページ設定 ---
 st.set_page_config(page_title="APR管理システム", layout="wide", page_icon="🏦")
-　
+
 # --- 2. ユーティリティ ---
 def to_f(val):
     if pd.isna(val): return 0.0
@@ -49,6 +49,7 @@ try:
         st.error("Settingsシートが空です。")
         st.stop()
 
+    # プロジェクト選択
     project_list = settings_df.iloc[:, 0].dropna().astype(str).unique().tolist()
     selected_project = st.sidebar.selectbox("プロジェクトを選択", project_list)
     p_info = settings_df[settings_df.iloc[:, 0] == selected_project].iloc[0]
@@ -58,26 +59,24 @@ try:
     rate_list = [to_f(r) for r in split_val(p_info.iloc[4], num_people)]
     is_compound = str(p_info.iloc[5]).upper() in ["TRUE", "はい", "YES", "1"]
 
-    # LINE ID および 個人名の取得
+    # --- 【修正】プロジェクトに紐づくメンバー名を取得 ---
+    # Settingsシートの6番目(G列相当)にメンバー名がカンマ区切りで入っている前提
+    raw_names = str(p_info.iloc[6]) if len(p_info) > 6 else ""
+    display_names = split_val(raw_names, num_people)
+    # ----------------------------------------------
+
+    # LINE ID取得 (LineIDシートから全員分取得)
     user_ids = []
-    member_names = []
     if not line_id_df.empty:
-        member_names = line_id_df.iloc[:, 0].dropna().astype(str).tolist()
         all_cells = line_id_df.values.flatten().astype(str)
         user_ids = sorted(list(set([str(x).strip() for x in all_cells if str(x).startswith('U')])))
-
-    display_names = []
-    for i in range(num_people):
-        if i < len(member_names):
-            display_names.append(f"{member_names[i]}")
-        else:
-            display_names.append(f"No.{i+1}")
 
     try:
         hist_df = conn.read(worksheet=selected_project, ttl=60)
     except:
         hist_df = pd.DataFrame(columns=["Date", "Type", "Total_Amount", "Breakdown", "Note"])
 
+    # 累計計算
     total_earned = [0.0] * num_people
     total_withdrawn = [0.0] * num_people
     total_deposited = [0.0] * num_people
@@ -136,8 +135,10 @@ try:
 
     with tab2:
         st.subheader("💸 入金・出金の記録")
+        # --- 【修正】プルダウンがプロジェクトごとに変わる ---
         selected_name = st.selectbox("メンバーを選択", display_names)
         idx = display_names.index(selected_name)
+        
         st.info(f"対象者: {selected_name}\n現在の評価額（元本）: **${calc_principals[idx]:,.2f}**")
         
         col1, col2 = st.columns(2)
@@ -153,7 +154,6 @@ try:
                 val_list[idx] = amount
                 type_label = "入金" if "入金" in trans_type else "出金"
                 
-                # --- 【修正】プロジェクト名と個人名の両方をNoteに記録 ---
                 final_memo = f"[{selected_project} / {selected_name}] {user_memo if user_memo else type_label}"
                 
                 new_row = pd.DataFrame([{
@@ -165,7 +165,7 @@ try:
                 }])
                 
                 conn.update(worksheet=selected_project, data=pd.concat([hist_df, new_row], ignore_index=True))
-                st.success(f"{selected_project} - {selected_name} 様の {type_label}（${amount}）を記録しました。")
+                st.success(f"保存完了: {selected_name} 様")
                 st.rerun()
             else:
                 st.warning("金額を入力してください。")
