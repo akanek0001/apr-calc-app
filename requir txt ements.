@@ -1,5 +1,1 @@
-streamlit
-streamlit-gsheets
-pandas
-requests
-
+st-gsheets-connection
