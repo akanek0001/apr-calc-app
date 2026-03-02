@@ -95,7 +95,7 @@ try:
     tab1, tab2 = st.tabs(["📈 収益確定・画像送付", "💸 出金記録"])
 
     with tab1:
-        st.subheader("本日の収益確定と証拠画像のアップロード")
+        st.subheader("本日の収益確定と画像のアップロード")
         total_apr = st.number_input("本日のAPR (%)", value=100.0)
         
         # --- 画像アップロード欄 ---
