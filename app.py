@@ -9,7 +9,7 @@ import re
 # Plotlyがインストールされていない場合でも起動できるようにする
 try:
     import plotly.express as px
-    PLOTLY_AVAILABLE = True
+    PLOTLY_AVAILABLE = True 
 except ImportError:
     PLOTLY_AVAILABLE = False
 
