@@ -3,4 +3,3 @@ streamlit-gsheets
 pandas
 plotly
 requests
- 
