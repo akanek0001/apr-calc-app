@@ -62,12 +62,10 @@ try:
     user_ids = []
     member_names = []
     if not line_id_df.empty:
-        # 1列目を名前、2列目以降にあるUから始まるものをIDとして取得
         member_names = line_id_df.iloc[:, 0].dropna().astype(str).tolist()
         all_cells = line_id_df.values.flatten().astype(str)
         user_ids = sorted(list(set([str(x).strip() for x in all_cells if str(x).startswith('U')])))
 
-    # 人数と名前のリストを合わせる（足りない場合はNo.で補完）
     display_names = []
     for i in range(num_people):
         if i < len(member_names):
@@ -80,7 +78,6 @@ try:
     except:
         hist_df = pd.DataFrame(columns=["Date", "Type", "Total_Amount", "Breakdown", "Note"])
 
-    # 累計計算
     total_earned = [0.0] * num_people
     total_withdrawn = [0.0] * num_people
     total_deposited = [0.0] * num_people
@@ -119,7 +116,7 @@ try:
         today_yields = [round((p * (total_apr * 0.67 * rate_list[i] / 100)) / 365, 4) for i, p in enumerate(calc_principals)]
 
         if st.button("収益を確定してLINE送信"):
-            new_row = pd.DataFrame([{"Date": datetime.now().strftime("%Y-%m-%d"), "Type": "収益", "Total_Amount": sum(today_yields), "Breakdown": ",".join(map(str, today_yields)), "Note": f"APR:{total_apr}%"}])
+            new_row = pd.DataFrame([{"Date": datetime.now().strftime("%Y-%m-%d"), "Type": "収益", "Total_Amount": sum(today_yields), "Breakdown": ",".join(map(str, today_yields)), "Note": f"[{selected_project}] APR:{total_apr}%"}])
             conn.update(worksheet=selected_project, data=pd.concat([hist_df, new_row], ignore_index=True))
             
             if "line" in st.secrets:
@@ -139,10 +136,8 @@ try:
 
     with tab2:
         st.subheader("💸 入金・出金の記録")
-        # 選択肢を個人名に
         selected_name = st.selectbox("メンバーを選択", display_names)
         idx = display_names.index(selected_name)
-        
         st.info(f"対象者: {selected_name}\n現在の評価額（元本）: **${calc_principals[idx]:,.2f}**")
         
         col1, col2 = st.columns(2)
@@ -158,8 +153,8 @@ try:
                 val_list[idx] = amount
                 type_label = "入金" if "入金" in trans_type else "出金"
                 
-                # --- 個人名をNote欄に記録 ---
-                final_memo = f"[{selected_name}] {user_memo if user_memo else type_label}"
+                # --- 【修正】プロジェクト名と個人名の両方をNoteに記録 ---
+                final_memo = f"[{selected_project} / {selected_name}] {user_memo if user_memo else type_label}"
                 
                 new_row = pd.DataFrame([{
                     "Date": datetime.now().strftime("%Y-%m-%d"), 
@@ -170,7 +165,7 @@ try:
                 }])
                 
                 conn.update(worksheet=selected_project, data=pd.concat([hist_df, new_row], ignore_index=True))
-                st.success(f"{selected_name} 様の {type_label}（${amount}）を記録しました。")
+                st.success(f"{selected_project} - {selected_name} 様の {type_label}（${amount}）を記録しました。")
                 st.rerun()
             else:
                 st.warning("金額を入力してください。")
