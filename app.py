@@ -87,13 +87,43 @@ try:
         updated_hist = pd.concat([hist_df, new_row], ignore_index=True)
         conn.update(worksheet=selected_project, data=updated_hist)
         
-        # メール送信
+          # メール送信
         if "gmail" in st.secrets:
-            # (メール送信ロジックは以前と同じ)
-            st.success("履歴を保存し、メールを送信しました！")
-        else:
-            st.warning("履歴は保存しましたが、メール設定がないため送信をスキップしました。")
-        st.rerun()
+            try:
+                mail_user = st.secrets["gmail"]["user"]
+                mail_pass = st.secrets["gmail"]["password"]
+                
+                # 人数分ループして一人ずつに送る
+                for i in range(num_people):
+                    target_email = email_list[i]
+                    # メールアドレスが入っていない場合はスキップ
+                    if not target_email or "@" not in target_email:
+                        continue
 
-except Exception as e:
-    st.error(f"エラーが発生しました: {e}")
+                    # メールの内容作成
+                    mail_content = f"""
+{selected_project} の収益報告です。
+
+■本日の収益: ${today_yields[i]:,.4f}
+■現在の運用元本: ${current_principals[i]:,.2f}
+■受取用Wallet: {wallet_list[i]}
+
+※このメールはシステムより自動送信されています。
+"""
+                    msg = MIMEText(mail_content, 'plain', 'utf-8')
+                    msg['Subject'] = Header(f"【収益報告】{selected_project}", 'utf-8')
+                    msg['From'] = mail_user
+                    msg['To'] = target_email
+                    
+                    # 送信実行
+                    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+                        smtp.login(mail_user, mail_pass)
+                        smtp.send_message(msg)
+                
+                st.success(f"履歴を保存し、{num_people}名にメールを送信しました！")
+            except Exception as mail_err:
+                st.error(f"履歴は保存されましたが、メール送信でエラーが発生しました: {mail_err}")
+        else:
+            st.warning("履歴は保存しましたが、Secretsに[gmail]設定がないため送信をスキップしました。")
+        
+        st.rerun()
