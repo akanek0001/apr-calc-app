@@ -2,13 +2,13 @@ import streamlit as st
 from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 from datetime import datetime
-import requests 
+import requests
 import json
 import re
 
 # --- ページ設定 ---
 st.set_page_config(page_title="APR管理システム", layout="wide", page_icon="🏦")
-st.title("🏦 APR管理システム（LINE Messaging API版）")
+st.title("🏦 APR管理システム（複利・出金管理版）")
 
 # --- 便利関数 ---
 def to_f(val):
@@ -24,19 +24,11 @@ def split_val(val, n):
         items.append(items[-1] if items else "0")
     return items
 
-# --- LINE Messaging API送信関数 ---
 def send_line_message(token, user_id, text):
     url = "https://api.line.me/v2/bot/message/push"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}"
-    }
-    payload = {
-        "to": user_id,
-        "messages": [{"type": "text", "text": text}]
-    }
-    response = requests.post(url, headers=headers, data=json.dumps(payload))
-    return response.status_code
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+    payload = {"to": user_id, "messages": [{"type": "text", "text": text}]}
+    return requests.post(url, headers=headers, data=json.dumps(payload)).status_code
 
 # --- メインロジック ---
 try:
@@ -47,70 +39,111 @@ try:
     selected_project = st.sidebar.selectbox("プロジェクトを選択", project_list)
     p_info = df[df.iloc[:, 0] == selected_project].iloc[0]
 
-    raw_num = str(p_info.iloc[1]).strip()
-    num_people = int(float(raw_num)) if raw_num and raw_num.replace('.','').isdigit() else 1
-    
+    num_people = int(float(str(p_info.iloc[1]).strip()))
     base_principals = [to_f(p) for p in split_val(p_info.iloc[3], num_people)]
     rate_list = [to_f(r) for r in split_val(p_info.iloc[4], num_people)]
-    wallet_list = split_val(p_info.iloc[5], num_people)
 
+    # 履歴の読み込み
     try:
         hist_df = conn.read(worksheet=selected_project, ttl=0)
     except:
-        hist_df = pd.DataFrame()
+        hist_df = pd.DataFrame(columns=["Date", "Type", "Total_Amount", "Breakdown", "Note"])
 
+    # 各メンバーの現在の状況を計算
     current_principals = []
+    total_withdrawn = [] # 累計出金額
+    total_earned = []    # 累計収益額
+
     for i in range(num_people):
-        unpaid_amount = 0.0
-        if not hist_df.empty and "Paid_Flags" in hist_df.columns:
+        earned = 0.0
+        withdrawn = 0.0
+        if not hist_df.empty:
             for _, row in hist_df.iterrows():
-                flags = str(row["Paid_Flags"]).split(",")
-                if i < len(flags) and flags[i].strip() == "0":
-                    breakdown = str(row["Breakdown"]).split(",")
-                    if i < len(breakdown):
-                        unpaid_amount += to_f(breakdown[i])
-        current_principals.append(base_principals[i] + unpaid_amount)
+                vals = str(row["Breakdown"]).split(",")
+                if i < len(vals):
+                    amount = to_f(vals[i])
+                    if str(row["Type"]) == "収益":
+                        earned += amount
+                    elif str(row["Type"]) == "出金":
+                        withdrawn += amount
+        
+        total_earned.append(earned)
+        total_withdrawn.append(withdrawn)
+        # 現在の元本 = 初期元本 + 累計収益 - 累計出金
+        current_principals.append(base_principals[i] + earned - withdrawn)
 
-    # --- 画面表示 ---
-    total_apr = st.number_input("本日の全体のAPR (%)", value=100.0, step=0.01)
-    net_apr_factor = 0.67
-    today_yields = [round((p * (total_apr * net_apr_factor * rate_list[i] / 100)) / 365, 4) for i, p in enumerate(current_principals)]
-    
-    st.info(f"💡 33%控除済み（実質 {total_apr * net_apr_factor:.2f}%）")
+    # --- タブ分け ---
+    tab1, tab2 = st.tabs(["📈 本日の収益確定", "💸 出金・精算処理"])
 
-    # --- 確定・LINE送信ボタン ---
-    if st.button("収益を確定してLINEで通知"):
-        with st.spinner("処理中..."):
-            # A. 履歴を保存
+    # --- Tab 1: 収益確定 ---
+    with tab1:
+        st.subheader("本日の収益計算")
+        total_apr = st.number_input("本日の全体のAPR (%)", value=100.0, step=0.01)
+        net_apr_factor = 0.67
+        today_yields = [round((p * (total_apr * net_apr_factor * rate_list[i] / 100)) / 365, 4) for i, p in enumerate(current_principals)]
+        
+        st.info(f"💡 33%控除済み（実質 {total_apr * net_apr_factor:.2f}%）")
+
+        # サマリー表示
+        cols = st.columns(num_people)
+        for i, col in enumerate(cols):
+            with col:
+                st.metric(f"No.{i+1} 現在の元本", f"${current_principals[i]:,.2f}")
+                st.write(f"累計収益: ${total_earned[i]:,.2f}")
+                st.write(f"累計出金: ${total_withdrawn[i]:,.2f}")
+
+        if st.button("収益を確定してLINE通知"):
             new_row = pd.DataFrame([{
                 "Date": datetime.now().strftime("%Y-%m-%d"),
-                "Total_Principal": round(sum(current_principals), 2),
-                "Breakdown": ", ".join(map(str, today_yields)),
-                "Paid_Flags": ",".join(["0"] * num_people)
+                "Type": "収益",
+                "Total_Amount": sum(today_yields),
+                "Breakdown": ",".join(map(str, today_yields)),
+                "Note": f"APR: {total_apr}%"
             }])
-            updated_hist = pd.concat([hist_df, new_row], ignore_index=True)
-            conn.update(worksheet=selected_project, data=updated_hist)
+            conn.update(worksheet=selected_project, data=pd.concat([hist_df, new_row], ignore_index=True))
             
-            # B. LINE通知処理
+            # LINE送信
             if "line" in st.secrets:
-                line_token = st.secrets["line"]["channel_access_token"]
-                line_user_id = st.secrets["line"]["user_id"]
-                
-                report_msg = f"【収益報告】\n{selected_project}\n"
-                report_msg += f"本日のAPR: {total_apr}%\n"
-                report_msg += f"------------------\n"
+                msg = f"【収益報告】\n{selected_project}\nAPR: {total_apr}%\n" + "-"*10 + "\n"
                 for i in range(num_people):
-                    report_msg += f"No.{i+1}: ${today_yields[i]:,.4f}\n"
-                report_msg += f"------------------\n"
-                report_msg += "※33%控除適用済み"
-                
-                status = send_line_message(line_token, line_user_id, report_msg)
-                
-                if status == 200:
-                    st.success("LINEに通知を送りました！")
-                else:
-                    st.error(f"LINE送信エラー（Code:{status}）")
+                    msg += f"No.{i+1}: +${today_yields[i]:,.4f}\n(元本: ${current_principals[i]+today_yields[i]:,.2f})\n"
+                send_line_message(st.secrets["line"]["channel_access_token"], st.secrets["line"]["user_id"], msg)
+            st.success("収益を記録しました。")
             st.rerun()
+
+    # --- Tab 2: 出金処理 ---
+    with tab2:
+        st.subheader("出金・精算の記録")
+        target_member = st.selectbox("出金するメンバー", [f"No.{i+1}" for i in range(num_people)])
+        member_idx = int(target_member.split(".")[1]) - 1
+        
+        st.warning(f"{target_member} の出金可能額（複利込）: **${current_principals[member_idx]:,.2f}**")
+        withdraw_amount = st.number_input("出金額 ($)", min_value=0.0, max_value=current_principals[member_idx], step=1.0)
+        
+        if st.button(f"{target_member} の出金を実行する"):
+            if withdraw_amount > 0:
+                # 全員分の配列を作成（対象者以外は0）
+                withdrawals = [0.0] * num_people
+                withdrawals[member_idx] = withdraw_amount
+                
+                new_row = pd.DataFrame([{
+                    "Date": datetime.now().strftime("%Y-%m-%d"),
+                    "Type": "出金",
+                    "Total_Amount": withdraw_amount,
+                    "Breakdown": ",".join(map(str, withdrawals)),
+                    "Note": f"メンバー{target_member}による出金"
+                }])
+                conn.update(worksheet=selected_project, data=pd.concat([hist_df, new_row], ignore_index=True))
+                
+                # LINE送信
+                if "line" in st.secrets:
+                    msg = f"【出金通知】\n{selected_project}\n{target_member}が ${withdraw_amount:,.2f} を出金しました。"
+                    send_line_message(st.secrets["line"]["channel_access_token"], st.secrets["line"]["user_id"], msg)
+                
+                st.success(f"{target_member} の出金を記録しました。元本が差し引かれます。")
+                st.rerun()
+            else:
+                st.error("金額を入力してください。")
 
 except Exception as e:
     st.error(f"エラーが発生しました: {e}")
