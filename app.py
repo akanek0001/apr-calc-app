@@ -29,16 +29,20 @@ def split_val(val, n):
 st.title("💎 APR資産運用管理システム Ultra")
 
 try:
-    # 接続設定 (ttl=0 でキャッシュを無効化し、常に最新のシートを読み込む)
+    # 接続設定 (最新の状態を取得)
     conn = st.connection("gsheets", type=GSheetsConnection)
     settings_df = conn.read(worksheet="Settings", ttl=0)
     line_id_df = conn.read(worksheet="LineID", ttl=60)
     
-    # プロジェクトの特定
+    if settings_df.empty:
+        st.error("Settingsシートが空、または読み込めません。")
+        st.stop()
+
+    # プロジェクト選択
     project_list = settings_df.iloc[:, 0].dropna().astype(str).unique().tolist()
     selected_project = st.sidebar.selectbox("プロジェクト選択", project_list)
     
-    # 選択したプロジェクトの行インデックスを取得
+    # 選択したプロジェクトの行インデックスとデータ取得
     p_idx = settings_df[settings_df.iloc[:, 0] == selected_project].index[0]
     p_info = settings_df.loc[p_idx]
     
@@ -48,58 +52,64 @@ try:
     rate_list = [to_f(r) for r in split_val(p_info.iloc[4], num_people)]
     display_names = split_val(str(p_info.iloc[6]), num_people)
 
+    # 履歴データの読み込み
+    try:
+        hist_df = conn.read(worksheet=selected_project, ttl=0)
+    except:
+        hist_df = pd.DataFrame(columns=["Date", "Type", "Total_Amount", "Breakdown", "Note"])
+
     # タブ作成
     tab1, tab2, tab3, tab4 = st.tabs(["📈 収益報告", "💸 入出金管理", "🚀 詳細分析", "👥 ユーザー追加・管理"])
 
-    # --- タブ1〜3は既存のまま (中略) ---
+    # --- タブ1〜3は前回のロジックを継続 (詳細は省略可) ---
+    # (中略: 収益計算やグラフ表示ロジック)
 
-    # --- ★タブ4: ユーザー追加機能 (ここが修正箇所) ---
+    # --- ★タブ4: ユーザー追加・管理 (確実な更新ロジック) ---
     with tab4:
         st.subheader("👤 運用ユーザーの管理")
         
-        # 現在のメンバー表を表示
-        df_current = pd.DataFrame({
-            "No": range(1, num_people + 1),
+        # 現在のメンバーを表示
+        st.write("📋 現在の登録メンバー")
+        member_summary = pd.DataFrame({
             "名前": display_names,
             "初期元本 ($)": base_principals,
             "配分比率": rate_list
         })
-        st.table(df_current)
+        st.table(member_summary)
         
         st.markdown("---")
-        st.subheader("➕ 新規メンバーをこのプロジェクトに追加")
+        st.subheader("➕ 新規メンバーを追加登録")
         
-        # 入力フォーム
-        with st.form("new_user_form", clear_on_submit=True):
-            add_name = st.text_input("メンバー名", placeholder="例：田中 太郎")
-            add_principal = st.number_input("初期投資額 ($)", min_value=0.0, step=100.0)
-            add_rate = st.number_input("収益配分比率 (通常は1.0)", value=1.0, step=0.1)
+        with st.form("new_user_registration", clear_on_submit=True):
+            new_name = st.text_input("メンバー名", placeholder="例：山田 太郎")
+            new_principal = st.number_input("初期投資額 ($)", min_value=0.0, step=100.0)
+            new_rate = st.number_input("配分比率 (通常1.0)", value=1.0, step=0.1)
             
-            submitted = st.form_submit_button("スプレッドシートへ登録")
+            save_btn = st.form_submit_button("スプレッドシートを更新して保存")
             
-            if submitted:
-                if add_name:
-                    # 1. 新しいリストを作成
-                    new_names = display_names + [add_name]
-                    new_principals = base_principals + [add_principal]
-                    new_rates = rate_list + [add_rate]
-                    new_count = len(new_names)
+            if save_btn:
+                if new_name:
+                    # 新しいデータ配列の作成
+                    upd_names = display_names + [new_name]
+                    upd_principals = base_principals + [new_principal]
+                    upd_rates = rate_list + [new_rate]
+                    upd_count = len(upd_names)
                     
-                    # 2. settings_df の該当行を直接書き換え (列番号に注意)
+                    # Settingsシートの該当行を更新
                     # A:Project, B:Num, C:Total, D:Principals, E:Rates, F:Compound, G:Names
-                    settings_df.at[p_idx, settings_df.columns[1]] = new_count
-                    settings_df.at[p_idx, settings_df.columns[3]] = ",".join(map(str, new_principals))
-                    settings_df.at[p_idx, settings_df.columns[4]] = ",".join(map(str, new_rates))
-                    settings_df.at[p_idx, settings_df.columns[6]] = ",".join(new_names)
+                    settings_df.at[p_idx, settings_df.columns[1]] = upd_count
+                    settings_df.at[p_idx, settings_df.columns[3]] = ",".join(map(str, upd_principals))
+                    settings_df.at[p_idx, settings_df.columns[4]] = ",".join(map(str, upd_rates))
+                    settings_df.at[p_idx, settings_df.columns[6]] = ",".join(upd_names)
                     
-                    # 3. スプレッドシートを更新
+                    # 書き込み実行
                     conn.update(worksheet="Settings", data=settings_df)
                     
-                    st.success(f"✅ {add_name} 様を登録しました。反映をお待ちください...")
+                    st.success(f"✅ {new_name} 様を登録しました。")
                     st.balloons()
-                    st.rerun() # 画面を更新して最新リストを表示
+                    st.rerun()
                 else:
                     st.error("名前を入力してください。")
 
 except Exception as e:
-    st.error(f"エラーが発生しました: {e}")
+    st.error(f"エラー: {e}")
