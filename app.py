@@ -4,7 +4,7 @@ import pandas as pd
 from datetime import datetime, timedelta  # timedeltaを追加
 import requests
 import json
-import re
+import re 
 
 # --- 1. ページ設定 ---
 st.set_page_config(page_title="APR管理システム", layout="wide", page_icon="🏦")
