@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
 import requests, json
- 
+
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -95,7 +95,7 @@ def send_line(token, user_id, text, image_url=None):
     r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=20)
     return r.status_code
 
-def upload_imgbb(file_bytes: bytes) -> str | None:
+def upload_imgbb(file_bytes: bytes):
     try:
         res = requests.post(
             "https://api.imgbb.com/1/upload",
@@ -134,7 +134,7 @@ def is_admin() -> bool:
 # =========================
 # Admin notification (Secrets: [admin].notify_line_ids)
 # =========================
-def get_admin_notify_ids() -> list[str]:
+def get_admin_notify_ids():
     raw = ""
     try:
         raw = str(st.secrets.get("admin", {}).get("notify_line_ids", "")).strip()
@@ -237,7 +237,7 @@ def resize_project_lists(p_info_row: pd.Series, new_n: int):
     fixed_principals = [principals[i] if i < len(principals) else principals[-1] for i in range(new_n)]
     return fixed_names, fixed_principals
 
-def _settings_row_index(settings_df: pd.DataFrame, project_name: str) -> int | None:
+def _settings_row_index(settings_df: pd.DataFrame, project_name: str):
     mask = settings_df["Project_Name"].astype(str) == str(project_name)
     if not mask.any():
         return None
@@ -280,7 +280,7 @@ def update_settings_individual_principals_batch(
     settings_ws,
     settings_df: pd.DataFrame,
     project_name: str,
-    deltas: list[float]
+    deltas: list
 ):
     df = settings_df.copy()
     row_idx = _settings_row_index(df, project_name)
@@ -298,23 +298,57 @@ def update_settings_individual_principals_batch(
     df_to_ws(settings_ws, df)
 
 # =========================
-# History helpers (Time column)
+# History (D列=Total_Amount) 自動更新版
+#  - A1:F1 ヘッダ
+#  - 2行目は合計行：C2="TOTAL", D2=合計値
+#  - 明細は3行目以降
 # =========================
 HIST_COLS = ["Date", "Time", "Type", "Total_Amount", "Breakdown", "Note"]
 
-def ensure_hist_schema(df: pd.DataFrame) -> pd.DataFrame:
-    df = clean_cols(df)
-    if df.empty:
-        return pd.DataFrame(columns=HIST_COLS)
+def ensure_hist_layout(ws):
+    values = ws.get_all_values()
+    if not values:
+        ws.update("A1:F1", [HIST_COLS])
+        ws.update("C2:D2", [["TOTAL", 0]], value_input_option="USER_ENTERED")
+        return
 
-    # add missing cols
-    for c in HIST_COLS:
-        if c not in df.columns:
-            df[c] = ""
+    # 1行目ヘッダ
+    header = [str(x).strip() for x in values[0]]
+    if header[:len(HIST_COLS)] != HIST_COLS:
+        ws.update("A1:F1", [HIST_COLS])
 
-    # keep desired order (extra cols at end)
-    ordered = HIST_COLS + [c for c in df.columns if c not in HIST_COLS]
-    return df[ordered]
+    # 2行目がTOTALでないなら挿入（既存データを下へずらす）
+    row2 = ws.row_values(2)
+    row2c = str(row2[2]).strip() if len(row2) >= 3 else ""
+    if row2c.upper() != "TOTAL":
+        ws.insert_row(["", "", "TOTAL", "0", "", ""], index=2)
+
+def sum_total_amount_colD(ws) -> float:
+    # D列（4列目）を取得し、3行目以降を合計
+    col = ws.col_values(4)  # 1行目: header, 2行目: total, 3行目〜: data
+    total = 0.0
+    for s in col[2:]:
+        total += to_f(s)
+    return float(total)
+
+def update_total_cell_D2(ws):
+    total = sum_total_amount_colD(ws)
+    ws.update("D2", [[total]], value_input_option="USER_ENTERED")
+
+def append_hist_row_and_update_total(ws, row: dict):
+    ensure_hist_layout(ws)
+    vals = [
+        row.get("Date", ""),
+        row.get("Time", ""),
+        row.get("Type", ""),
+        row.get("Total_Amount", 0),
+        row.get("Breakdown", ""),
+        row.get("Note", "")
+    ]
+    # 追記（明細は下に追加される）
+    ws.append_row(vals, value_input_option="USER_ENTERED")
+    # D2を自動更新
+    update_total_cell_D2(ws)
 
 # =========================
 # Main
@@ -454,7 +488,7 @@ try:
             st.warning("左のサイドバーでプロジェクトを選択してください。")
         st.stop()
 
-    # Refresh settings (in case admin updated)
+    # Refresh settings
     settings_df = ensure_settings_schema(ws_to_df(settings_ws))
     p_info = settings_df[settings_df["Project_Name"].astype(str) == str(selected_project)].iloc[0]
 
@@ -467,7 +501,7 @@ try:
     labels = member_names[:num_people]
 
     base_principals = [to_f(x) for x in split_csv(p_info.get("IndividualPrincipals", ""), num_people, default="0")]
-    calc_principals = base_principals[:]  # 表示用（Settingsが真）
+    calc_principals = base_principals[:]  # Settingsが真
 
     # fallback IDs from Settings if LineID sheet empty
     if not user_ids:
@@ -479,14 +513,15 @@ try:
     # History sheet per project
     try:
         hist_ws = sh.worksheet(selected_project)
-        hist_df = ensure_hist_schema(ws_to_df(hist_ws))
+        ensure_hist_layout(hist_ws)
+        update_total_cell_D2(hist_ws)  # 起動時に合計を整合
     except:
         hist_ws = sh.add_worksheet(title=selected_project, rows=1000, cols=20)
-        hist_df = pd.DataFrame(columns=HIST_COLS)
-        df_to_ws(hist_ws, hist_df)
+        ensure_hist_layout(hist_ws)
+        update_total_cell_D2(hist_ws)
 
     # =========================
-    # Profit tab (TotalPrincipal × APR × 0.66, equal split)
+    # Profit tab
     # =========================
     with tab_profit:
         st.subheader(f"【{selected_project}】本日の収益（総額×APR×66%→均等配分 / 収益は総額・個別元本に加算）")
@@ -528,19 +563,18 @@ try:
 
             jst = now_jst()
 
-            # 履歴保存（Date+Time）
-            new_row = pd.DataFrame([{
+            # 履歴（追記 + D2更新）
+            row = {
                 "Date": jst.strftime("%Y-%m-%d"),
                 "Time": jst.strftime("%H:%M"),
                 "Type": "収益",
                 "Total_Amount": total_yield,
                 "Breakdown": join_csv(today_yields),
                 "Note": f"APR:{total_apr}% net:{net_factor}"
-            }])
-            updated_hist = pd.concat([hist_df, new_row], ignore_index=True)
-            df_to_ws(hist_ws, updated_hist)
+            }
+            append_hist_row_and_update_total(hist_ws, row)
 
-            # --- 収益を Settings に反映（総額＋個別元本を増やす） ---
+            # Settings反映（総額＋個別元本）
             update_settings_total_principal(settings_ws, settings_df, selected_project, delta_amount=total_yield)
             update_settings_individual_principals_batch(settings_ws, settings_df, selected_project, deltas=today_yields)
 
@@ -589,10 +623,10 @@ try:
             st.rerun()
 
     # =========================
-    # Cash tab (Deposit/Withdraw + update TotalPrincipal +/- + notify admin + DateTime)
+    # Cash tab
     # =========================
     with tab_cash:
-        st.subheader("💳 入金・出金の記録（時間も記録／総額・個別元本を増減／管理者へLINE通知）")
+        st.subheader("💳 入金・出金の記録（時間記録／D列Total_Amount合計をD2へ自動更新／管理者へ通知）")
 
         action = st.radio("種別", ["➕ 入金（追加元本）", "💸 出金（精算）"], horizontal=True, key="c_action")
 
@@ -623,21 +657,18 @@ try:
 
             jst = now_jst()
 
-            # 履歴追記（Date+Time）
+            # 履歴（追記 + D2更新）
             vec = [0.0] * num_people
             vec[idx] = float(amt)
-
-            new_row = pd.DataFrame([{
+            row = {
                 "Date": jst.strftime("%Y-%m-%d"),
                 "Time": jst.strftime("%H:%M"),
                 "Type": rtype,
                 "Total_Amount": float(amt),
                 "Breakdown": join_csv(vec),
                 "Note": memo
-            }])
-
-            updated_hist = pd.concat([hist_df, new_row], ignore_index=True)
-            df_to_ws(hist_ws, updated_hist)
+            }
+            append_hist_row_and_update_total(hist_ws, row)
 
             # Settingsへ反映（総額も個別元本も増減）
             before_total = project_total_principal
@@ -662,7 +693,7 @@ try:
                 after_total=after_total
             )
 
-            st.success(f"{rtype}を記録しました（時間も記録）。")
+            st.success(f"{rtype}を記録しました（D2合計も更新）。")
             st.rerun()
 
 except Exception as e:
