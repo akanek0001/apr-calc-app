@@ -59,23 +59,44 @@ def only_line_ids(values):
     out = []
     for v in values:
         s = str(v).strip()
-        if s.startswith("U"):  # LINE userId
+        if s.startswith("U"):
             out.append(s)
-    # 重複削除しつつ順序維持
-    seen = set()
-    uniq = []
+    seen, uniq = set(), []
     for x in out:
         if x not in seen:
             seen.add(x)
             uniq.append(x)
     return uniq
 
-def send_line(token, user_id, text):
+def send_line(token, user_id, text, image_url=None):
     url = "https://api.line.me/v2/bot/message/push"
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
-    payload = {"to": str(user_id), "messages": [{"type": "text", "text": text}]}
-    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=15)
+
+    messages = [{"type": "text", "text": text}]
+    if image_url:
+        messages.append({
+            "type": "image",
+            "originalContentUrl": image_url,
+            "previewImageUrl": image_url
+        })
+
+    payload = {"to": str(user_id), "messages": messages}
+    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=20)
     return r.status_code
+
+def upload_imgbb(file_bytes: bytes) -> str | None:
+    """ImgBBへアップロードしてURLを返す（失敗時None）"""
+    try:
+        res = requests.post(
+            "https://api.imgbb.com/1/upload",
+            params={"key": st.secrets["imgbb"]["api_key"]},
+            files={"image": file_bytes},
+            timeout=30
+        )
+        data = res.json()
+        return data["data"]["url"]
+    except:
+        return None
 
 # --- メイン ---
 st.title("🏦 APR資産運用管理システム")
@@ -121,14 +142,15 @@ try:
             if "LineID" in line_id_df.columns:
                 user_ids = only_line_ids(line_id_df["LineID"].dropna().tolist())
             else:
-                # 列名が想定外なら最後の列から拾う
                 user_ids = only_line_ids(line_id_df.iloc[:, -1].dropna().tolist())
     except:
         user_ids = []
 
     if not user_ids:
-        # SettingsのLineID（カンマ区切り想定）
         user_ids = only_line_ids(split_csv(p_info["LineID"], 999))
+
+    st.sidebar.info(f"計算モード: {'複利' if is_compound else '単利'}")
+    st.sidebar.write(f"送信先ID数: {len(user_ids)}")
 
     # 履歴（プロジェクト名のシート）
     try:
@@ -142,7 +164,6 @@ try:
     # 履歴集計
     total_earned = [0.0] * num_people
     total_withdrawn = [0.0] * num_people
-
     if not hist_df.empty and all(c in hist_df.columns for c in ["Type", "Breakdown"]):
         for _, row in hist_df.iterrows():
             rtype = str(row.get("Type", "")).strip()
@@ -163,16 +184,18 @@ try:
         else:
             calc_principals.append(base_principals[i])
 
-    st.sidebar.info(f"計算モード: {'複利' if is_compound else '単利'}")
-    st.sidebar.write(f"送信先ID数: {len(user_ids)}")
-
-    tab1, tab2 = st.tabs(["📈 収益確定・LINE送信", "💸 出金記録"])
+    tab1, tab2 = st.tabs(["📈 収益確定・画像付きLINE送信", "💸 出金記録"])
 
     # --- 収益 ---
     with tab1:
         st.subheader(f"【{selected_project}】本日の収益")
+
         total_apr = st.number_input("本日の全体APR (%)", value=100.0, step=0.1)
         net_factor = 0.67
+
+        uploaded_file = st.file_uploader("エビデンス画像をアップロード（任意）", type=["png", "jpg", "jpeg"])
+        if uploaded_file:
+            st.image(uploaded_file, caption="送信プレビュー", width=420)
 
         # 収益計算（rate_list反映、365日割）
         today_yields = []
@@ -189,7 +212,16 @@ try:
                 name = member_names[i] if i < len(member_names) else f"No.{i+1}"
                 st.metric(f"{name}", f"${calc_principals[i]:,.2f}", f"+${today_yields[i]:,.4f}")
 
-        if st.button("収益を保存してLINE送信"):
+        if st.button("収益を保存して（画像付きで）LINE送信"):
+            # 画像アップロード（任意）
+            image_url = None
+            if uploaded_file:
+                with st.spinner("ImgBBへ画像アップロード中..."):
+                    image_url = upload_imgbb(uploaded_file.getvalue())
+                if uploaded_file and not image_url:
+                    st.error("画像アップロードに失敗しました（ImgBB）。画像なしで続行するなら画像を外して再実行してください。")
+                    st.stop()
+
             # 履歴に追記
             new_row = pd.DataFrame([{
                 "Date": datetime.now().strftime("%Y-%m-%d"),
@@ -202,7 +234,7 @@ try:
             updated_hist = pd.concat([hist_df, new_row], ignore_index=True)
             df_to_ws(hist_ws, updated_hist)
 
-            # メッセージ作成（JST）
+            # メッセージ（JST）
             jst_now = datetime.utcnow() + timedelta(hours=9)
             now_str = jst_now.strftime("%Y/%m/%d %H:%M")
             mode_str = "複利運用" if is_compound else "単利運用"
@@ -220,12 +252,15 @@ try:
                 if is_compound:
                     msg += f"  (次回元本: ${new_p:,.2f})\n"
 
+            if image_url:
+                msg += "\n📎 エビデンス画像を添付します。"
+
             # 送信
             token = st.secrets["line"]["channel_access_token"]
             success = 0
             fail = 0
             for uid in user_ids:
-                code = send_line(token, uid, msg)
+                code = send_line(token, uid, msg, image_url=image_url)
                 if code == 200:
                     success += 1
                 else:
@@ -237,8 +272,9 @@ try:
     # --- 出金 ---
     with tab2:
         st.subheader("出金・精算の記録")
-        target = st.selectbox("メンバー", [member_names[i] if i < len(member_names) else f"No.{i+1}" for i in range(num_people)])
-        idx = [member_names[i] if i < len(member_names) else f"No.{i+1}" for i in range(num_people)].index(target)
+        labels = [member_names[i] if i < len(member_names) else f"No.{i+1}" for i in range(num_people)]
+        target = st.selectbox("メンバー", labels)
+        idx = labels.index(target)
 
         st.info(f"現在の出金可能額: ${calc_principals[idx]:,.2f}")
         amt = st.number_input("出金額 ($)", min_value=0.0, max_value=float(calc_principals[idx]), step=10.0)
