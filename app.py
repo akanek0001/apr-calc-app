@@ -1,5 +1,5 @@
 import streamlit as st
-from streamlit_gsheets import GSheetsConnection
+#from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 from datetime import datetime, timedelta  # timedeltaを追加
 import requests
@@ -41,9 +41,9 @@ def send_line_multimedia(token, user_id, text, image_url=None):
 st.title("🏦 APR資産運用管理システム")
 
 try:
-    conn = st.connection("gsheets", type=GSheetsConnection)
-    settings_df = conn.read(worksheet="Settings", ttl=60)
-    line_id_df = conn.read(worksheet="LineID", ttl=60)
+    #conn = st.connection("gsheets", type=GSheetsConnection)
+    #settings_df = conn.read(worksheet="Settings", ttl=60)
+    #line_id_df = conn.read(worksheet="LineID", ttl=60)
     
     if settings_df.empty:
         st.error("Settingsシートが空です。")
