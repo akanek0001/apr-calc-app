@@ -17,11 +17,6 @@ except Exception as e:
     st.sidebar.error(f"Secrets debug error: {e}")
 # --- END DEBUG ---
 
-
-
-
-
-
 import streamlit as st
 from streamlit_gsheets import GSheetsConnection
 import pandas as pd
