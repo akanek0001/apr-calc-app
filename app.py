@@ -3,7 +3,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 import requests, json
 
-import gspread
+import gspread 
 from google.oauth2.service_account import Credentials
 
 # --- ページ設定 ---
