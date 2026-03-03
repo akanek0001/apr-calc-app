@@ -60,6 +60,7 @@ try:
     sh = open_sheet()
 
     settings_df = ws_to_df(sh.worksheet("Settings"))
+    settings_df.columns = [str(c).strip() for c in settings_df.columns]
     line_id_df  = ws_to_df(sh.worksheet("LineID"))
 
     if settings_df.empty:
