@@ -510,7 +510,7 @@ try:
     # Profit tab
     # =========================
     with tab_profit:
-        st.subheader(f"【{selected_project}】本日の収益（総額×APR×66%→均等配分 / 収益は総額・個別元本に加算）")
+        st.subheader(f"【{selected_project}】本日の収益（総額×APR×67%→均等配分 / 収益は総額・個別元本に加算）")
 
         total_apr = st.number_input("本日のAPR (%)", value=100.0, step=0.1, key="p_apr")
         net_factor = 0.66
@@ -584,7 +584,7 @@ try:
             msg += f"報告日時: {now_str}\n"
             msg += "━━━━━━━━━━━━━━\n\n"
             msg += f"📈 本日のAPR: {total_apr}%\n"
-            msg += f"配分率: 66%\n\n"
+            msg += f"配分率: 67%\n\n"
             msg += f"💰 本日の総収益: ${project_daily_yield:,.4f}\n"
             msg += f"👥 参加人数: {num_people}名\n\n"
             msg += f"📊 現在のプロジェクト総額: ${after_total:,.2f}\n"
