@@ -68,9 +68,11 @@ try:
         st.stop()
 
     project_list = settings_df["Project_Name"].unique().tolist()
+    settings_df.columns = [str(c).strip() for c in settings_df.columns]
     selected_project = st.sidebar.selectbox("プロジェクトを選択", project_list)
 
     p_info = settings_df[settings_df["Project_Name"] == selected_project].iloc[0]
+    settings_df.columns = [str(c).strip() for c in settings_df.columns]
 
     num_people = int(to_f(p_info["Num_People"]))
     base_principals = [to_f(x) for x in split_val(p_info["IndividualPrincipals"], num_people)]
