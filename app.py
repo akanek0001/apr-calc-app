@@ -6,7 +6,7 @@ import requests, json
 import gspread
 from google.oauth2.service_account import Credentials
 
-# =========================
+# ========================= 
 # Page
 # =========================
 st.set_page_config(page_title="APR管理システム", layout="wide", page_icon="🏦")
