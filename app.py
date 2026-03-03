@@ -9,7 +9,7 @@ from google.oauth2.service_account import Credentials
 # --- ページ設定 ---
 st.set_page_config(page_title="APR管理システム", layout="wide", page_icon="🏦")
 
-# --- Google Sheets 接続 ---
+# --- Google Sheets 接続 --- 
 def gs_client():
     cred_info = st.secrets["connections"]["gsheets"]["credentials"]
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
