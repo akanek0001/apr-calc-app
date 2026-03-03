@@ -6,7 +6,7 @@ import requests, json
 import gspread
 from google.oauth2.service_account import Credentials
 
-# --- ページ設定 ---
+# --- ページ設定 --- 
 st.set_page_config(page_title="APR管理システム", layout="wide", page_icon="🏦")
 
 # --- Google Sheets 接続 ---
