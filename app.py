@@ -1,3 +1,27 @@
+# --- DEBUG: secrets & gsheets connection check ---
+st.sidebar.markdown("## 🔎 Debug")
+try:
+    st.sidebar.write("Has connections.gsheets:", "connections" in st.secrets and "gsheets" in st.secrets["connections"])
+    if "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
+        gs = st.secrets["connections"]["gsheets"]
+        st.sidebar.write("Spreadsheet set:", bool(gs.get("spreadsheet")))
+        st.sidebar.write("Has credentials:", "credentials" in gs)
+        if "credentials" in gs:
+            cred = gs["credentials"]
+            st.sidebar.write("cred.type:", cred.get("type"))
+            st.sidebar.write("cred.project_id:", bool(cred.get("project_id")))
+            st.sidebar.write("cred.client_email:", cred.get("client_email"))
+            st.sidebar.write("cred.private_key_id:", bool(cred.get("private_key_id")))
+            st.sidebar.write("cred.private_key len:", len(cred.get("private_key", "")))
+except Exception as e:
+    st.sidebar.error(f"Secrets debug error: {e}")
+# --- END DEBUG ---
+
+
+
+
+
+
 import streamlit as st
 from streamlit_gsheets import GSheetsConnection
 import pandas as pd
