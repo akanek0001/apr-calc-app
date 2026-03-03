@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
 import requests, json
- 
+
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -40,7 +40,7 @@ def clean_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = (
         df.columns.astype(str)
-        .str.replace("\u3000", " ", regex=False)  # 全角スペース→半角
+        .str.replace("\u3000", " ", regex=False)
         .str.strip()
     )
     return df
@@ -129,7 +129,7 @@ def is_admin() -> bool:
     return False
 
 # =========================
-# Admin notification (Secrets: [admin].notify_line_ids = "Uxxx,Uyyy")
+# Admin notification (Secrets: [admin].notify_line_ids)
 # =========================
 def get_admin_notify_ids() -> list[str]:
     raw = ""
@@ -142,7 +142,15 @@ def get_admin_notify_ids() -> list[str]:
     ids = [x.strip() for x in raw.split(",") if x.strip()]
     return only_line_ids(ids)
 
-def notify_admin_cash_event(action_type: str, project: str, member: str, amount: float, memo: str):
+def notify_admin_cash_event(
+    action_type: str,
+    project: str,
+    member: str,
+    amount: float,
+    memo: str,
+    before_principal: float,
+    after_principal: float
+):
     admin_ids = get_admin_notify_ids()
     if not admin_ids:
         return
@@ -150,11 +158,15 @@ def notify_admin_cash_event(action_type: str, project: str, member: str, amount:
     jst_now = datetime.utcnow() + timedelta(hours=9)
     now_str = jst_now.strftime("%Y/%m/%d %H:%M")
 
+    sign = "+" if action_type == "入金" else "-"
+
     msg = "🔔【入出金通知】\n"
     msg += f"種別: {action_type}\n"
     msg += f"プロジェクト: {project}\n"
     msg += f"メンバー: {member}\n"
-    msg += f"金額: ${amount:,.2f}\n"
+    msg += f"金額: {sign}${amount:,.2f}\n"
+    msg += f"参考元本（処理前）: ${before_principal:,.2f}\n"
+    msg += f"参考元本（処理後）: ${after_principal:,.2f}\n"
     if memo:
         msg += f"備考: {memo}\n"
     msg += f"日時: {now_str}"
@@ -169,8 +181,8 @@ def notify_admin_cash_event(action_type: str, project: str, member: str, amount:
 SETTINGS_COLS = [
     "Project_Name",
     "Num_People",
-    "TotalPrincipal",          # ★収益原資に使う「プロジェクト総額」
-    "IndividualPrincipals",    # 参考（入出金管理の表示用）
+    "TotalPrincipal",          # 収益原資に使う「プロジェクト総額」
+    "IndividualPrincipals",    # 個別元本（入出金で同期更新）
     "ProfitRates",             # 未使用（残してOK）
     "IsCompound",
     "MemberNames",
@@ -217,6 +229,38 @@ def resize_project_lists(p_info_row: pd.Series, new_n: int):
 
     fixed_principals = [principals[i] if i < len(principals) else principals[-1] for i in range(new_n)]
     return fixed_names, fixed_principals
+
+def update_settings_individual_principals(
+    settings_ws,
+    settings_df: pd.DataFrame,
+    project_name: str,
+    member_index: int,
+    delta_amount: float
+) -> None:
+    """
+    Settingsの IndividualPrincipals を、対象メンバーだけ delta_amount で更新して保存する。
+    delta_amount: 入金は +、出金は - を渡す
+    """
+    df = settings_df.copy()
+    mask = df["Project_Name"].astype(str) == str(project_name)
+    if not mask.any():
+        return
+
+    row_idx = df[mask].index[0]
+    p_info = df.loc[row_idx]
+
+    n = int(to_f(p_info.get("Num_People", 1))) or 1
+    principals = [to_f(x) for x in split_csv(p_info.get("IndividualPrincipals", ""), n, default="0")]
+
+    if member_index < 0 or member_index >= n:
+        return
+
+    principals[member_index] = float(principals[member_index]) + float(delta_amount)
+
+    df.at[row_idx, "IndividualPrincipals"] = join_csv(principals)
+
+    # シート全体更新（確実。大規模ならセル更新に最適化可能）
+    df_to_ws(settings_ws, df)
 
 # =========================
 # Main
@@ -310,7 +354,7 @@ try:
 
             st.caption("人数変更で自動増減します（末尾値で埋め／切り詰め）。")
             names_text = st.text_input("MemberNames（カンマ区切り）", value=",".join(base_names), key="m_member_names")
-            principals_text = st.text_input("IndividualPrincipals（カンマ区切り：参考）", value=",".join(base_princs), key="m_individual_principals")
+            principals_text = st.text_input("IndividualPrincipals（カンマ区切り：入出金で自動更新）", value=",".join(base_princs), key="m_individual_principals")
             lineid_text = st.text_input("LineID（Settings側。未使用なら空でOK）", value=str(p_row.get("LineID", "")) if p_row is not None else "", key="m_lineid_fallback")
 
             colS, colD = st.columns(2)
@@ -403,7 +447,7 @@ try:
                     elif rtype == "入金":
                         total_deposit[i] += vals[i]
 
-    # Current principals (for withdraw available display, etc.)
+    # Current principals
     calc_principals = []
     for i in range(num_people):
         base_plus_deposit = base_principals[i] + total_deposit[i]
@@ -491,10 +535,10 @@ try:
             st.rerun()
 
     # =========================
-    # Cash tab (Deposit/Withdraw in same tab + notify admin)
+    # Cash tab (Deposit/Withdraw + notify admin + sync Settings principals)
     # =========================
     with tab_cash:
-        st.subheader("💳 入金・出金の記録（保存時に管理者へLINE通知）")
+        st.subheader("💳 入金・出金の記録（保存時に管理者へLINE通知／Settings個別元本も同期更新）")
 
         action = st.radio("種別", ["➕ 入金（追加元本）", "💸 出金（精算）"], horizontal=True, key="c_action")
 
@@ -521,6 +565,7 @@ try:
                 st.warning("金額が0です。")
                 st.stop()
 
+            # 履歴追記
             vec = [0.0] * num_people
             vec[idx] = float(amt)
 
@@ -535,8 +580,24 @@ try:
             updated_hist = pd.concat([hist_df, new_row], ignore_index=True)
             df_to_ws(hist_ws, updated_hist)
 
-            # ★管理者通知（Secrets: admin.notify_line_ids が設定されている場合のみ）
-            notify_admin_cash_event(rtype, selected_project, labels[idx], float(amt), memo)
+            # SettingsのIndividualPrincipalsを同期更新（ズレ防止）
+            before_p = float(calc_principals[idx])
+            delta = float(amt) if rtype == "入金" else -float(amt)
+            after_p = before_p + delta
+
+            update_settings_individual_principals(
+                settings_ws=settings_ws,
+                settings_df=settings_df,
+                project_name=selected_project,
+                member_index=idx,
+                delta_amount=delta
+            )
+
+            # 管理者通知（処理前後の参考元本を含む）
+            notify_admin_cash_event(
+                rtype, selected_project, labels[idx], float(amt), memo,
+                before_p, after_p
+            )
 
             st.success(f"{rtype}を記録しました（管理者通知: {'ON' if get_admin_notify_ids() else 'OFF'}）。")
             st.rerun()
