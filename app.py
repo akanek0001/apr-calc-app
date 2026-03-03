@@ -149,7 +149,9 @@ def notify_admin_cash_event(
     amount: float,
     memo: str,
     before_principal: float,
-    after_principal: float
+    after_principal: float,
+    before_total: float,
+    after_total: float
 ):
     admin_ids = get_admin_notify_ids()
     if not admin_ids:
@@ -158,15 +160,17 @@ def notify_admin_cash_event(
     jst_now = datetime.utcnow() + timedelta(hours=9)
     now_str = jst_now.strftime("%Y/%m/%d %H:%M")
 
-    sign = "+" if action_type == "入金" else "-"
+    sign = "+" if action_type in ["入金", "収益"] else "-"
 
-    msg = "🔔【入出金通知】\n"
+    msg = "🔔【入出金/収益 通知】\n"
     msg += f"種別: {action_type}\n"
     msg += f"プロジェクト: {project}\n"
-    msg += f"メンバー: {member}\n"
+    msg += f"対象: {member}\n"
     msg += f"金額: {sign}${amount:,.2f}\n"
-    msg += f"参考元本（処理前）: ${before_principal:,.2f}\n"
-    msg += f"参考元本（処理後）: ${after_principal:,.2f}\n"
+    msg += f"個別元本（前）: ${before_principal:,.2f}\n"
+    msg += f"個別元本（後）: ${after_principal:,.2f}\n"
+    msg += f"総額（前）: ${before_total:,.2f}\n"
+    msg += f"総額（後）: ${after_total:,.2f}\n"
     if memo:
         msg += f"備考: {memo}\n"
     msg += f"日時: {now_str}"
@@ -181,9 +185,9 @@ def notify_admin_cash_event(
 SETTINGS_COLS = [
     "Project_Name",
     "Num_People",
-    "TotalPrincipal",          # 収益原資に使う「プロジェクト総額」
-    "IndividualPrincipals",    # 個別元本（入出金で同期更新）
-    "ProfitRates",             # 未使用（残してOK）
+    "TotalPrincipal",
+    "IndividualPrincipals",
+    "ProfitRates",
     "IsCompound",
     "MemberNames",
     "LineID",
@@ -230,25 +234,36 @@ def resize_project_lists(p_info_row: pd.Series, new_n: int):
     fixed_principals = [principals[i] if i < len(principals) else principals[-1] for i in range(new_n)]
     return fixed_names, fixed_principals
 
-def update_settings_individual_principals(
+def _settings_row_index(settings_df: pd.DataFrame, project_name: str) -> int | None:
+    mask = settings_df["Project_Name"].astype(str) == str(project_name)
+    if not mask.any():
+        return None
+    return int(settings_df[mask].index[0])
+
+def update_settings_total_principal(settings_ws, settings_df: pd.DataFrame, project_name: str, delta_amount: float):
+    df = settings_df.copy()
+    row_idx = _settings_row_index(df, project_name)
+    if row_idx is None:
+        return
+
+    cur = to_f(df.at[row_idx, "TotalPrincipal"])
+    new_val = float(cur) + float(delta_amount)
+    df.at[row_idx, "TotalPrincipal"] = str(new_val)
+    df_to_ws(settings_ws, df)
+
+def update_settings_individual_principal_one(
     settings_ws,
     settings_df: pd.DataFrame,
     project_name: str,
     member_index: int,
     delta_amount: float
-) -> None:
-    """
-    Settingsの IndividualPrincipals を、対象メンバーだけ delta_amount で更新して保存する。
-    delta_amount: 入金は +、出金は - を渡す
-    """
+):
     df = settings_df.copy()
-    mask = df["Project_Name"].astype(str) == str(project_name)
-    if not mask.any():
+    row_idx = _settings_row_index(df, project_name)
+    if row_idx is None:
         return
 
-    row_idx = df[mask].index[0]
     p_info = df.loc[row_idx]
-
     n = int(to_f(p_info.get("Num_People", 1))) or 1
     principals = [to_f(x) for x in split_csv(p_info.get("IndividualPrincipals", ""), n, default="0")]
 
@@ -256,10 +271,28 @@ def update_settings_individual_principals(
         return
 
     principals[member_index] = float(principals[member_index]) + float(delta_amount)
+    df.at[row_idx, "IndividualPrincipals"] = join_csv(principals)
+    df_to_ws(settings_ws, df)
+
+def update_settings_individual_principals_batch(
+    settings_ws,
+    settings_df: pd.DataFrame,
+    project_name: str,
+    deltas: list[float]
+):
+    df = settings_df.copy()
+    row_idx = _settings_row_index(df, project_name)
+    if row_idx is None:
+        return
+
+    p_info = df.loc[row_idx]
+    n = int(to_f(p_info.get("Num_People", 1))) or 1
+    principals = [to_f(x) for x in split_csv(p_info.get("IndividualPrincipals", ""), n, default="0")]
+
+    for i in range(min(n, len(deltas))):
+        principals[i] = float(principals[i]) + float(deltas[i])
 
     df.at[row_idx, "IndividualPrincipals"] = join_csv(principals)
-
-    # シート全体更新（確実。大規模ならセル更新に最適化可能）
     df_to_ws(settings_ws, df)
 
 # =========================
@@ -299,7 +332,7 @@ try:
     )
 
     # =========================
-    # Manage tab (admin only + Settings view admin only)
+    # Manage tab (admin only)
     # =========================
     with tab_manage:
         st.subheader("⚙️ 管理（管理者のみ）")
@@ -352,10 +385,10 @@ try:
                 base_names = [f"No.{i+1}" for i in range(int(new_n))]
                 base_princs = ["0" for _ in range(int(new_n))]
 
-            st.caption("人数変更で自動増減します（末尾値で埋め／切り詰め）。")
+            st.caption("人数変更で自動増減（末尾値で埋め／切り詰め）。")
             names_text = st.text_input("MemberNames（カンマ区切り）", value=",".join(base_names), key="m_member_names")
-            principals_text = st.text_input("IndividualPrincipals（カンマ区切り：入出金で自動更新）", value=",".join(base_princs), key="m_individual_principals")
-            lineid_text = st.text_input("LineID（Settings側。未使用なら空でOK）", value=str(p_row.get("LineID", "")) if p_row is not None else "", key="m_lineid_fallback")
+            principals_text = st.text_input("IndividualPrincipals（カンマ区切り：入出金・収益で自動更新）", value=",".join(base_princs), key="m_individual_principals")
+            lineid_text = st.text_input("LineID（Settings側。LineIDシートがあれば未使用）", value=str(p_row.get("LineID", "")) if p_row is not None else "", key="m_lineid_fallback")
 
             colS, colD = st.columns(2)
             with colS:
@@ -391,7 +424,7 @@ try:
             st.dataframe(settings_df, use_container_width=True)
 
     # =========================
-    # Need project selected for profit/cash
+    # Need project selected
     # =========================
     if not selected_project:
         with tab_profit:
@@ -428,39 +461,14 @@ try:
         hist_df = pd.DataFrame(columns=["Date", "Type", "Total_Amount", "Breakdown", "Note"])
         df_to_ws(hist_ws, hist_df)
 
-    # Aggregate history (earn/withdraw/deposit)
-    total_earned = [0.0] * num_people
-    total_withdrawn = [0.0] * num_people
-    total_deposit = [0.0] * num_people
-
-    if not hist_df.empty and all(c in hist_df.columns for c in ["Type", "Breakdown"]):
-        for _, row in hist_df.iterrows():
-            rtype = str(row.get("Type", "")).strip()
-            rbreakdown = str(row.get("Breakdown", "")).strip()
-            vals = [to_f(v) for v in rbreakdown.split(",")] if rbreakdown else []
-            for i in range(num_people):
-                if i < len(vals):
-                    if rtype == "収益":
-                        total_earned[i] += vals[i]
-                    elif rtype == "出金":
-                        total_withdrawn[i] += vals[i]
-                    elif rtype == "入金":
-                        total_deposit[i] += vals[i]
-
-    # Current principals
-    calc_principals = []
-    for i in range(num_people):
-        base_plus_deposit = base_principals[i] + total_deposit[i]
-        if is_compound:
-            calc_principals.append(base_plus_deposit + total_earned[i] - total_withdrawn[i])
-        else:
-            calc_principals.append(base_plus_deposit)
+    # Current principals are from Settings now (収益・入出金でSettingsが更新されるため)
+    calc_principals = base_principals[:]  # 表示用
 
     # =========================
     # Profit tab (TotalPrincipal × APR × 0.66, equal split)
     # =========================
     with tab_profit:
-        st.subheader(f"【{selected_project}】本日の収益（総額×APR×66%→均等配分）")
+        st.subheader(f"【{selected_project}】本日の収益（総額×APR×66%→均等配分 / 収益は総額・個別元本に加算）")
 
         total_apr = st.number_input("本日のAPR (%)", value=100.0, step=0.1, key="p_apr")
         net_factor = 0.66
@@ -469,9 +477,13 @@ try:
         if uploaded_file:
             st.image(uploaded_file, caption="送信プレビュー", width=420)
 
+        before_total = project_total_principal
+
         project_daily_yield = (project_total_principal * (total_apr / 100.0) * net_factor) / 365.0
         per_person = round(project_daily_yield / max(1, num_people), 4)
         today_yields = [per_person] * num_people
+        total_yield = float(sum(today_yields))
+        after_total = before_total + total_yield
 
         st.info(
             f"総額: ${project_total_principal:,.2f} / "
@@ -482,7 +494,7 @@ try:
         cols = st.columns(num_people if num_people <= 6 else 6)
         for i in range(num_people):
             with cols[i % len(cols)]:
-                st.metric(labels[i], f"参考元本: ${calc_principals[i]:,.2f}", f"+${today_yields[i]:,.4f}")
+                st.metric(labels[i], f"個別元本: ${calc_principals[i]:,.2f}", f"+${today_yields[i]:,.4f}")
 
         if st.button("収益を保存して（画像付きで）LINE送信", key="p_send"):
             image_url = None
@@ -493,17 +505,37 @@ try:
                     st.error("画像アップロード失敗（ImgBB）。画像なしで続行するなら画像を外して再実行。")
                     st.stop()
 
+            # 履歴保存
             new_row = pd.DataFrame([{
                 "Date": datetime.now().strftime("%Y-%m-%d"),
                 "Type": "収益",
-                "Total_Amount": sum(today_yields),
+                "Total_Amount": total_yield,
                 "Breakdown": join_csv(today_yields),
                 "Note": f"APR:{total_apr}% net:{net_factor}"
             }])
-
             updated_hist = pd.concat([hist_df, new_row], ignore_index=True)
             df_to_ws(hist_ws, updated_hist)
 
+            # --- ★収益を Settings に反映（総額＋個別元本を増やす） ---
+            update_settings_total_principal(settings_ws, settings_df, selected_project, delta_amount=total_yield)
+            update_settings_individual_principals_batch(settings_ws, settings_df, selected_project, deltas=today_yields)
+
+            # 管理者通知（収益）
+            # ※収益は全員対象なので member は "全員"
+            if get_admin_notify_ids():
+                notify_admin_cash_event(
+                    action_type="収益",
+                    project=selected_project,
+                    member="全員",
+                    amount=total_yield,
+                    memo=f"APR:{total_apr}% net:{net_factor}",
+                    before_principal=0.0,
+                    after_principal=0.0,
+                    before_total=before_total,
+                    after_total=after_total
+                )
+
+            # LINE送信（参加者）
             jst_now = datetime.utcnow() + timedelta(hours=9)
             now_str = jst_now.strftime("%Y/%m/%d %H:%M")
 
@@ -535,18 +567,19 @@ try:
             st.rerun()
 
     # =========================
-    # Cash tab (Deposit/Withdraw + notify admin + sync Settings principals)
+    # Cash tab (Deposit/Withdraw + update TotalPrincipal +/- + notify admin)
     # =========================
     with tab_cash:
-        st.subheader("💳 入金・出金の記録（保存時に管理者へLINE通知／Settings個別元本も同期更新）")
+        st.subheader("💳 入金・出金の記録（総額・個別元本を増減／管理者へLINE通知）")
 
         action = st.radio("種別", ["➕ 入金（追加元本）", "💸 出金（精算）"], horizontal=True, key="c_action")
 
         target = st.selectbox("メンバー", labels, key="c_member")
         idx = labels.index(target)
 
+        # 出金可能は「個別元本」を下限0で
         available = max(0.0, float(calc_principals[idx]))
-        st.caption(f"参考元本（現在）: ${calc_principals[idx]:,.2f} / 出金可能（下限0）: ${available:,.2f}")
+        st.caption(f"個別元本（現在）: ${calc_principals[idx]:,.2f} / 出金可能（下限0）: ${available:,.2f}")
 
         if action.startswith("💸"):
             if available <= 0:
@@ -555,10 +588,12 @@ try:
             amt = st.number_input("出金額 ($)", min_value=0.0, max_value=available, step=10.0, key="c_amt_w")
             memo = st.text_input("備考", value="出金精算", key="c_memo_w")
             rtype = "出金"
+            delta = -float(amt)
         else:
             amt = st.number_input("入金額 ($)", min_value=0.0, step=10.0, key="c_amt_d")
             memo = st.text_input("備考", value="追加入金", key="c_memo_d")
             rtype = "入金"
+            delta = float(amt)
 
         if st.button("保存", key="c_save"):
             if amt <= 0:
@@ -580,26 +615,39 @@ try:
             updated_hist = pd.concat([hist_df, new_row], ignore_index=True)
             df_to_ws(hist_ws, updated_hist)
 
-            # SettingsのIndividualPrincipalsを同期更新（ズレ防止）
-            before_p = float(calc_principals[idx])
-            delta = float(amt) if rtype == "入金" else -float(amt)
-            after_p = before_p + delta
+            # --- ★Settingsへ反映（総額も個別元本も増減） ---
+            before_total = project_total_principal
+            after_total = before_total + float(delta)
 
-            update_settings_individual_principals(
+            before_p = float(calc_principals[idx])
+            after_p = before_p + float(delta)
+
+            # TotalPrincipal を増減
+            update_settings_total_principal(settings_ws, settings_df, selected_project, delta_amount=float(delta))
+
+            # IndividualPrincipals を対象者だけ増減
+            update_settings_individual_principal_one(
                 settings_ws=settings_ws,
                 settings_df=settings_df,
                 project_name=selected_project,
                 member_index=idx,
-                delta_amount=delta
+                delta_amount=float(delta)
             )
 
-            # 管理者通知（処理前後の参考元本を含む）
+            # 管理者通知
             notify_admin_cash_event(
-                rtype, selected_project, labels[idx], float(amt), memo,
-                before_p, after_p
+                action_type=rtype,
+                project=selected_project,
+                member=labels[idx],
+                amount=float(amt),
+                memo=memo,
+                before_principal=before_p,
+                after_principal=after_p,
+                before_total=before_total,
+                after_total=after_total
             )
 
-            st.success(f"{rtype}を記録しました（管理者通知: {'ON' if get_admin_notify_ids() else 'OFF'}）。")
+            st.success(f"{rtype}を記録しました（総額・個別元本を更新）。")
             st.rerun()
 
 except Exception as e:
