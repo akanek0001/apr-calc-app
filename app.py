@@ -458,7 +458,7 @@ try:
         hist_df = clean_cols(ws_to_df(hist_ws))
     except:
         hist_ws = sh.add_worksheet(title=selected_project, rows=1000, cols=20)
-        hist_df = pd.DataFrame(columns=["Date", "Type", "Total_Amount", "Breakdown", "Note"])
+        hist_df = pd.DataFrame(columns=["Date","Time","Type","Total_Amount","Breakdown","Note"])
         df_to_ws(hist_ws, hist_df)
 
     # Current principals are from Settings now (収益・入出金でSettingsが更新されるため)
