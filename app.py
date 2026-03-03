@@ -513,7 +513,7 @@ try:
         st.subheader(f"【{selected_project}】本日の収益（総額×APR×67%→均等配分 / 収益は総額・個別元本に加算）")
 
         total_apr = st.number_input("本日のAPR (%)", value=100.0, step=0.1, key="p_apr")
-        net_factor = 0.66
+        net_factor = 0.67
 
         uploaded_file = st.file_uploader("エビデンス画像（任意）", type=["png", "jpg", "jpeg"], key="p_file")
         if uploaded_file:
