@@ -34,7 +34,7 @@ def df_to_ws(ws, df):
 
 # --- ユーティリティ ---
 def to_f(val):
-    try:
+    try: 
         return float(str(val).replace(',','').replace('$','').replace('%','').strip())
     except:
         return 0.0
