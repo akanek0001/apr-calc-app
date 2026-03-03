@@ -62,7 +62,8 @@ try:
     settings_df = ws_to_df(sh.worksheet("Settings"))
     settings_df.columns = [str(c).strip() for c in settings_df.columns]
     line_id_df  = ws_to_df(sh.worksheet("LineID"))
-
+settings_df.columns = [str(c).strip() for c in settings_df.columns]
+line_id_df.columns  = [str(c).strip() for c in line_id_df.columns]
     if settings_df.empty:
         st.error("Settingsシートが空です。")
         st.stop()
