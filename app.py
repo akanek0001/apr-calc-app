@@ -75,3 +75,23 @@ class GSheets:
         return self.registry.worksheet(name)
 
     # 以下、あなたの元コードの read_df / append_row / upsert_member... をそのまま残す
+
+
+
+
+st.title("接続テスト")
+
+cfg = load_gsheets_cfg()
+st.write("cfg:", cfg)
+
+if cfg is None:
+    st.error("Secretsのconnections.gsheets.spreadsheetが読めていません")
+    st.stop()
+
+gs = GSheets(cfg)
+st.success("Google Sheets 接続OK")
+
+# Membersシートを読めるか試す
+ws = gs.ws("Members")
+st.write("Members sheet title:", ws.title)
+st.write("Rows:", ws.row_count, "Cols:", ws.col_count)
