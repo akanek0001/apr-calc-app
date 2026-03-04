@@ -1,4 +1,9 @@
-# app.py
+# app.pyセキュリテーファイル変更必要！！
+
+
+
+
+
 # Streamlit APR / 入出金管理 + 管理者(⚙️)画面復旧テンプレート
 # - 管理者PINログイン（Secretsの admin.pin）
 # - メンバー（個人名 ↔ LINE User ID）管理
