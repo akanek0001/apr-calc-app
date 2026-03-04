@@ -1,9 +1,9 @@
-# app.py  (管理タブが消えない修正版：管理タブ内で st.stop() しない)
+# app.py  (保存後にAPRへ戻らない：ページ状態を保持する版)
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional
 
 import json
 import pandas as pd
@@ -87,7 +87,6 @@ def upload_imgbb(file_bytes: bytes) -> Optional[str]:
         key = st.secrets["imgbb"]["api_key"]
     except:
         return None
-
     try:
         res = requests.post(
             "https://api.imgbb.com/1/upload",
@@ -101,7 +100,7 @@ def upload_imgbb(file_bytes: bytes) -> Optional[str]:
         return None
 
 # -----------------------------
-# Sheets Config / Client
+# Sheets
 # -----------------------------
 SETTINGS_HEADERS = ["Project_Name", "Net_Factor", "IsCompound", "UpdatedAt_JST"]
 MEMBERS_HEADERS = [
@@ -157,7 +156,6 @@ class GSheets:
             st.error(f"Spreadsheet を開けません。共有設定（編集者）とIDを確認してください。: {e}")
             st.stop()
 
-        # 初期化（429時はここで落ちやすいので try を浅く）
         self._ensure_sheet(self.cfg.settings_sheet, SETTINGS_HEADERS)
         self._ensure_sheet(self.cfg.members_sheet, MEMBERS_HEADERS)
         self._ensure_sheet(self.cfg.ledger_sheet, LEDGER_HEADERS)
@@ -210,7 +208,7 @@ class GSheets:
         st.cache_data.clear()
 
 # -----------------------------
-# Admin Auth (パス)
+# Admin Auth (password)
 # -----------------------------
 def admin_password() -> str:
     return str(st.secrets.get("admin", {}).get("password", "")).strip()
@@ -336,7 +334,7 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
     st.write(f"- モード: {'複利（元本に加算）' if is_compound else '単利（元本は固定）'}")
 
     if not is_admin():
-        st.info("APR確定は管理者のみ実行できます（管理タブでログイン）。")
+        st.info("APR確定は管理者のみ実行できます（管理画面でログイン）。")
         return members_df
 
     if st.button("APRを確定して全員にLINE送信"):
@@ -348,35 +346,25 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
                 st.error("画像アップロードに失敗しました（ImgBB）。画像を外して再実行してください。")
                 return members_df
 
-        # 複利なら元本に加算
         if is_compound:
             for i in range(len(members_df)):
                 if members_df.loc[i, "Project_Name"] == str(project) and bool(members_df.loc[i, "IsActive"]) is True:
                     members_df.loc[i, "Principal"] = float(members_df.loc[i, "Principal"]) + float(per_member)
 
-        # Ledger：個人ごとに記録
         ts = fmt_dt(now_jst())
         for _, r in mem.iterrows():
             gs.append_row(gs.cfg.ledger_sheet, [
-                ts,
-                project,
-                r["PersonName"],
-                "APR",
-                float(per_member),
+                ts, project, r["PersonName"], "APR", float(per_member),
                 f"APR:{apr}%, net:0.67, equal:{n}",
                 evidence_url or "",
-                r["Line_User_ID"],
-                r["LINE_DisplayName"],
-                "app",
+                r["Line_User_ID"], r["LINE_DisplayName"], "app",
             ])
 
-        # Members保存
         out = members_df.copy()
         out["Principal"] = out["Principal"].apply(lambda x: f"{float(x):.6f}")
         out["IsActive"] = out["IsActive"].apply(lambda x: "TRUE" if bool(x) else "FALSE")
         gs.write_df(gs.cfg.members_sheet, out)
 
-        # LINE：全員へ同じ文面（個人名なし）
         token = st.secrets["line"]["channel_access_token"]
         targets = dedup_line_ids(mem)
 
@@ -435,7 +423,7 @@ def ui_cash(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) ->
     uploaded = st.file_uploader("エビデンス画像（任意）", type=["png", "jpg", "jpeg"], key="cash_img")
 
     if not is_admin():
-        st.info("入金/出金の記録は管理者のみ実行できます（管理タブでログイン）。")
+        st.info("入金/出金の記録は管理者のみ実行できます（管理画面でログイン）。")
         return members_df
 
     if st.button("確定して保存＆個別にLINE通知"):
@@ -453,25 +441,21 @@ def ui_cash(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) ->
 
         new_balance = current + float(amt) if typ == "Deposit" else current - float(amt)
 
-        # Members更新
         for i in range(len(members_df)):
             if members_df.loc[i, "Project_Name"] == str(project) and members_df.loc[i, "PersonName"] == str(person):
                 members_df.loc[i, "Principal"] = float(new_balance)
 
-        # Ledger追記
         ts = fmt_dt(now_jst())
         gs.append_row(gs.cfg.ledger_sheet, [
             ts, project, person, typ, float(amt), note, evidence_url or "",
             row["Line_User_ID"], row["LINE_DisplayName"], "app"
         ])
 
-        # Members保存
         out = members_df.copy()
         out["Principal"] = out["Principal"].apply(lambda x: f"{float(x):.6f}")
         out["IsActive"] = out["IsActive"].apply(lambda x: "TRUE" if bool(x) else "FALSE")
         gs.write_df(gs.cfg.members_sheet, out)
 
-        # 個別LINE通知
         token = st.secrets["line"]["channel_access_token"]
         msg = "💸【入出金通知】\n"
         msg += f"プロジェクト: {project}\n"
@@ -497,14 +481,12 @@ def ui_cash(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) ->
     return members_df
 
 # -----------------------------
-# UI: Admin (Members管理のみ)
+# UI: Admin
 # -----------------------------
 def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> pd.DataFrame:
     st.subheader("⚙️ 管理（管理者のみ）")
-
     admin_login_ui()
 
-    # ★ここが重要：未ログインでも st.stop() しない（タブが消えた/空に見える原因を潰す）
     if not is_admin():
         st.info("ログインすると、メンバー追加・編集が表示されます。")
         return members_df
@@ -512,9 +494,6 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
     if settings_df.empty:
         st.warning("Settingsシートが空です。先にSettingsを入力してください。")
         return members_df
-
-    st.divider()
-    st.write("### メンバー管理（追加/編集）")
 
     projects = settings_df["Project_Name"].dropna().astype(str).unique().tolist()
     project = st.selectbox("対象プロジェクト", projects, key="admin_project")
@@ -576,17 +555,24 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
         gs.write_df(gs.cfg.members_sheet, out)
         gs.clear_cache()
 
+        # ★ここで「どの画面に戻すか」を固定できる（管理に留める）
+        st.session_state["page"] = "⚙️ 管理"
+
         st.success("保存しました。")
         st.rerun()
 
     return members_df
 
 # -----------------------------
-# Main
+# Main (tabs → radio)
 # -----------------------------
 def main():
     st.set_page_config(page_title="APR資産運用管理", layout="wide", page_icon="🏦")
     st.title("🏦 APR資産運用管理システム")
+
+    # page state
+    if "page" not in st.session_state:
+        st.session_state["page"] = "📈 APR"
 
     # Spreadsheet ID
     con = st.secrets.get("connections", {}).get("gsheets", {})
@@ -605,15 +591,19 @@ def main():
         st.error(f"読み取りエラー: {e}")
         st.stop()
 
-    tab_apr, tab_cash, tab_admin = st.tabs(["📈 APR", "💸 入金/出金", "⚙️ 管理"])
+    # Sidebar navigation (keeps state across rerun)
+    page = st.sidebar.radio(
+        "メニュー",
+        options=["📈 APR", "💸 入金/出金", "⚙️ 管理"],
+        index=["📈 APR", "💸 入金/出金", "⚙️ 管理"].index(st.session_state["page"]),
+    )
+    st.session_state["page"] = page
 
-    with tab_apr:
+    if page == "📈 APR":
         members_df = ui_apr(gs, settings_df, members_df)
-
-    with tab_cash:
+    elif page == "💸 入金/出金":
         members_df = ui_cash(gs, settings_df, members_df)
-
-    with tab_admin:
+    else:
         members_df = ui_admin(gs, settings_df, members_df)
 
 if __name__ == "__main__":
