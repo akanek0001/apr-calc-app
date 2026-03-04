@@ -7,7 +7,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 # =========================================================
-# APR資産運用管理システム（全体コード：管理者ログインUIを常に表示）
+# APR資産運用管理システム（全体コード：管理者ログインUIを常に表示） 
 # =========================================================
 
 st.set_page_config(page_title="APR管理システム", layout="wide", page_icon="🏦")
