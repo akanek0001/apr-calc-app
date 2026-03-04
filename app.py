@@ -1,21 +1,32 @@
+# app.py
+# APR資産運用管理システム（Settings / Members / Ledger）+ APR計算 + LINE個別送信
+# Secretsは connections.gsheets 方式に対応
+#
+# 必須:
+# - [connections.gsheets].spreadsheet （スプレッドシートID or URL）
+# - [connections.gsheets.credentials] （サービスアカウント）
+# - [admin].pin （管理画面保護）
+#
+# 任意:
+# - [app].line_channel_access_token （LINE Push用）
+
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional
- 
+from datetime import datetime, timezone, timedelta, date
+from typing import Any, Dict, List, Optional, Tuple
+
 import pandas as pd
 import requests
 import streamlit as st
 
 import gspread
 from google.oauth2.service_account import Credentials
+from gspread.exceptions import APIError
 
-
-# =========================
+# ------------------------
 # Timezone
-# =========================
+# ------------------------
 JST = timezone(timedelta(hours=9), "JST")
 
 
@@ -23,14 +34,10 @@ def now_jst() -> datetime:
     return datetime.now(JST)
 
 
-def jst_str(dt: Optional[datetime] = None) -> str:
-    dt = dt or now_jst()
-    return dt.strftime("%Y-%m-%d %H:%M:%S")
+def jst_str(dt: datetime) -> str:
+    return dt.astimezone(JST).strftime("%Y-%m-%d %H:%M:%S")
 
 
-# =========================
-# Helpers
-# =========================
 def safe_str(x: Any) -> str:
     return "" if x is None else str(x)
 
@@ -38,97 +45,58 @@ def safe_str(x: Any) -> str:
 def is_truthy(v: Any) -> bool:
     if isinstance(v, bool):
         return v
+    if v is None:
+        return False
     s = str(v).strip().lower()
-    return s in ("1", "true", "yes", "y", "on", "はい")
+    return s in ("1", "true", "yes", "y", "on")
 
 
-def to_f(v: Any) -> float:
-    try:
-        s = str(v).replace(",", "").replace("$", "").replace("¥", "").replace("%", "").strip()
-        return float(s) if s else 0.0
-    except Exception:
-        return 0.0
+# ------------------------
+# Headers
+# ------------------------
+DEFAULT_SETTINGS_HEADERS = [
+    "Project_Name",
+    "APR_Rate",          # 0.67 など（年利）
+    "Currency",          # JPY/USDT...
+    "Note",
+    "UpdatedAt_JST",
+]
+
+DEFAULT_MEMBERS_HEADERS = [
+    "Project_Name",
+    "PersonName",
+    "Line_User_ID",
+    "LINE_DisplayName",
+    "IsActive",          # TRUE/FALSE
+    "CreatedAt_JST",
+    "UpdatedAt_JST",
+]
+
+DEFAULT_LEDGER_HEADERS = [
+    "Datetime_JST",
+    "Project_Name",
+    "PersonName",
+    "Type",              # Deposit / Withdraw / APR / Other
+    "Amount",
+    "Currency",
+    "Note",
+    "Line_User_ID",
+    "LINE_DisplayName",
+    "Source",            # app / make / line / other
+]
 
 
-def clean_cols(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = (
-        df.columns.astype(str)
-        .str.replace("\u3000", " ", regex=False)
-        .str.strip()
-    )
-    return df
-
-
-def uniq_keep_order(items: List[str]) -> List[str]:
-    seen = set()
-    out = []
-    for x in items:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
-
-
-def extract_sheet_id(value: str) -> str:
-    s = (value or "").strip()
-    if "/spreadsheets/d/" in s:
-        try:
-            return s.split("/spreadsheets/d/")[1].split("/")[0]
-        except Exception:
-            return s
-    return s
-
-
-# =========================
-# LINE
-# =========================
-def send_line_push(token: str, user_id: str, text: str, image_url: Optional[str] = None) -> int:
-    if not user_id or str(user_id).strip() == "" or str(user_id).lower() == "nan":
-        return 400
-
-    url = "https://api.line.me/v2/bot/message/push"
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
-
-    messages = [{"type": "text", "text": text}]
-    if image_url:
-        messages.append({"type": "image", "originalContentUrl": image_url, "previewImageUrl": image_url})
-
-    payload = {"to": str(user_id), "messages": messages}
-    try:
-        r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=20)
-        return r.status_code
-    except Exception:
-        return 500
-
-
-def upload_imgbb(file_bytes: bytes) -> Optional[str]:
-    if "imgbb" not in st.secrets or "api_key" not in st.secrets["imgbb"]:
-        return None
-    try:
-        res = requests.post(
-            "https://api.imgbb.com/1/upload",
-            params={"key": st.secrets["imgbb"]["api_key"]},
-            files={"image": file_bytes},
-            timeout=30,
-        )
-        data = res.json()
-        return data["data"]["url"]
-    except Exception:
-        return None
-
-
-# =========================
-# Admin auth
-# =========================
+# ------------------------
+# Admin Auth
+# ------------------------
 def is_admin() -> bool:
     return bool(st.session_state.get("admin_ok", False))
 
 
 def admin_login_ui() -> None:
-    pw = safe_str(st.secrets.get("admin", {}).get("pin", ""))  # 以前の仕様を踏襲（pinキーでもパス扱い）
-    if not pw:
-        st.warning("Secrets の [admin].pin が未設定です。管理機能を保護できません。")
+    pin_required = safe_str(st.secrets.get("admin", {}).get("pin", ""))
+    if not pin_required:
+        st.warning("Secrets の [admin].pin が未設定です。管理画面を保護できません。")
         st.session_state["admin_ok"] = False
         return
 
@@ -144,20 +112,20 @@ def admin_login_ui() -> None:
         return
 
     with st.form("admin_login_form", clear_on_submit=False):
-        pin = st.text_input("管理者パスワード", type="password")
+        pin = st.text_input("管理者パス", type="password")
         ok = st.form_submit_button("ログイン")
         if ok:
-            if pin == pw:
+            if pin == pin_required:
                 st.session_state["admin_ok"] = True
                 st.success("ログイン成功")
             else:
                 st.session_state["admin_ok"] = False
-                st.error("パスワードが違います")
+                st.error("パスが違います")
 
 
-# =========================
-# Sheets config
-# =========================
+# ------------------------
+# Config
+# ------------------------
 @dataclass
 class GSheetsConfig:
     spreadsheet_id: str
@@ -166,477 +134,591 @@ class GSheetsConfig:
     ledger_sheet: str = "Ledger"
 
 
-DEFAULT_SETTINGS_HEADERS = ["Project_Name", "TotalPrincipal", "Currency", "IsCompound", "ReceiveFactor"]
-DEFAULT_MEMBERS_HEADERS = [
-    "PersonName", "Project_Name", "Line_User_ID", "LINE_DisplayName", "IsActive", "CreatedAt_JST", "UpdatedAt_JST"
-]
-DEFAULT_LEDGER_HEADERS = [
-    "Datetime_JST", "Project_Name", "PersonName", "Type", "Amount", "Currency", "Note",
-    "Line_User_ID", "LINE_DisplayName", "Source", "Evidence_URL"
-]
+def _extract_spreadsheet_id(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return ""
+    # URLならID抽出
+    if "/spreadsheets/d/" in s:
+        try:
+            return s.split("/spreadsheets/d/")[1].split("/")[0]
+        except Exception:
+            return s
+    return s
 
 
-# =========================
-# Cached low-read wrappers (429対策)
-# =========================
-@st.cache_resource(show_spinner=False)
-def get_gspread_client() -> gspread.Client:
+def load_cfg_from_secrets() -> Optional[GSheetsConfig]:
     con = st.secrets.get("connections", {}).get("gsheets", {})
-    creds_info = con.get("credentials")
-    if not creds_info:
-        raise RuntimeError("Secrets に [connections.gsheets.credentials] がありません。")
+    raw = safe_str(con.get("spreadsheet", "")).strip()
+    sid = _extract_spreadsheet_id(raw)
+    if not sid:
+        return None
 
-    must = ["client_email", "private_key", "token_uri", "project_id", "type"]
-    miss = [k for k in must if k not in creds_info or not str(creds_info.get(k, "")).strip()]
-    if miss:
-        raise RuntimeError(f"Service Account 情報に不足: {miss}")
+    # シート名を変えたい場合はここ（固定で良いなら触らない）
+    # 例: [gsheets] settings_sheet="Settings" ... みたいな上書きをしたい場合も可能だが、
+    # 今回は混乱を避けるため固定にしている。
 
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(dict(creds_info), scopes=scopes)
-    return gspread.authorize(creds)
+    return GSheetsConfig(spreadsheet_id=sid)
 
 
-@st.cache_resource(show_spinner=False)
-def open_book(spreadsheet_id: str):
-    gc = get_gspread_client()
-    return gc.open_by_key(spreadsheet_id)
+def load_line_token() -> str:
+    return safe_str(st.secrets.get("app", {}).get("line_channel_access_token", "")).strip()
 
 
-@st.cache_data(ttl=10, show_spinner=False)
-def cached_get_header_row(spreadsheet_id: str, sheet_name: str) -> List[str]:
-    book = open_book(spreadsheet_id)
-    ws = book.worksheet(sheet_name)
-    # 1行目だけ読む（get_all_values禁止）
-    row = ws.row_values(1)
-    return [str(x).strip() for x in row]
-
-
-@st.cache_data(ttl=10, show_spinner=False)
-def cached_read_df(spreadsheet_id: str, sheet_name: str) -> pd.DataFrame:
-    book = open_book(spreadsheet_id)
-    ws = book.worksheet(sheet_name)
-    values = ws.get_all_values()  # ここは必要時だけ、かつttlで抑える
-    if not values:
-        return pd.DataFrame()
-    header = values[0]
-    rows = values[1:]
-    df = pd.DataFrame(rows, columns=header)
-    return clean_cols(df).fillna("")
-
-
-def clear_cache_for_sheet():
-    # データキャッシュだけクリア（書き込み直後に使う）
-    cached_get_header_row.clear()
-    cached_read_df.clear()
-
-
-# =========================
-# GSheets
-# =========================
+# ------------------------
+# Google Sheets Client
+# ------------------------
 class GSheets:
     def __init__(self, cfg: GSheetsConfig):
+        self.cfg = cfg
+
+        # Credentials
         con = st.secrets.get("connections", {}).get("gsheets", {})
-        spreadsheet = extract_sheet_id(safe_str(con.get("spreadsheet", "")))
-        if not spreadsheet:
-            st.error("Secrets の [connections.gsheets].spreadsheet が未設定です。")
+        creds_info = con.get("credentials", None)
+        if not creds_info:
+            st.error("Secrets に [connections.gsheets.credentials] がありません。")
             st.stop()
 
-        self.cfg = cfg
-        self.cfg.spreadsheet_id = spreadsheet
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_info(dict(creds_info), scopes=scopes)
+        self.gc = gspread.authorize(creds)
+
+        if not self.cfg.spreadsheet_id:
+            st.error("Spreadsheet ID が空です（secrets の connections.gsheets.spreadsheet を確認）。")
+            st.stop()
 
         try:
-            self.book = open_book(self.cfg.spreadsheet_id)
-        except Exception as e:
+            self.book = self.gc.open_by_key(self.cfg.spreadsheet_id)
+        except APIError as e:
             st.error(f"Spreadsheet を開けません: {e}")
             st.stop()
 
-        # シート存在とヘッダーは最小readで保証
+        # Ensure base sheets
         self._ensure_sheet(self.cfg.settings_sheet, DEFAULT_SETTINGS_HEADERS)
         self._ensure_sheet(self.cfg.members_sheet, DEFAULT_MEMBERS_HEADERS)
         self._ensure_sheet(self.cfg.ledger_sheet, DEFAULT_LEDGER_HEADERS)
 
-    def _ensure_sheet(self, name: str, headers: List[str]) -> None:
+    def _ensure_sheet(self, title: str, headers: List[str], rows: int = 2000, cols: int = 26) -> None:
         try:
-            ws = self.book.worksheet(name)
-        except Exception:
-            ws = self.book.add_worksheet(title=name, rows=1000, cols=max(20, len(headers) + 5))
-            ws.append_row(headers, value_input_option="USER_ENTERED")
-            clear_cache_for_sheet()
-            return
+            try:
+                ws = self.book.worksheet(title)
+            except Exception:
+                ws = self.book.add_worksheet(title=title, rows=str(rows), cols=str(cols))
 
-        # 1行目だけ読む
-        row1 = ws.row_values(1)
-        if not row1:
-            ws.append_row(headers, value_input_option="USER_ENTERED")
-            clear_cache_for_sheet()
-            return
+            values = ws.get_all_values()
+            if not values:
+                ws.append_row(headers, value_input_option="USER_ENTERED")
+                return
 
-        current = [str(x).strip() for x in row1]
-        missing = [h for h in headers if h not in current]
-        if missing:
-            ws.update("1:1", [current + missing])
-            clear_cache_for_sheet()
+            # 1行目ヘッダーの重複を避けつつ、必要列が足りなければ追加
+            current = values[0]
+            # 空ヘッダーを削除
+            current = [h.strip() for h in current if str(h).strip() != ""]
+            if not current:
+                ws.update("1:1", [headers])
+                return
 
-    def headers(self, sheet_name: str) -> List[str]:
-        return cached_get_header_row(self.cfg.spreadsheet_id, sheet_name)
+            # 既存ヘッダーに必要ヘッダーが無ければ末尾に追加
+            missing = [h for h in headers if h not in current]
+            if missing:
+                new_headers = current + missing
+                ws.update("1:1", [new_headers])
 
-    def read_df(self, sheet_name: str) -> pd.DataFrame:
-        return cached_read_df(self.cfg.spreadsheet_id, sheet_name)
+        except APIError as e:
+            # 429 (quota) など
+            st.error(f"シート初期化に失敗: {title} / {e}")
+            st.stop()
 
     def ws(self, name: str):
         return self.book.worksheet(name)
 
-    def append_row_by_headers(self, sheet_name: str, row: Dict[str, Any]) -> None:
-        ws = self.ws(sheet_name)
-        headers = self.headers(sheet_name)
-        out = [safe_str(row.get(h, "")) for h in headers]
-        ws.append_row(out, value_input_option="USER_ENTERED")
-        clear_cache_for_sheet()
+    @st.cache_data(ttl=10, show_spinner=False)
+    def read_df_cached(_cache_key: str, spreadsheet_id: str, sheet_name: str) -> pd.DataFrame:
+        # キャッシュ用（インスタンス参照を避ける）
+        # 実体の取得は呼び出し側で行う
+        return pd.DataFrame()
 
-    # ---- Settings ----
-    def get_settings(self) -> pd.DataFrame:
-        df = self.read_df(self.cfg.settings_sheet)
-        for h in DEFAULT_SETTINGS_HEADERS:
-            if h not in df.columns:
-                df[h] = ""
+    def read_df(self, sheet_name: str) -> pd.DataFrame:
+        try:
+            ws = self.ws(sheet_name)
+            values = ws.get_all_values()
+        except APIError as e:
+            st.error(f"読み取りエラー: {sheet_name} / {e}")
+            st.stop()
+
+        if not values:
+            return pd.DataFrame()
+
+        headers = values[0]
+        rows = values[1:]
+        # ヘッダー重複対策（pandasが死ぬ）
+        seen = {}
+        fixed = []
+        for h in headers:
+            h = str(h).strip()
+            if h == "":
+                h = "Unnamed"
+            if h in seen:
+                seen[h] += 1
+                fixed.append(f"{h}__{seen[h]}")
+            else:
+                seen[h] = 0
+                fixed.append(h)
+
+        df = pd.DataFrame(rows, columns=fixed).fillna("")
         return df
 
-    def update_project_total(self, project_name: str, new_total: float) -> None:
+    def append_row(self, sheet_name: str, row: List[Any]) -> None:
+        try:
+            self.ws(sheet_name).append_row([safe_str(x) for x in row], value_input_option="USER_ENTERED")
+        except APIError as e:
+            st.error(f"書き込みエラー: {sheet_name} / {e}")
+            st.stop()
+
+    def upsert_setting_project(self, project_name: str, apr_rate: float, currency: str, note: str = "") -> None:
         ws = self.ws(self.cfg.settings_sheet)
-        df = self.get_settings().fillna("")
-        idxs = df.index[df["Project_Name"].astype(str) == str(project_name)].tolist()
-        if not idxs:
-            return
-        idx = idxs[0]
-        sheet_row = idx + 2
-        headers = self.headers(self.cfg.settings_sheet)
-        if "TotalPrincipal" not in headers:
-            return
-        col = headers.index("TotalPrincipal") + 1
-        ws.update_cell(sheet_row, col, safe_str(round(new_total, 6)))
-        clear_cache_for_sheet()
+        values = ws.get_all_values()
+        if not values:
+            ws.append_row(DEFAULT_SETTINGS_HEADERS, value_input_option="USER_ENTERED")
+            values = [DEFAULT_SETTINGS_HEADERS]
 
-    def project_base_total(self, project_name: str) -> float:
-        df = self.get_settings().fillna("")
-        m = df[df["Project_Name"].astype(str) == str(project_name)]
-        if m.empty:
-            return 0.0
-        return to_f(m.iloc[0].get("TotalPrincipal", 0))
+        headers = values[0]
+        col = {h: i for i, h in enumerate(headers)}
 
-    def project_meta(self, project_name: str) -> Dict[str, Any]:
-        df = self.get_settings().fillna("")
-        m = df[df["Project_Name"].astype(str) == str(project_name)]
-        if m.empty:
-            return {"Currency": "JPY", "IsCompound": "TRUE", "ReceiveFactor": "0.67"}
-        return m.iloc[0].to_dict()
+        def get_cell(row: List[str], key: str) -> str:
+            i = col.get(key, -1)
+            return row[i] if 0 <= i < len(row) else ""
 
-    # ---- Members ----
-    def get_members(self) -> pd.DataFrame:
-        df = self.read_df(self.cfg.members_sheet)
-        for h in DEFAULT_MEMBERS_HEADERS:
-            if h not in df.columns:
-                df[h] = ""
-        return df.fillna("")
+        target_row = None
+        for r_i in range(2, len(values) + 1):
+            row = values[r_i - 1]
+            if get_cell(row, "Project_Name") == project_name:
+                target_row = r_i
+                break
+
+        ts = jst_str(now_jst())
+        out = [""] * len(headers)
+        out[col["Project_Name"]] = project_name
+        out[col["APR_Rate"]] = str(apr_rate)
+        out[col["Currency"]] = currency
+        out[col["Note"]] = note
+        out[col["UpdatedAt_JST"]] = ts
+
+        if target_row is None:
+            ws.append_row(out, value_input_option="USER_ENTERED")
+        else:
+            ws.update(f"A{target_row}:{chr(ord('A')+len(headers)-1)}{target_row}", [out])
+
+    def upsert_member(self, project_name: str, person_name: str, line_user_id: str, display_name: str, is_active: bool) -> None:
+        ws = self.ws(self.cfg.members_sheet)
+        values = ws.get_all_values()
+        if not values:
+            ws.append_row(DEFAULT_MEMBERS_HEADERS, value_input_option="USER_ENTERED")
+            values = [DEFAULT_MEMBERS_HEADERS]
+
+        headers = values[0]
+        col = {h: i for i, h in enumerate(headers)}
+
+        def get_cell(row: List[str], key: str) -> str:
+            i = col.get(key, -1)
+            return row[i] if 0 <= i < len(row) else ""
+
+        target_row = None
+        for r_i in range(2, len(values) + 1):
+            row = values[r_i - 1]
+            if get_cell(row, "Project_Name") == project_name and get_cell(row, "PersonName") == person_name:
+                target_row = r_i
+                break
+
+        ts = jst_str(now_jst())
+        if target_row is None:
+            out = [""] * len(headers)
+            out[col["Project_Name"]] = project_name
+            out[col["PersonName"]] = person_name
+            out[col["Line_User_ID"]] = line_user_id
+            out[col["LINE_DisplayName"]] = display_name
+            out[col["IsActive"]] = "TRUE" if is_active else "FALSE"
+            out[col["CreatedAt_JST"]] = ts
+            out[col["UpdatedAt_JST"]] = ts
+            ws.append_row(out, value_input_option="USER_ENTERED")
+        else:
+            # update minimal
+            def update_cell(key: str, value: str):
+                c = col[key] + 1
+                ws.update_cell(target_row, c, value)
+
+            update_cell("Line_User_ID", line_user_id)
+            update_cell("LINE_DisplayName", display_name)
+            update_cell("IsActive", "TRUE" if is_active else "FALSE")
+            update_cell("UpdatedAt_JST", ts)
 
     def members_for_project(self, project_name: str) -> pd.DataFrame:
-        df = self.get_members().fillna("")
+        df = self.read_df(self.cfg.members_sheet)
+        if df.empty:
+            return df
+        # 列名が壊れてるときは落ちないように
+        if "Project_Name" not in df.columns:
+            return pd.DataFrame()
         df = df[df["Project_Name"].astype(str) == str(project_name)]
-
-        def active_flag(x: Any) -> bool:
-            if str(x).strip() == "":
-                return True
-            return is_truthy(x)
-
-        df = df[df["IsActive"].apply(active_flag)]
+        if "IsActive" in df.columns:
+            df = df[df["IsActive"].astype(str).str.lower().isin(["true", "1", "yes", "y", "on"])]
         return df
 
-    # ---- Ledger ----
-    def get_ledger(self) -> pd.DataFrame:
+    def get_project_list(self) -> List[str]:
+        df = self.read_df(self.cfg.settings_sheet)
+        if df.empty or "Project_Name" not in df.columns:
+            return []
+        return sorted(list({str(x).strip() for x in df["Project_Name"].tolist() if str(x).strip()}))
+
+    def get_project_setting(self, project_name: str) -> Tuple[float, str]:
+        # デフォルト 0.67 / JPY
+        df = self.read_df(self.cfg.settings_sheet)
+        apr = 0.67
+        cur = "JPY"
+        if df.empty or "Project_Name" not in df.columns:
+            return apr, cur
+        m = df[df["Project_Name"].astype(str) == str(project_name)]
+        if m.empty:
+            return apr, cur
+        r = m.iloc[0].to_dict()
+        try:
+            apr = float(str(r.get("APR_Rate", "0.67")).strip() or "0.67")
+        except Exception:
+            apr = 0.67
+        cur = str(r.get("Currency", "JPY")).strip() or "JPY"
+        return apr, cur
+
+    def calc_balance_for_project(self, project_name: str) -> float:
         df = self.read_df(self.cfg.ledger_sheet)
-        for h in DEFAULT_LEDGER_HEADERS:
-            if h not in df.columns:
-                df[h] = ""
-        return df.fillna("")
+        if df.empty:
+            return 0.0
+        if "Project_Name" not in df.columns or "Type" not in df.columns or "Amount" not in df.columns:
+            return 0.0
 
-    def project_current_total(self, project_name: str) -> float:
-        base = self.project_base_total(project_name)
-        led = self.get_ledger().fillna("")
-        led = led[led["Project_Name"].astype(str) == str(project_name)]
-        total = base
-        for _, r in led.iterrows():
-            typ = str(r.get("Type", "")).strip()
-            amt = to_f(r.get("Amount", 0))
-            if typ == "Deposit":
-                total += amt
-            elif typ == "Withdraw":
-                total -= amt
-            elif typ == "APR":
-                total += amt
-        return total
+        dfp = df[df["Project_Name"].astype(str) == str(project_name)].copy()
+        if dfp.empty:
+            return 0.0
 
+        def fnum(x: Any) -> float:
+            try:
+                return float(str(x).replace(",", "").strip())
+            except Exception:
+                return 0.0
 
-# =========================
-# APR calc
-# =========================
-def calc_apr_daily_amount(total_principal: float, apr_percent: float, receive_factor: float) -> float:
-    effective_apr = apr_percent * receive_factor
-    daily_rate = (effective_apr / 100.0) / 365.0
-    return total_principal * daily_rate
+        dfp["AmountNum"] = dfp["Amount"].apply(fnum)
+        dep = dfp[dfp["Type"].astype(str) == "Deposit"]["AmountNum"].sum()
+        wdr = dfp[dfp["Type"].astype(str) == "Withdraw"]["AmountNum"].sum()
+        # APR行は残高に影響させる/させないは運用次第だが、ここでは「影響させない」(収益記録のみ)にする
+        return float(dep - wdr)
 
 
-# =========================
+# ------------------------
+# LINE Push
+# ------------------------
+def line_push_message(channel_access_token: str, to_user_id: str, text: str) -> bool:
+    if not channel_access_token:
+        return False
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {
+        "Authorization": f"Bearer {channel_access_token}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "to": to_user_id,
+        "messages": [{"type": "text", "text": text}],
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=15)
+    return 200 <= r.status_code < 300
+
+
+# ------------------------
 # UI
-# =========================
-def ui_debug(gs: GSheets):
-    st.sidebar.markdown("## 🔎 Debug")
-    con = st.secrets.get("connections", {}).get("gsheets", {})
-    st.sidebar.write("spreadsheet:", extract_sheet_id(safe_str(con.get("spreadsheet", ""))))
-    creds = con.get("credentials", {})
-    st.sidebar.write("client_email:", safe_str(creds.get("client_email", "")))
-    st.sidebar.write("token_uri:", safe_str(creds.get("token_uri", "")))
-    st.sidebar.write("Sheets:", gs.cfg.settings_sheet, gs.cfg.members_sheet, gs.cfg.ledger_sheet)
-    if st.sidebar.button("キャッシュクリア"):
-        clear_cache_for_sheet()
-        st.rerun()
+# ------------------------
+def ui_debug(cfg: GSheetsConfig):
+    with st.sidebar:
+        st.write("🔎 Debug")
+        st.caption(f"spreadsheet: {cfg.spreadsheet_id}")
+        con = st.secrets.get("connections", {}).get("gsheets", {})
+        creds = con.get("credentials", {})
+        st.caption(f"client_email: {safe_str(creds.get('client_email',''))}")
+        st.caption(f"token_uri: {safe_str(creds.get('token_uri',''))}")
+        st.caption("Sheets: Settings Members Ledger")
+        if st.button("キャッシュクリア"):
+            st.cache_data.clear()
+            st.toast("キャッシュをクリアしました")
 
 
-def ui_apr(gs: GSheets):
-    st.subheader("📈 APR（本日の収益）→ 台帳記録 → 全員へ一斉LINE（受取率 0.67）")
+def ui_settings(gs: GSheets):
+    st.subheader("⚙️ Settings（プロジェクト設定）")
+    df = gs.read_df(gs.cfg.settings_sheet)
+    if df.empty:
+        st.info("Settings が空です。まずプロジェクトを作成してください。")
+    else:
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
-    settings_df = gs.get_settings()
-    if settings_df.empty:
-        st.error("Settings が空です。")
-        return
-
-    projects = settings_df["Project_Name"].dropna().astype(str).unique().tolist()
-    project = st.selectbox("プロジェクト", options=projects)
-
-    meta = gs.project_meta(project)
-    currency = str(meta.get("Currency", "JPY")).strip() or "JPY"
-
-    receive_factor = to_f(meta.get("ReceiveFactor", 0.67))
-    if receive_factor <= 0:
-        receive_factor = 0.67
-
-    current_total = gs.project_current_total(project)
-    st.info(f"現在総額（Ledger反映）: {current_total:,.2f} {currency} / 受取率: {receive_factor:.2f}")
-
-    members = gs.members_for_project(project)
-    if members.empty:
-        st.warning("Members にこのプロジェクトのメンバーがいません（Project_Name一致を確認）。")
-        return
-
-    token = safe_str(st.secrets.get("line", {}).get("channel_access_token", ""))
-    uids = [str(x).strip() for x in members["Line_User_ID"].tolist() if str(x).strip().startswith("U")]
-    uids = uniq_keep_order(uids)
-
-    st.caption(f"人数: {len(members)} / 送信先ID: {len(uids)}")
-
-    apr_percent = st.number_input("本日のAPR（年利, %）", value=20.0, step=0.1)
-    uploaded = st.file_uploader("エビデンス画像（任意）", type=["png", "jpg", "jpeg"])
-    if uploaded:
-        st.image(uploaded, width=360)
-
-    total_daily = calc_apr_daily_amount(current_total, apr_percent, receive_factor)
-    per_person = total_daily / max(1, len(members))
-    st.metric("本日の合計収益", f"{total_daily:,.4f} {currency}")
-    st.metric("1人あたり（均等）", f"{per_person:,.4f} {currency}")
-
-    if st.button("✅ APRを台帳に記録して全員へ送信", use_container_width=True):
-        evidence_url = ""
-        if uploaded:
-            with st.spinner("画像URL化（ImgBB）..."):
-                u = upload_imgbb(uploaded.getvalue())
-            if not u:
-                st.error("ImgBB失敗。画像なしで再実行してください。")
-                return
-            evidence_url = u
-
-        dt = jst_str()
-
-        # 個人ごとにAPR行（均等）を台帳へ
-        for _, m in members.iterrows():
-            gs.append_row_by_headers(
-                gs.cfg.ledger_sheet,
-                {
-                    "Datetime_JST": dt,
-                    "Project_Name": project,
-                    "PersonName": str(m.get("PersonName", "")).strip(),
-                    "Type": "APR",
-                    "Amount": round(per_person, 6),
-                    "Currency": currency,
-                    "Note": f"APR:{apr_percent}%, Receive:{receive_factor}",
-                    "Line_User_ID": str(m.get("Line_User_ID", "")).strip(),
-                    "LINE_DisplayName": str(m.get("LINE_DisplayName", "")).strip(),
-                    "Source": "app",
-                    "Evidence_URL": evidence_url,
-                },
-            )
-
-        # TotalPrincipalも更新（APR分を総額に加算）
-        new_total = current_total + total_daily
-        gs.update_project_total(project, new_total)
-
-        # 一斉LINE（個人名なし）
-        if token and uids:
-            msg = (
-                "🏦【本日の運用収益報告】\n"
-                f"プロジェクト: {project}\n"
-                f"日時(JST): {dt}\n"
-                f"APR(年利): {apr_percent}%\n"
-                f"受取率: {receive_factor:.2f}\n"
-                f"本日の合計収益: {total_daily:,.4f} {currency}\n"
-                f"1人あたり(均等): {per_person:,.4f} {currency}\n"
-            )
-            if evidence_url:
-                msg += "📎 エビデンス画像を添付します。"
-
-            ok, ng = 0, 0
-            for uid in uids:
-                code = send_line_push(token, uid, msg, image_url=(evidence_url or None))
-                if code == 200:
-                    ok += 1
-                else:
-                    ng += 1
-            st.success(f"送信：成功 {ok} / 失敗 {ng}")
-
-        st.success(f"APR記録完了。更新後総額: {new_total:,.2f} {currency}")
-        st.rerun()
-
-
-def ui_cash(gs: GSheets):
-    st.subheader("💸 入金 / 出金 → 台帳記録 → 個人へLINE通知")
-
-    settings_df = gs.get_settings()
-    if settings_df.empty:
-        st.error("Settings が空です。")
-        return
-
-    projects = settings_df["Project_Name"].dropna().astype(str).unique().tolist()
-    project = st.selectbox("プロジェクト", options=projects, key="cash_project")
-
-    meta = gs.project_meta(project)
-    currency_default = str(meta.get("Currency", "JPY")).strip() or "JPY"
-
-    members = gs.members_for_project(project)
-    if members.empty:
-        st.warning("Members にこのプロジェクトのメンバーがいません（Project_Name一致を確認）。")
-        return
-
-    labels = members["PersonName"].astype(str).tolist()
-    person = st.selectbox("メンバー（PersonName）", options=labels)
-
-    mrow = members[members["PersonName"].astype(str) == str(person)].iloc[0]
-    uid = str(mrow.get("Line_User_ID", "")).strip()
-    disp = str(mrow.get("LINE_DisplayName", "")).strip()
-
-    current_total = gs.project_current_total(project)
-    st.info(f"現在総額（Ledger反映）: {current_total:,.2f} {currency_default}")
-
-    dt = now_jst()
-    with st.form("cash_form", clear_on_submit=False):
-        d = st.date_input("日付（JST）", value=dt.date())
-        t = st.time_input("時刻（JST）", value=dt.time().replace(second=0, microsecond=0))
-        dt_fixed = datetime(d.year, d.month, d.day, t.hour, t.minute, t.second, tzinfo=JST)
-
-        typ = st.selectbox("種別", options=["Deposit", "Withdraw"])
-        amount = st.number_input("金額", min_value=0.0, value=0.0, step=1000.0)
-        currency = st.text_input("通貨", value=currency_default)
-        note = st.text_input("メモ", value="")
-        submit = st.form_submit_button("✅ 台帳に記録してLINE通知")
-
-    if submit:
-        if amount <= 0:
-            st.error("金額が0です。")
-            return
-
-        dt_s = dt_fixed.strftime("%Y-%m-%d %H:%M:%S")
-
-        gs.append_row_by_headers(
-            gs.cfg.ledger_sheet,
-            {
-                "Datetime_JST": dt_s,
-                "Project_Name": project,
-                "PersonName": person,
-                "Type": typ,
-                "Amount": round(float(amount), 6),
-                "Currency": currency.strip() or currency_default,
-                "Note": note,
-                "Line_User_ID": uid,
-                "LINE_DisplayName": disp,
-                "Source": "app",
-                "Evidence_URL": "",
-            },
-        )
-
-        # TotalPrincipal更新（入金/出金分を総額に反映）
-        new_total = current_total + float(amount) if typ == "Deposit" else current_total - float(amount)
-        gs.update_project_total(project, new_total)
-
-        token = safe_str(st.secrets.get("line", {}).get("channel_access_token", ""))
-        if token and uid.startswith("U"):
-            msg = (
-                f"🏦【{project} 入出金通知】\n"
-                f"日時(JST): {dt_s}\n"
-                f"種別: {'入金' if typ == 'Deposit' else '出金'}\n"
-                f"金額: {float(amount):,.2f} {currency}\n"
-                f"メモ: {note}\n"
-                f"更新後の総額: {new_total:,.2f} {currency_default}\n"
-            )
-            code = send_line_push(token, uid, msg)
-            if code == 200:
-                st.success("記録＆LINE通知しました。")
-            else:
-                st.warning(f"記録は完了しましたが、LINE送信に失敗しました（HTTP {code}）。")
+    st.divider()
+    st.write("### プロジェクト追加/更新")
+    with st.form("settings_upsert", clear_on_submit=False):
+        project = st.text_input("Project_Name", placeholder="例: プロジェクトA")
+        apr_rate = st.number_input("APR_Rate（年利）", min_value=0.0, max_value=10.0, value=0.67, step=0.01)
+        currency = st.text_input("Currency", value="JPY")
+        note = st.text_input("Note", value="")
+        ok = st.form_submit_button("保存")
+    if ok:
+        if not project.strip():
+            st.error("Project_Name は必須です")
         else:
-            st.success("記録しました（LINE送信は未設定/IDなし）。")
+            gs.upsert_setting_project(project.strip(), float(apr_rate), currency.strip(), note.strip())
+            st.success("保存しました")
+            st.rerun()
 
-        st.rerun()
+
+def ui_members(gs: GSheets):
+    st.subheader("👤 Members（個人名 ↔ LINE）")
+    projects = gs.get_project_list()
+    project = st.selectbox("Project", options=[""] + projects)
+    if not project:
+        st.info("Project を選んでください")
+        return
+
+    df = gs.members_for_project(project)
+    if df.empty:
+        st.warning("このプロジェクトのメンバーがいません")
+    else:
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.write("### メンバー追加/更新（Project + PersonName でUpsert）")
+    with st.form("member_upsert", clear_on_submit=False):
+        person = st.text_input("PersonName", placeholder="例: 田中太郎")
+        line_uid = st.text_input("Line_User_ID", placeholder="例: Uxxxxxxxxxxxxxxxx")
+        disp = st.text_input("LINE_DisplayName", placeholder="例: taro")
+        active = st.checkbox("IsActive", value=True)
+        ok = st.form_submit_button("保存")
+    if ok:
+        if not person.strip():
+            st.error("PersonName は必須です")
+        else:
+            gs.upsert_member(project, person.strip(), line_uid.strip(), disp.strip(), bool(active))
+            st.success("保存しました")
+            st.rerun()
 
 
 def ui_ledger(gs: GSheets):
-    st.subheader("📒 Ledger（台帳）")
-    df = gs.get_ledger()
-    if df.empty:
-        st.info("Ledger が空です。")
+    st.subheader("📒 入金/出金 台帳（Ledger）")
+
+    projects = gs.get_project_list()
+    project = st.selectbox("Project", options=[""] + projects, key="ledger_project")
+    if not project:
+        st.info("Project を選んでください")
         return
-    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    tab1, tab2 = st.tabs(["記録する", "見る"])
+    with tab1:
+        members_df = gs.members_for_project(project)
+        people = []
+        if not members_df.empty and "PersonName" in members_df.columns:
+            people = sorted([str(x).strip() for x in members_df["PersonName"].tolist() if str(x).strip()])
+
+        with st.form("ledger_add", clear_on_submit=False):
+            d = st.date_input("日付(JST)", value=now_jst().date())
+            t = st.time_input("時刻(JST)", value=now_jst().time().replace(second=0, microsecond=0))
+            dt = datetime(d.year, d.month, d.day, t.hour, t.minute, t.second, tzinfo=JST)
+
+            person = st.selectbox("PersonName", options=[""] + people)
+            typ = st.selectbox("Type", options=["Deposit", "Withdraw", "Other"])
+            amount = st.number_input("Amount", min_value=0.0, value=0.0, step=1000.0)
+            currency = st.text_input("Currency", value=gs.get_project_setting(project)[1])
+            note = st.text_input("Note", value="")
+            source = st.selectbox("Source", options=["app", "make", "line", "other"])
+
+            ok = st.form_submit_button("追加")
+        if ok:
+            if not person:
+                st.error("PersonName を選んでください")
+            else:
+                # member情報からLINE ID/表示名を引く（無ければ空）
+                line_uid = ""
+                disp = ""
+                if not members_df.empty:
+                    m = members_df[members_df["PersonName"].astype(str) == str(person)]
+                    if not m.empty:
+                        r = m.iloc[0].to_dict()
+                        line_uid = safe_str(r.get("Line_User_ID", ""))
+                        disp = safe_str(r.get("LINE_DisplayName", ""))
+
+                row = [
+                    dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    project,
+                    person,
+                    typ,
+                    amount,
+                    currency,
+                    note,
+                    line_uid,
+                    disp,
+                    source,
+                ]
+                gs.append_row(gs.cfg.ledger_sheet, row)
+                st.success("追加しました")
+                st.rerun()
+
+    with tab2:
+        df = gs.read_df(gs.cfg.ledger_sheet)
+        if df.empty:
+            st.info("Ledger が空です")
+            return
+        if "Project_Name" in df.columns:
+            df = df[df["Project_Name"].astype(str) == str(project)]
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
 
+def ui_apr(gs: GSheets):
+    st.subheader("📈 APR報告（一斉）")
+
+    projects = gs.get_project_list()
+    project = st.selectbox("Project", options=[""] + projects, key="apr_project")
+    if not project:
+        st.info("Project を選んでください")
+        return
+
+    apr_rate, currency = gs.get_project_setting(project)
+    balance = gs.calc_balance_for_project(project)
+
+    st.write(f"現在総額（Ledger反映）: **{balance:,.2f} {currency}** / 年利: **{apr_rate:.2f}**")
+
+    # 日利換算（365）
+    daily_profit_total = balance * float(apr_rate) / 365.0
+
+    st.write(f"本日の収益（概算）: **{daily_profit_total:,.2f} {currency}**")
+
+    members = gs.members_for_project(project)
+    if members.empty or "PersonName" not in members.columns:
+        st.warning("Members にこのプロジェクトのメンバーがいません（Project_Name一致を確認）。")
+        return
+
+    # メンバーへ均等割り（運用ルール次第：必要なら按分に変更）
+    n = len(members)
+    per = daily_profit_total / n if n > 0 else 0.0
+
+    st.write(f"人数: {n} / 1人あたり: **{per:,.2f} {currency}**")
+
+    # 実行
+    line_token = load_line_token()
+    send_line = st.checkbox("LINEに送る（tokenがある場合のみ）", value=bool(line_token))
+    record_ledger = st.checkbox("LedgerにAPRとして記録する", value=True)
+    note = st.text_input("メモ（Note）", value=f"APR daily ({apr_rate:.2f}/year)")
+
+    if st.button("APRを実行（記録/送信）", type="primary"):
+        dt = now_jst()
+        ok_count = 0
+        fail_count = 0
+
+        for _, r in members.iterrows():
+            person = safe_str(r.get("PersonName", ""))
+            uid = safe_str(r.get("Line_User_ID", ""))
+            disp = safe_str(r.get("LINE_DisplayName", ""))
+
+            # Ledger記録
+            if record_ledger:
+                row = [
+                    dt.strftime("%Y-%m-%d %H:%M:%S"),
+                    project,
+                    person,
+                    "APR",
+                    round(per, 2),
+                    currency,
+                    note,
+                    uid,
+                    disp,
+                    "app",
+                ]
+                gs.append_row(gs.cfg.ledger_sheet, row)
+
+            # LINE送信
+            if send_line and line_token and uid:
+                msg = (
+                    f"【APR報告】{project}\n"
+                    f"{person} 様\n"
+                    f"本日の収益: {per:,.2f} {currency}\n"
+                    f"年利: {apr_rate:.2f}\n"
+                    f"日時(JST): {jst_str(dt)}\n"
+                )
+                try:
+                    if line_push_message(line_token, uid, msg):
+                        ok_count += 1
+                    else:
+                        fail_count += 1
+                except Exception:
+                    fail_count += 1
+
+        st.success(f"完了：LINE成功 {ok_count} / 失敗 {fail_count}（Ledger記録={record_ledger}）")
+        st.rerun()
+
+
+def ui_admin(gs: GSheets):
+    st.subheader("⚙ 管理（管理者のみ）")
+    admin_login_ui()
+    if not is_admin():
+        st.info("管理者パスを入力すると管理機能が表示されます")
+        st.stop()
+
+    st.success("管理者モード")
+
+    st.write("### ヘッダー（コピペ用）")
+    st.write("**Settings**")
+    st.code("\t".join(DEFAULT_SETTINGS_HEADERS))
+    st.write("**Members**")
+    st.code("\t".join(DEFAULT_MEMBERS_HEADERS))
+    st.write("**Ledger**")
+    st.code("\t".join(DEFAULT_LEDGER_HEADERS))
+
+    st.divider()
+    ui_settings(gs)
+    st.divider()
+    ui_members(gs)
+
+
+# ------------------------
+# Main
+# ------------------------
 def main():
-    st.set_page_config(page_title="APR資産運用管理システム", layout="wide", page_icon="🏦")
+    st.set_page_config(page_title="APR資産運用管理システム", layout="wide")
     st.title("🏦 APR資産運用管理システム")
 
-    gs = GSheets(GSheetsConfig(spreadsheet_id=""))
+    cfg = load_cfg_from_secrets()
+    if cfg is None:
+        st.error("Secrets の [connections.gsheets].spreadsheet が未設定です。")
+        st.stop()
 
-    ui_debug(gs)
+    ui_debug(cfg)
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["📈 APR報告（一斉）", "💸 入金/出金（個別）", "📒 台帳", "⚙️ 管理"]
+    # ここで spreadsheet_id を空で渡すのは禁止
+    gs = GSheets(cfg)
+
+    tab_apr, tab_ledger, tab_members, tab_admin = st.tabs(
+        ["📈 APR報告（一斉）", "📒 入金/出金（個別）", "👤 Members（閲覧）", "⚙ 管理"]
     )
 
-    with tab1:
+    with tab_apr:
         ui_apr(gs)
-    with tab2:
-        ui_cash(gs)
-    with tab3:
-        ui_ledger(gs)
-    with tab4:
-        st.subheader("⚙️ 管理（管理者のみ）")
-        admin_login_ui()
-        if not is_admin():
-            st.info("管理者ログイン後に表示します。")
-            st.stop()
 
-        st.success("管理者モード")
-        st.write("### ヘッダー（コピペ用）")
-        st.write("Settings"); st.code("\t".join(DEFAULT_SETTINGS_HEADERS))
-        st.write("Members"); st.code("\t".join(DEFAULT_MEMBERS_HEADERS))
-        st.write("Ledger"); st.code("\t".join(DEFAULT_LEDGER_HEADERS))
-        st.caption("※ 1行目に貼り付け（タブ区切り）")
+    with tab_ledger:
+        ui_ledger(gs)
+
+    with tab_members:
+        # 閲覧のみ
+        df = gs.read_df(gs.cfg.members_sheet)
+        if df.empty:
+            st.info("Members が空です")
+        else:
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+    with tab_admin:
+        ui_admin(gs)
 
 
 if __name__ == "__main__":
