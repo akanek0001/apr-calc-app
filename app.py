@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
@@ -67,7 +67,7 @@ def is_truthy(v: Any) -> bool:
 
 
 # =========================
-# Secrets (connections.gsheets 방식)
+# Secrets (connections.gsheets)
 # =========================
 def get_spreadsheet_id_from_secrets() -> str:
     con = st.secrets.get("connections", {}).get("gsheets", {})
@@ -87,12 +87,11 @@ def get_service_account_info() -> Dict[str, Any]:
     creds = con.get("credentials")
     if not creds:
         raise KeyError("Secrets に [connections.gsheets.credentials] がありません。")
-    # streamlit secrets は AttrDict っぽいので dict に落とす
     return dict(creds)
 
 
 # =========================
-# Google Sheets Client (gspread)
+# Google Sheets Client
 # =========================
 @dataclass
 class GSheetsConfig:
@@ -112,7 +111,7 @@ DEFAULT_SETTINGS_HEADERS = [
     "IsCompound",
     "MemberNames",
     "LineID",
-    "NetFactors",  # 任意（0.67,0.60,...）
+    "NetFactor",   # ★ プロジェクト単位（0.67 or 0.60）
 ]
 
 DEFAULT_MEMBERS_HEADERS = [
@@ -151,7 +150,6 @@ class GSheets:
         self.gc = gspread.authorize(creds)
         self.book = self.gc.open_by_key(cfg.spreadsheet_id)
 
-        # シートが無い場合は作る（※429が出る環境ではRun連打しない）
         self._ensure_sheet(cfg.settings_sheet, DEFAULT_SETTINGS_HEADERS)
         self._ensure_sheet(cfg.members_sheet, DEFAULT_MEMBERS_HEADERS)
         self._ensure_sheet(cfg.ledger_sheet, DEFAULT_LEDGER_HEADERS)
@@ -169,7 +167,6 @@ class GSheets:
             ws.append_row(headers, value_input_option="USER_ENTERED")
             return
 
-        # ヘッダー重複で pandas が落ちるので、重複してたら止める（あなたが直したのでOKのはず）
         h = values[0]
         if len(h) != len(set(h)):
             st.error(f"ヘッダー名が重複しています: {name} / {h}")
@@ -192,9 +189,6 @@ class GSheets:
         ws = self.ws(name)
         ws.append_row([safe_str(x) for x in row], value_input_option="USER_ENTERED")
 
-    def update_cell(self, sheet: str, row: int, col: int, value: Any) -> None:
-        self.ws(sheet).update_cell(row, col, safe_str(value))
-
 
 # =========================
 # Cache (429対策)
@@ -207,7 +201,6 @@ def cached_read_df(spreadsheet_id: str, sheet_name: str, sa_fingerprint: str) ->
 
 
 def sa_fingerprint_from_secrets() -> str:
-    # キャッシュキー用（中身そのまま使わない）
     sa = get_service_account_info()
     return safe_str(sa.get("client_email", "")) + "|" + safe_str(sa.get("private_key_id", ""))
 
@@ -236,7 +229,6 @@ def upload_imgbb(file_bytes: bytes) -> Optional[str]:
         api_key = st.secrets["imgbb"]["api_key"]
     except Exception:
         return None
-
     try:
         res = requests.post(
             "https://api.imgbb.com/1/upload",
@@ -308,20 +300,13 @@ def compute_member_principals(
     base_principals: List[float],
     is_compound: bool,
 ) -> List[float]:
-    """
-    元本計算（複利なら APR も元本に加算）
-    Deposit: +, Withdraw: -, APR: +（複利のみ）
-    """
     n = len(names)
     p = base_principals[:]
     if ledger_df.empty:
         return p
 
-    df = ledger_df.copy()
-    df = df.fillna("")
+    df = ledger_df.copy().fillna("")
     df = df[df["Project_Name"].astype(str) == str(project)]
-
-    # 金額をfloatへ
     df["Amount_f"] = df["Amount"].apply(to_f)
 
     for i in range(n):
@@ -329,15 +314,12 @@ def compute_member_principals(
         sub = df[df["PersonName"].astype(str) == str(name)]
         if sub.empty:
             continue
-
         dep = sub[sub["Type"] == "Deposit"]["Amount_f"].sum()
         wdr = sub[sub["Type"] == "Withdraw"]["Amount_f"].sum()
         apr = sub[sub["Type"] == "APR"]["Amount_f"].sum()
-
         p[i] = p[i] + dep - wdr
         if is_compound:
             p[i] = p[i] + apr
-
     return p
 
 
@@ -356,12 +338,6 @@ def only_line_ids(values: List[Any]) -> List[str]:
 
 
 def get_broadcast_ids(gs: GSheets, settings_lineid_fallback: str) -> List[str]:
-    """
-    一斉送信先：
-    1) LineIDシート（あれば）を読む → 重複排除
-    2) 無ければ Settings の LineID をCSVとして読む → 重複排除
-    """
-    # 1) LineID sheet
     try:
         df = gs.read_df(gs.cfg.lineid_sheet)
         if not df.empty:
@@ -373,7 +349,6 @@ def get_broadcast_ids(gs: GSheets, settings_lineid_fallback: str) -> List[str]:
     except Exception:
         pass
 
-    # 2) fallback
     ids = split_csv(settings_lineid_fallback, 999, default="")
     return only_line_ids(ids)
 
@@ -395,7 +370,6 @@ def page_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame, l
 
     member_names = split_csv(p.get("MemberNames", ""), num_people, default="")
     if not any(member_names):
-        # 名前が無ければ No.1.. にする
         member_names = [f"No.{i+1}" for i in range(num_people)]
     else:
         member_names = [x if x else f"No.{i+1}" for i, x in enumerate(member_names)]
@@ -403,11 +377,11 @@ def page_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame, l
     base_principals = [to_f(x) for x in split_csv(p.get("IndividualPrincipals", "0"), num_people, default="0")]
     profit_rates = [to_f(x) for x in split_csv(p.get("ProfitRates", "100"), num_people, default="100")]
 
-    # 個人別 net_factor（無ければ 0.67）
-    net_factors = [to_f(x) for x in split_csv(p.get("NetFactors", "0.67"), num_people, default="0.67")]
-    net_factors = [nf if nf > 0 else 0.67 for nf in net_factors]
+    # ★ プロジェクト単位 NetFactor（無ければ 0.67）
+    net_factor = to_f(p.get("NetFactor", 0.67))
+    if net_factor <= 0:
+        net_factor = 0.67
 
-    # 現在元本
     principals = compute_member_principals(
         ledger_df=ledger_df,
         project=project,
@@ -417,17 +391,16 @@ def page_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame, l
     )
 
     st.sidebar.info(f"複利: {'YES' if is_compound else 'NO'} / 人数: {num_people}")
+    st.sidebar.info(f"NetFactor（プロジェクト）: {net_factor}")
 
     apr_percent = st.number_input("本日のAPR（%）", value=100.0, step=0.1)
     evidence = st.file_uploader("エビデンス画像（任意）", type=["png", "jpg", "jpeg"])
 
-    # 収益計算
     today_yields = []
     for i in range(num_people):
         p0 = principals[i]
         r = profit_rates[i] / 100.0
-        nf = net_factors[i]  # 0.67 or 0.60 ...
-        y = (p0 * (apr_percent / 100.0) * nf * r) / 365.0
+        y = (p0 * (apr_percent / 100.0) * net_factor * r) / 365.0
         today_yields.append(round(float(y), 6))
 
     st.subheader("本日の計算結果")
@@ -435,22 +408,19 @@ def page_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame, l
     with cols[0]:
         st.metric("総収益", fmt_money(sum(today_yields)))
     with cols[1]:
-        st.metric("ネット係数の例", f"{net_factors[0]:.2f}" if net_factors else "0.67")
+        st.metric("NetFactor", f"{net_factor:.2f}")
     with cols[2]:
         st.metric("報告日時（JST）", now_jst().strftime("%Y-%m-%d %H:%M"))
 
-    st.write("メンバー別（表示用）")
     show = pd.DataFrame({
         "PersonName": member_names,
         "Principal": principals,
         "ProfitRate(%)": [round(x, 4) for x in profit_rates],
-        "NetFactor": [round(x, 4) for x in net_factors],
         "TodayYield": today_yields,
     })
     st.dataframe(show, use_container_width=True, hide_index=True)
 
     if st.button("収益を確定して、全員へLINE送信", type="primary"):
-        # 画像（任意）をImgBBへ
         image_url = None
         if evidence is not None:
             with st.spinner("画像アップロード中（ImgBB）..."):
@@ -459,16 +429,14 @@ def page_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame, l
                 st.error("ImgBBアップロードに失敗しました。画像なしで送る場合は画像を外して再実行してください。")
                 st.stop()
 
-        # Ledgerへ記録（APRは個人別に1行ずつ）
         dtj = now_jst().strftime("%Y-%m-%d %H:%M:%S")
+
+        # APRは個人別に台帳へ記録（複利反映のため）
         for i in range(num_people):
             name = member_names[i]
             amt = today_yields[i]
-
-            # 複利なら Total_After は元本加算、単利なら参考として同じ値
             total_after = principals[i] + amt if is_compound else principals[i]
 
-            # Membersから紐付け（無い場合は空でOK）
             m = None
             if not members_df.empty:
                 mm = members_df[members_df["PersonName"].astype(str) == str(name)]
@@ -480,23 +448,20 @@ def page_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame, l
 
             gs.append_row(gs.cfg.ledger_sheet, [
                 dtj, project, name, "APR", amt, total_after,
-                f"APR:{apr_percent}%", line_uid, disp, "app"
+                f"APR:{apr_percent}%, NetFactor:{net_factor}", line_uid, disp, "app"
             ])
 
-        # 一斉送信ID（LineIDシート優先）
         broadcast_ids = get_broadcast_ids(gs, safe_str(p.get("LineID", "")))
-
         token = safe_str(st.secrets.get("line", {}).get("channel_access_token", ""))
         if not token:
             st.error("Secrets の [line].channel_access_token が未設定です。")
             st.stop()
 
-        # メッセージ（個人名は不要、総額のみ）
         msg = "🏦 【資産運用 収益報告】\n"
         msg += f"プロジェクト: {project}\n"
         msg += f"報告日時(JST): {dtj}\n"
         msg += f"本日のAPR: {apr_percent}%\n"
-        msg += f"ネット係数: 個人設定\n"
+        msg += f"NetFactor: {net_factor}\n"
         msg += f"総収益: {fmt_money(sum(today_yields))}\n"
         if image_url:
             msg += "\n📎 エビデンス画像を添付します。"
@@ -543,9 +508,7 @@ def page_cashflow(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFra
         is_compound=is_compound,
     )
 
-    # 入出金は同一ページ内
     c1, c2 = st.columns([1, 1])
-
     with c1:
         target = st.selectbox("メンバー", member_names)
         idx = member_names.index(target)
@@ -562,11 +525,8 @@ def page_cashflow(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFra
             st.stop()
 
         dtj = now_jst().strftime("%Y-%m-%d %H:%M:%S")
-
-        # 元本（参考）更新
         after = principals[idx] + amt if typ == "Deposit" else principals[idx] - amt
 
-        # Membersから紐付け
         m = None
         if not members_df.empty:
             mm = members_df[members_df["PersonName"].astype(str) == str(target)]
@@ -581,7 +541,6 @@ def page_cashflow(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFra
             note, line_uid, disp, "app"
         ])
 
-        # 本人へLINE通知（紐付けが無ければ送れない）
         token = safe_str(st.secrets.get("line", {}).get("channel_access_token", ""))
         if token and line_uid:
             msg = "🏦 【入出金通知】\n"
@@ -622,7 +581,6 @@ def page_members(gs: GSheets, members_df: pd.DataFrame):
         st.dataframe(members_df, use_container_width=True, hide_index=True)
         return
 
-    # LS Active / LS All（ボタンで実装。フィルターUIにしない）
     if "members_ls_mode" not in st.session_state:
         st.session_state["members_ls_mode"] = "ACTIVE"
 
@@ -657,7 +615,6 @@ def page_members(gs: GSheets, members_df: pd.DataFrame):
             st.error("PersonName と Line_User_ID は必須です。")
             st.stop()
 
-        # 既存UIDチェック（UID一致なら追加しない）
         cur = members_df.copy().fillna("")
         if not cur.empty and "Line_User_ID" in cur.columns:
             exists = cur[cur["Line_User_ID"].astype(str) == str(line_uid)]
@@ -706,30 +663,24 @@ def main():
         st.error("Secrets の [connections.gsheets].spreadsheet が未設定です。")
         st.stop()
 
-    # 左サイド “タブ（メニュー）” を必ず出す
     page = st.sidebar.radio("メニュー", ["📈 APR", "💸 入出金", "👤 メンバー", "⚙️ 管理"], index=0)
 
-    # 429対策：同一実行で複数回読まない
     fp = sa_fingerprint_from_secrets()
 
     try:
-        # 初期化（シート存在保証）
         gs = GSheets(GSheetsConfig(spreadsheet_id=spreadsheet_id))
     except Exception as e:
         st.error(f"Spreadsheet を開けません。共有設定（編集者）とIDを確認してください。: {e}")
         st.stop()
 
-    # 読み取り（キャッシュ）
     try:
-        settings_df = cached_read_df(spreadsheet_id, "Settings", fp)
-        members_df = cached_read_df(spreadsheet_id, "Members", fp)
-        ledger_df = cached_read_df(spreadsheet_id, "Ledger", fp)
+        settings_df = cached_read_df(spreadsheet_id, "Settings", fp).fillna("")
+        members_df = cached_read_df(spreadsheet_id, "Members", fp).fillna("")
+        ledger_df = cached_read_df(spreadsheet_id, "Ledger", fp).fillna("")
     except Exception as e:
         st.error(f"読み取りエラー: {e}")
         st.stop()
 
-    # 必須列チェック
-    settings_df = settings_df.fillna("")
     if settings_df.empty:
         st.error("Settings シートが空です。")
         st.stop()
@@ -738,9 +689,6 @@ def main():
         if col not in settings_df.columns:
             st.error(f"Settings に列がありません: {col}")
             st.stop()
-
-    members_df = members_df.fillna("")
-    ledger_df = ledger_df.fillna("")
 
     if page == "📈 APR":
         page_apr(gs, settings_df, members_df, ledger_df)
