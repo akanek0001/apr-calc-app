@@ -1,58 +1,57 @@
 # app.py
-# APR 管理システム（フル版 / 安定運用向け）
-# - Google Sheets（gspread）: Settings / Members / Ledger を中央台帳として運用
-# - 管理者PINログイン（Secrets: [admin].pin）
-# - プロジェクト別 NetFactor（0.67 / 0.60 等）設定
-# - APR計算 → 全員へLINE一斉送信（個人名は入れない）
-# - 入金/出金 → 本人へLINE通知（PersonName ↔ Line_User_ID で紐付け）
-# - 画像エビデンス（任意）: ImgBB → LINE添付
-# - 429(Quota exceeded) 対策: st.cache_data TTL + まとめ読み + 最小読み込み
+# APR資産運用管理システム（完全版）
+# - Google Sheets: connections.gsheets 方式（Streamlit Secrets）
+# - シート: Settings / Members / Ledger
+# - 管理者のみ: メンバー管理（追加・IsActive切替）/ Settings閲覧
+# - メンバー追加仕様: Line_User_ID が既に存在する場合は「更新しない（スキップ）」
+# - 入金/出金: 個人にLINE通知（PersonNameで送る）
+# - APR確定: 全員にLINE通知（個人名は入れない、No.ごとの金額のみ）
+# - 画像添付: ImgBBにアップ→LINEに画像添付（任意）
+# - 429対策: 読み取りキャッシュ + 書き込み後はキャッシュクリア、不要な rerun を抑制
 #
-# ===== 必須 Secrets（Streamlit Cloud > Settings > Secrets）=====
+# 必要な Secrets（Streamlit Cloud > Settings > Secrets）
+#
 # [admin]
-# pin = "your-admin-pin"
+# password = "あなたの管理者パス"
 #
 # [connections.gsheets]
-# spreadsheet = "https://docs.google.com/spreadsheets/d/<SPREADSHEET_ID>/edit"
-# # or: spreadsheet = "<SPREADSHEET_ID>"
+# spreadsheet = "スプレッドシートIDまたはURL"
 #
 # [connections.gsheets.credentials]
 # type = "service_account"
 # project_id = "..."
 # private_key_id = "..."
 # private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
-# client_email = "xxxxx@xxxxx.iam.gserviceaccount.com"
+# client_email = "xxxx@xxxx.iam.gserviceaccount.com"
 # client_id = "..."
 # token_uri = "https://oauth2.googleapis.com/token"
 #
 # [line]
-# channel_access_token = "..."
+# channel_access_token = "LINE Channel Access Token"
 #
-# [imgbb]
-# api_key = "..."   # 画像を送る場合のみ
-#
-# ===============================================================
+# [imgbb]  # 任意（画像を使うなら）
+# api_key = "ImgBB API KEY"
+
 
 from __future__ import annotations
 
 import json
 import re
-import time
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
-import streamlit as st
 import requests
+import streamlit as st
 
 import gspread
 from google.oauth2.service_account import Credentials
 
 
-# -----------------------------
-# Timezone
-# -----------------------------
+# =========================
+# Timezone / Format
+# =========================
 JST = timezone(timedelta(hours=9), "JST")
 
 
@@ -60,72 +59,75 @@ def now_jst() -> datetime:
     return datetime.now(JST)
 
 
-# -----------------------------
-# Small utils
-# -----------------------------
-def s(x: Any) -> str:
+def fmt_dt_jst(dt: datetime) -> str:
+    return dt.astimezone(JST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def money(x: float) -> str:
+    # 通貨表記は $ 固定
+    try:
+        return f"${float(x):,.2f}"
+    except Exception:
+        return "$0.00"
+
+
+# =========================
+# Parsing helpers
+# =========================
+def safe_str(x: Any) -> str:
     return "" if x is None else str(x)
 
 
 def to_f(x: Any) -> float:
     try:
-        v = str(x).replace(",", "").replace("$", "").replace("%", "").strip()
-        return float(v) if v else 0.0
+        s = str(x).replace(",", "").replace("$", "").replace("%", "").strip()
+        return float(s) if s else 0.0
     except Exception:
         return 0.0
 
 
-def clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+def split_csv(val: Any, n: int) -> List[str]:
+    s = safe_str(val).strip()
+    if not s:
+        return ["0"] * n
+    items = [x.strip() for x in s.split(",") if x.strip() != ""]
+    while len(items) < n:
+        items.append(items[-1] if items else "0")
+    return items[:n]
+
+
+def split_names(val: Any, n: int) -> List[str]:
+    s = safe_str(val).strip()
+    if not s:
+        return [f"No.{i+1}" for i in range(n)]
+    items = [x.strip() for x in re.split(r"[,\n]+", s) if x.strip()]
+    while len(items) < n:
+        items.append(f"No.{len(items)+1}")
+    return items[:n]
+
+
+def truthy(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    s = safe_str(v).strip().lower()
+    return s in ("1", "true", "yes", "y", "はい", "on")
+
+
+def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    cols = []
-    seen = {}
-    for c in df.columns.astype(str).tolist():
-        c = c.replace("\u3000", " ").strip()
-        if c == "":
-            c = "Unnamed"
-        # duplicate header -> make unique
-        if c in seen:
-            seen[c] += 1
-            c2 = f"{c}.{seen[c]}"
-        else:
-            seen[c] = 0
-            c2 = c
-        cols.append(c2)
-    df.columns = cols
+    df.columns = (
+        df.columns.astype(str)
+        .str.replace("\u3000", " ", regex=False)  # 全角スペース→半角
+        .str.strip()
+    )
     return df
 
 
-def extract_sheet_id(v: str) -> str:
-    v = v.strip()
-    if "/spreadsheets/d/" in v:
-        try:
-            return v.split("/spreadsheets/d/")[1].split("/")[0]
-        except Exception:
-            return v
-    return v
-
-
-def only_line_user_ids(values: List[Any]) -> List[str]:
-    out: List[str] = []
-    for v in values:
-        t = s(v).strip()
-        if t.startswith("U") and len(t) >= 10:
-            out.append(t)
-    # unique keep order
-    seen = set()
-    uniq = []
-    for x in out:
-        if x not in seen:
-            seen.add(x)
-            uniq.append(x)
-    return uniq
-
-
-# -----------------------------
+# =========================
 # LINE / ImgBB
-# -----------------------------
-def send_line_message(token: str, user_id: str, text: str, image_url: Optional[str] = None) -> int:
-    if not user_id:
+# =========================
+def send_line(token: str, user_id: str, text: str, image_url: Optional[str] = None) -> int:
+    if not user_id or str(user_id).strip() == "":
         return 400
 
     url = "https://api.line.me/v2/bot/message/push"
@@ -133,21 +135,30 @@ def send_line_message(token: str, user_id: str, text: str, image_url: Optional[s
 
     messages: List[Dict[str, Any]] = [{"type": "text", "text": text}]
     if image_url:
-        messages.append({"type": "image", "originalContentUrl": image_url, "previewImageUrl": image_url})
+        messages.append(
+            {
+                "type": "image",
+                "originalContentUrl": image_url,
+                "previewImageUrl": image_url,
+            }
+        )
 
-    payload = {"to": user_id, "messages": messages}
+    payload = {"to": str(user_id), "messages": messages}
     try:
         r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=20)
-        return r.status_code
+        return int(r.status_code)
     except Exception:
         return 500
 
 
-def upload_imgbb(api_key: str, file_bytes: bytes) -> Optional[str]:
+def upload_imgbb(file_bytes: bytes) -> Optional[str]:
+    key = st.secrets.get("imgbb", {}).get("api_key", "")
+    if not key:
+        return None
     try:
         res = requests.post(
             "https://api.imgbb.com/1/upload",
-            params={"key": api_key},
+            params={"key": key},
             files={"image": file_bytes},
             timeout=30,
         )
@@ -157,17 +168,17 @@ def upload_imgbb(api_key: str, file_bytes: bytes) -> Optional[str]:
         return None
 
 
-# -----------------------------
-# Admin auth (PIN)
-# -----------------------------
+# =========================
+# Admin Auth (password)
+# =========================
 def is_admin() -> bool:
     return bool(st.session_state.get("admin_ok", False))
 
 
-def admin_login_block() -> None:
-    pin_required = s(st.secrets.get("admin", {}).get("pin", "")).strip()
-    if not pin_required:
-        st.warning("Secrets の [admin].pin が未設定です（管理者保護できません）。")
+def admin_gate_ui() -> None:
+    pw_required = safe_str(st.secrets.get("admin", {}).get("password", ""))
+    if not pw_required:
+        st.warning("Secrets に admin.password が未設定です（管理機能を保護できません）。")
         st.session_state["admin_ok"] = False
         return
 
@@ -179,832 +190,748 @@ def admin_login_block() -> None:
             if st.button("ログアウト", use_container_width=True):
                 st.session_state["admin_ok"] = False
                 st.toast("ログアウトしました")
-        st.divider()
         return
 
     with st.form("admin_login_form", clear_on_submit=False):
-        pin = st.text_input("管理者PIN", type="password")
+        pw = st.text_input("管理者パスワード", type="password")
         ok = st.form_submit_button("ログイン")
         if ok:
-            if pin == pin_required:
+            if pw == pw_required:
                 st.session_state["admin_ok"] = True
                 st.success("管理者ログインに成功しました。")
             else:
                 st.session_state["admin_ok"] = False
-                st.error("PINが違います。")
+                st.error("パスワードが違います。")
 
 
-# -----------------------------
-# GSheets config / client
-# -----------------------------
+# =========================
+# Google Sheets Client
+# =========================
 @dataclass
-class AppSheets:
-    settings: str = "Settings"
-    members: str = "Members"
-    ledger: str = "Ledger"
-    lineid: str = "LineID"  # fallback
+class GSheetsConfig:
+    spreadsheet_id: str
+    settings_sheet: str = "Settings"
+    members_sheet: str = "Members"
+    ledger_sheet: str = "Ledger"
 
 
 DEFAULT_SETTINGS_HEADERS = [
-    "Project_Name",     # プロジェクト名
-    "NetFactor",        # 0.67 or 0.60 など
-    "SplitMode",        # equal / proportional（デフォルト equal）
-    "Currency",         # 例: USD (表示は $ 固定)
-    "Active",           # TRUE/FALSE（プロジェクトのON/OFF）
+    "Project_Name",
+    "Num_People",
+    "TotalPrincipal",
+    "IndividualPrincipals",
+    "ProfitRates",
+    "IsCompound",
+    "MemberNames",
 ]
+# ※ LineIDは Settings に入れてもOKですが、本システムでは Members を送信先の基準にします。
+
 
 DEFAULT_MEMBERS_HEADERS = [
-    "Project_Name",
     "PersonName",
     "Line_User_ID",
     "LINE_DisplayName",
-    "Active",           # TRUE/FALSE
+    "IsActive",
     "CreatedAt_JST",
+    "UpdatedAt_JST",
 ]
 
 DEFAULT_LEDGER_HEADERS = [
     "Datetime_JST",
     "Project_Name",
     "PersonName",
-    "Type",             # Deposit / Withdraw / APR
-    "Amount",           # 正の数（Withdraw も正で保存）
-    "Signed_Amount",    # Deposit:+ / Withdraw:- / APR:+
-    "Balance_After",
+    "Type",            # Deposit / Withdraw / APR
+    "Amount",          # 当該イベント金額
+    "Balance_After",   # 反映後の元本（個人）
+    "APR_Percent",     # APRの時だけ入る
+    "Net_Factor",      # 0.67 固定など
     "Note",
-    "Evidence_Image_URL",
+    "Line_User_ID",
+    "LINE_DisplayName",
+    "Image_URL",
 ]
 
 
-@st.cache_resource(show_spinner=False)
-def gs_client_from_secrets() -> gspread.Client:
+def _extract_sheet_id_or_url(s: str) -> str:
+    s = s.strip()
+    if "/spreadsheets/d/" in s:
+        try:
+            return s.split("/spreadsheets/d/")[1].split("/")[0]
+        except Exception:
+            return s
+    return s
+
+
+def load_cfg() -> Optional[GSheetsConfig]:
     con = st.secrets.get("connections", {}).get("gsheets", {})
-    creds_info = con.get("credentials", None)
-    if not creds_info:
-        raise RuntimeError("Secrets に [connections.gsheets.credentials] がありません。")
-
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_info(dict(creds_info), scopes=scopes)
-    return gspread.authorize(creds)
-
-
-def open_spreadsheet() -> gspread.Spreadsheet:
-    con = st.secrets.get("connections", {}).get("gsheets", {})
-    sid = s(con.get("spreadsheet", "")).strip()
+    sid = safe_str(con.get("spreadsheet", "")).strip()
     if not sid:
-        raise RuntimeError("Secrets の [connections.gsheets].spreadsheet が未設定です。")
-    sid = extract_sheet_id(sid)
-    gc = gs_client_from_secrets()
-    return gc.open_by_key(sid)
+        return None
+    sid = _extract_sheet_id_or_url(sid)
+    return GSheetsConfig(spreadsheet_id=sid)
 
 
-def ensure_sheet(sp: gspread.Spreadsheet, title: str, headers: List[str]) -> None:
-    try:
-        ws = sp.worksheet(title)
-        vals = ws.get_all_values()
-        if not vals:
-            ws.append_row(headers, value_input_option="USER_ENTERED")
+class GSheets:
+    def __init__(self, cfg: GSheetsConfig):
+        self.cfg = cfg
+
+        con = st.secrets.get("connections", {}).get("gsheets", {})
+        creds_info = con.get("credentials", None)
+        if not creds_info:
+            st.error('Secrets に [connections.gsheets.credentials] がありません。')
+            st.stop()
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_info(dict(creds_info), scopes=scopes)
+        self.gc = gspread.authorize(creds)
+        self.book = self.gc.open_by_key(self.cfg.spreadsheet_id)
+
+        # 起動時に最低限のシートだけ保証（429対策のため、読み取りは必要最小限）
+        self._ensure_sheet(self.cfg.settings_sheet, DEFAULT_SETTINGS_HEADERS)
+        self._ensure_sheet(self.cfg.members_sheet, DEFAULT_MEMBERS_HEADERS)
+        self._ensure_sheet(self.cfg.ledger_sheet, DEFAULT_LEDGER_HEADERS)
+
+    def _ensure_sheet(self, name: str, headers: List[str]) -> None:
+        try:
+            ws = self.book.worksheet(name)
+        except Exception:
+            ws = self.book.add_worksheet(title=name, rows=2000, cols=max(20, len(headers) + 5))
+
+        # 1行目を確認して、空ならヘッダー作成（get_all_valuesを避けて1行目だけ取得）
+        row1 = ws.row_values(1)
+        if not row1:
+            ws.update("1:1", [headers], value_input_option="USER_ENTERED")
             return
 
-        # ヘッダー重複や不足がある場合は“初回行だけ”矯正
-        current = vals[0]
-        current = [c.strip() for c in current]
-        # duplicate fix
-        seen = {}
-        fixed = []
-        changed = False
-        for c in current:
-            if c in seen:
-                seen[c] += 1
-                fixed.append(f"{c}.{seen[c]}")
-                changed = True
-            else:
-                seen[c] = 0
-                fixed.append(c)
+        # ヘッダー不足があれば追加
+        existing = [c.strip() for c in row1 if str(c).strip() != ""]
+        if not existing:
+            ws.update("1:1", [headers], value_input_option="USER_ENTERED")
+            return
 
-        # add missing required columns (append to end)
-        for h in headers:
-            if h not in fixed:
-                fixed.append(h)
-                changed = True
+        missing = [h for h in headers if h not in existing]
+        if missing:
+            new_headers = existing + missing
+            ws.update("1:1", [new_headers], value_input_option="USER_ENTERED")
 
-        if changed:
-            ws.update("1:1", [fixed])
+    def ws(self, name: str):
+        return self.book.worksheet(name)
 
-    except gspread.WorksheetNotFound:
-        ws = sp.add_worksheet(title=title, rows=2000, cols=max(10, len(headers) + 5))
-        ws.append_row(headers, value_input_option="USER_ENTERED")
+    # 429対策：読取はキャッシュ（ttl長め）
+    @st.cache_data(ttl=180)
+    def read_df(_self, sheet_name: str) -> pd.DataFrame:
+        ws = _self.ws(sheet_name)
+        values = ws.get_all_values()
+        if not values:
+            return pd.DataFrame()
+        header = values[0]
+        rows = values[1:]
+        df = pd.DataFrame(rows, columns=header)
+        df = normalize_cols(df).fillna("")
+        return df
 
-
-def _gs_read_all_values(ws: gspread.Worksheet) -> List[List[str]]:
-    # 429対策（軽いバックオフ）
-    for i in range(3):
+    def clear_cache(self) -> None:
         try:
-            return ws.get_all_values()
-        except gspread.exceptions.APIError as e:
-            msg = s(e)
-            if "429" in msg or "Quota exceeded" in msg:
-                time.sleep(1.5 * (i + 1))
-                continue
-            raise
-    # last try
-    return ws.get_all_values()
+            st.cache_data.clear()
+        except Exception:
+            pass
+
+    def append_row(self, sheet_name: str, row: List[Any]) -> None:
+        ws = self.ws(sheet_name)
+        ws.append_row([safe_str(x) for x in row], value_input_option="USER_ENTERED")
+
+    # ===== Members: 仕様変更 =====
+    # Line_User_IDが既に存在する場合は「更新しない（スキップ）」
+    def add_member_skip_if_exists(self, person_name: str, line_user_id: str, line_display_name: str) -> str:
+        ws = self.ws(self.cfg.members_sheet)
+
+        values = ws.get_all_values()
+        if not values:
+            ws.append_row(DEFAULT_MEMBERS_HEADERS, value_input_option="USER_ENTERED")
+            values = [DEFAULT_MEMBERS_HEADERS]
+
+        headers = values[0]
+        col = {h: i for i, h in enumerate(headers)}
+
+        # 必須列を保証
+        required = DEFAULT_MEMBERS_HEADERS
+        missing = [h for h in required if h not in col]
+        if missing:
+            ws.update("1:1", [headers + missing], value_input_option="USER_ENTERED")
+            headers = headers + missing
+            col = {h: i for i, h in enumerate(headers)}
+
+        # 既存チェック（Line_User_ID一致ならスキップ）
+        for r_i in range(2, len(values) + 1):
+            row = values[r_i - 1]
+            uid = row[col["Line_User_ID"]] if col["Line_User_ID"] < len(row) else ""
+            if uid == line_user_id:
+                return "skipped"
+
+        ts = fmt_dt_jst(now_jst())
+        out = [""] * len(headers)
+        out[col["PersonName"]] = person_name
+        out[col["Line_User_ID"]] = line_user_id
+        out[col["LINE_DisplayName"]] = line_display_name
+        out[col["IsActive"]] = "TRUE"
+        out[col["CreatedAt_JST"]] = ts
+        out[col["UpdatedAt_JST"]] = ts
+        ws.append_row(out, value_input_option="USER_ENTERED")
+        return "inserted"
+
+    def get_member_by_person(self, person_name: str) -> Optional[Dict[str, str]]:
+        df = self.read_df(self.cfg.members_sheet)
+        if df.empty:
+            return None
+        if "PersonName" not in df.columns:
+            return None
+        m = df[df["PersonName"].astype(str) == str(person_name)]
+        if m.empty:
+            return None
+        r = m.iloc[0].to_dict()
+        return {k: safe_str(v) for k, v in r.items()}
+
+    def active_line_ids(self) -> List[str]:
+        df = self.read_df(self.cfg.members_sheet)
+        if df.empty:
+            return []
+        for c in DEFAULT_MEMBERS_HEADERS:
+            if c not in df.columns:
+                return []
+        df = df.fillna("")
+        def to_bool(x):
+            s = str(x).strip().upper()
+            return s in ["TRUE", "1", "YES", "Y", "はい", "ON"]
+        active = df[df["IsActive"].apply(to_bool)]
+        ids = []
+        for uid in active["Line_User_ID"].tolist():
+            s = str(uid).strip()
+            if s.startswith("U"):
+                ids.append(s)
+        # uniq preserve order
+        seen, out = set(), []
+        for x in ids:
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+
+    # ===== Settings =====
+    def read_settings(self) -> pd.DataFrame:
+        df = self.read_df(self.cfg.settings_sheet)
+        return df
+
+    def update_project_principals(
+        self,
+        project_name: str,
+        num_people: int,
+        principals: List[float],
+    ) -> None:
+        """
+        Settings の TotalPrincipal / IndividualPrincipals を更新（入金/出金/APRで自動更新用）
+        """
+        ws = self.ws(self.cfg.settings_sheet)
+        values = ws.get_all_values()
+        if not values:
+            ws.append_row(DEFAULT_SETTINGS_HEADERS, value_input_option="USER_ENTERED")
+            values = [DEFAULT_SETTINGS_HEADERS]
+
+        headers = normalize_cols(pd.DataFrame(columns=values[0])).columns.tolist()
+        col = {h: i for i, h in enumerate(headers)}
+
+        need = ["Project_Name", "Num_People", "TotalPrincipal", "IndividualPrincipals"]
+        missing = [h for h in need if h not in col]
+        if missing:
+            ws.update("1:1", [headers + missing], value_input_option="USER_ENTERED")
+            headers = headers + missing
+            col = {h: i for i, h in enumerate(headers)}
+
+        # 行探索（Project_Name一致）
+        target_row = None
+        for r in range(2, len(values) + 1):
+            row = values[r - 1]
+            pn = row[col["Project_Name"]] if col["Project_Name"] < len(row) else ""
+            if str(pn) == str(project_name):
+                target_row = r
+                break
+        if target_row is None:
+            # 新規行追加
+            out = [""] * len(headers)
+            out[col["Project_Name"]] = str(project_name)
+            out[col["Num_People"]] = str(num_people)
+            out[col["TotalPrincipal"]] = str(sum(principals))
+            out[col["IndividualPrincipals"]] = ",".join([str(round(x, 6)) for x in principals])
+            ws.append_row(out, value_input_option="USER_ENTERED")
+            return
+
+        # まとめ更新（最小API）
+        updates = []
+        updates.append((target_row, col["Num_People"] + 1, str(num_people)))
+        updates.append((target_row, col["TotalPrincipal"] + 1, str(sum(principals))))
+        updates.append((target_row, col["IndividualPrincipals"] + 1, ",".join([str(round(x, 6)) for x in principals])))
+
+        for r, c, v in updates:
+            ws.update_cell(r, c, v)
 
 
-@st.cache_data(ttl=20, show_spinner=False)
-def read_sheet_df_cached(spreadsheet_id: str, sheet_name: str) -> pd.DataFrame:
-    gc = gs_client_from_secrets()
-    sp = gc.open_by_key(spreadsheet_id)
-    ws = sp.worksheet(sheet_name)
-    values = _gs_read_all_values(ws)
-    if not values:
-        return pd.DataFrame()
-    header = values[0]
-    rows = values[1:]
-    df = pd.DataFrame(rows, columns=header)
-    df = clean_columns(df)
-    return df
+# =========================
+# UI helpers
+# =========================
+def require_line_token() -> str:
+    token = safe_str(st.secrets.get("line", {}).get("channel_access_token", "")).strip()
+    if not token:
+        st.error("Secrets に [line].channel_access_token がありません。")
+        st.stop()
+    return token
 
 
-def cache_bust():
-    # 書き込み後にキャッシュをクリアして最新を反映
-    st.cache_data.clear()
+def ui_members_admin(gs: GSheets) -> None:
+    st.subheader("👤 メンバー管理（管理者のみ）")
 
+    admin_gate_ui()
+    if not is_admin():
+        st.info("管理者ログインすると操作できます。")
+        st.stop()
 
-# -----------------------------
-# Domain logic: balances / APR
-# -----------------------------
-def members_for_project(df_members: pd.DataFrame, project: str, active_only: bool = True) -> pd.DataFrame:
-    if df_members.empty:
-        return df_members
-
-    df = df_members.copy()
-    for col in ["Project_Name", "PersonName", "Line_User_ID", "Active"]:
-        if col not in df.columns:
-            # absent column -> add
-            df[col] = ""
-
-    df = df[df["Project_Name"].astype(str) == str(project)]
-    if active_only:
-        df = df[df["Active"].astype(str).str.strip().str.upper().isin(["TRUE", "YES", "1", "はい", "ON"])]
-    df = df.fillna("")
-    return df
-
-
-def compute_person_balance_from_ledger(df_ledger: pd.DataFrame, project: str, person: str) -> float:
-    if df_ledger.empty:
-        return 0.0
-
-    df = df_ledger.copy().fillna("")
-    required = ["Project_Name", "PersonName", "Signed_Amount"]
-    for c in required:
-        if c not in df.columns:
-            return 0.0
-
-    df = df[(df["Project_Name"].astype(str) == str(project)) & (df["PersonName"].astype(str) == str(person))]
+    # 一覧 + IsActiveトグル
+    df = gs.read_df(gs.cfg.members_sheet).fillna("")
     if df.empty:
-        return 0.0
-    return float(df["Signed_Amount"].apply(to_f).sum())
+        st.info("Members シートが空です。")
+        df = pd.DataFrame(columns=DEFAULT_MEMBERS_HEADERS)
+
+    # IsActive列がなければ追加
+    if "IsActive" not in df.columns:
+        df["IsActive"] = "TRUE"
+
+    def to_bool(x):
+        s = str(x).strip().upper()
+        return s in ["TRUE", "1", "YES", "Y", "はい", "ON"]
+
+    view = df.copy()
+    view["IsActive"] = view["IsActive"].apply(to_bool)
+
+    st.caption("Is Active を切り替えたら「保存」を押してください。")
+    edited = st.data_editor(
+        view,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        column_config={"IsActive": st.column_config.CheckboxColumn("Is Active")},
+        disabled=[c for c in view.columns if c != "IsActive"],
+        key="members_isactive_editor",
+    )
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        if st.button("Is Active を保存", type="primary"):
+            out = df.copy()
+            out["IsActive"] = edited["IsActive"].apply(lambda b: "TRUE" if bool(b) else "FALSE")
+            ws = gs.ws(gs.cfg.members_sheet)
+            ws.clear()
+            ws.update([out.columns.tolist()] + out.astype(str).values.tolist(), value_input_option="USER_ENTERED")
+            gs.clear_cache()
+            st.success("保存しました。")
+
+    with c2:
+        if st.button("再読込"):
+            gs.clear_cache()
+            st.toast("再読込しました（キャッシュクリア）")
+
+    st.divider()
+
+    # 追加（仕様：Line_User_ID一致なら更新しない）
+    st.write("### 新規メンバー追加（Line_User_IDが既に存在する場合は追加せずスキップ）")
+    with st.form("add_member_form", clear_on_submit=True):
+        person = st.text_input("PersonName（個人名）")
+        line_uid = st.text_input("Line_User_ID（Uから始まる）")
+        disp = st.text_input("LINE_DisplayName（任意）")
+        ok = st.form_submit_button("追加")
+
+    if ok:
+        if not person.strip() or not line_uid.strip():
+            st.error("PersonName と Line_User_ID は必須です。")
+        else:
+            res = gs.add_member_skip_if_exists(person.strip(), line_uid.strip(), disp.strip())
+            gs.clear_cache()
+            if res == "inserted":
+                st.success("新規メンバーとして追加しました。")
+            else:
+                st.info("同じ Line_User_ID が既に存在するため、更新せずスキップしました。")
 
 
-def compute_project_total_balance(df_ledger: pd.DataFrame, project: str, active_people: List[str]) -> float:
-    total = 0.0
-    for p in active_people:
-        total += compute_person_balance_from_ledger(df_ledger, project, p)
-    return total
+def ui_settings_readonly(gs: GSheets) -> None:
+    st.subheader("⚙️ Settings（確認用 / 管理者のみ）")
+    admin_gate_ui()
+    if not is_admin():
+        st.info("管理者ログインすると表示できます。")
+        st.stop()
+    df = gs.read_settings()
+    if df.empty:
+        st.info("Settings シートが空です。")
+        return
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
 
-def calc_daily_apr_distribution(
-    project_total_balance: float,
+def get_project_row(settings_df: pd.DataFrame, project: str) -> pd.Series:
+    sdf = settings_df.copy()
+    sdf = normalize_cols(sdf).fillna("")
+    if "Project_Name" not in sdf.columns:
+        raise ValueError("Settings に Project_Name 列がありません。")
+    m = sdf[sdf["Project_Name"].astype(str) == str(project)]
+    if m.empty:
+        raise ValueError(f"Settings にプロジェクト '{project}' が見つかりません。")
+    return m.iloc[0]
+
+
+def compute_today_yields(
+    principals: List[float],
+    rates: List[float],
     apr_percent: float,
-    net_factor: float,
-    people: List[str],
-    split_mode: str,
-    df_ledger: pd.DataFrame,
-    project: str,
-) -> Dict[str, float]:
-    """
-    1日分のAPR分配（USD表示のため $ 前提）。
-    - equal: プロジェクト合計から日次利益を算出 → 人数で等分
-    - proportional: 各人の残高比率で按分
-    """
-    if not people:
-        return {}
-
-    daily_profit_total = project_total_balance * (apr_percent / 100.0) * net_factor / 365.0
-    daily_profit_total = round(daily_profit_total, 4)
-
-    mode = (split_mode or "equal").strip().lower()
-    if mode not in ("equal", "proportional"):
-        mode = "equal"
-
-    if mode == "equal":
-        each = round(daily_profit_total / len(people), 4)
-        return {p: each for p in people}
-
-    # proportional
-    balances = {p: max(0.0, compute_person_balance_from_ledger(df_ledger, project, p)) for p in people}
-    denom = sum(balances.values())
-    if denom <= 0:
-        each = round(daily_profit_total / len(people), 4)
-        return {p: each for p in people}
-
-    out: Dict[str, float] = {}
-    # rounding drift is OK for reporting; ledger stores per person
-    for p in people:
-        out[p] = round(daily_profit_total * (balances[p] / denom), 4)
+    net_factor: float = 0.67,
+) -> List[float]:
+    # 365日割、rateは “比率（例: 1,1,1）” として扱い、APR×net×rateで配分
+    out = []
+    for p, r in zip(principals, rates):
+        y = (p * (apr_percent * net_factor * (r / 100.0))) / 365.0
+        out.append(round(float(y), 6))
     return out
 
 
-# -----------------------------
-# Writes: append ledger row with balance update
-# -----------------------------
-def append_ledger_row(
-    spreadsheet_id: str,
-    row: Dict[str, Any],
-    settings_sheet: str,
-    members_sheet: str,
-    ledger_sheet: str,
-) -> None:
-    """
-    429対策のため、書き込みは必要最小限で:
-    - append_row で追加
-    """
-    gc = gs_client_from_secrets()
-    sp = gc.open_by_key(spreadsheet_id)
-    ws = sp.worksheet(ledger_sheet)
+def ui_apr(gs: GSheets) -> None:
+    st.subheader("📈 APR（収益確定 → 全員へLINE送信）")
 
-    # Ensure header has required columns (one-time)
-    ensure_sheet(sp, ledger_sheet, DEFAULT_LEDGER_HEADERS)
+    # Settings読取（キャッシュされる）
+    settings_df = gs.read_settings()
+    if settings_df.empty:
+        st.error("Settings シートが空です。")
+        return
+    settings_df = normalize_cols(settings_df).fillna("")
 
-    # Get header (single call)
-    header = _gs_read_all_values(ws)[0]
-    header = [h.strip() for h in header]
-    # make sure row aligns with header order
-    out = []
-    for h in header:
-        out.append(s(row.get(h, "")))
-    ws.append_row(out, value_input_option="USER_ENTERED")
-
-
-# -----------------------------
-# Members: upsert policy
-# - IMPORTANT: 「LINE User ID が一致したら更新しない」に変更（＝スキップ）
-# -----------------------------
-def add_member_if_new_line_user_id(
-    spreadsheet_id: str,
-    project: str,
-    person_name: str,
-    line_user_id: str,
-    line_display_name: str,
-    active: bool,
-    members_sheet: str,
-) -> Tuple[bool, str]:
-    """
-    Returns (created, message)
-    Policy:
-    - 既存に同一 Line_User_ID があれば「更新しない」= 何もしない（スキップ）
-    - 既存に同一 (Project_Name + PersonName) があって Line_User_ID が空の場合は埋める…も禁止（更新しない）
-      → とにかく “一致したら更新しない” を厳格に守る
-    """
-    gc = gs_client_from_secrets()
-    sp = gc.open_by_key(spreadsheet_id)
-    ensure_sheet(sp, members_sheet, DEFAULT_MEMBERS_HEADERS)
-    ws = sp.worksheet(members_sheet)
-
-    values = _gs_read_all_values(ws)
-    if not values:
-        ws.append_row(DEFAULT_MEMBERS_HEADERS, value_input_option="USER_ENTERED")
-        values = [DEFAULT_MEMBERS_HEADERS]
-
-    header = [h.strip() for h in values[0]]
-    col = {h: i for i, h in enumerate(header)}
-    # ensure required columns exist
-    for h in DEFAULT_MEMBERS_HEADERS:
-        if h not in col:
-            header.append(h)
-    if header != values[0]:
-        ws.update("1:1", [header])
-        col = {h: i for i, h in enumerate(header)}
-        values = _gs_read_all_values(ws)
-
-    # If Line_User_ID already exists anywhere -> skip
-    for r in values[1:]:
-        uid = r[col["Line_User_ID"]] if col["Line_User_ID"] < len(r) else ""
-        if uid == line_user_id and uid:
-            return (False, "同じ LINE User ID が既に存在するため、更新せずにスキップしました。")
-
-    ts = now_jst().strftime("%Y-%m-%d %H:%M:%S")
-    out_row = [""] * len(header)
-    out_row[col["Project_Name"]] = project
-    out_row[col["PersonName"]] = person_name
-    out_row[col["Line_User_ID"]] = line_user_id
-    out_row[col["LINE_DisplayName"]] = line_display_name
-    out_row[col["Active"]] = "TRUE" if active else "FALSE"
-    out_row[col["CreatedAt_JST"]] = ts
-    ws.append_row(out_row, value_input_option="USER_ENTERED")
-    return (True, "追加しました。")
-
-
-# -----------------------------
-# UI blocks
-# -----------------------------
-def ui_debug_quota_hint(e: Exception) -> None:
-    msg = s(e)
-    if "429" in msg or "Quota exceeded" in msg:
-        st.error(
-            "読み取り回数制限(429)に当たりました。\n"
-            "このアプリはキャッシュで軽減していますが、短時間に連続操作すると発生します。\n"
-            "対策: 連打しない / タブ切替を減らす / Ledger件数を増やしすぎない（必要なら月別に分ける）"
-        )
-
-
-def ui_project_selector(df_settings: pd.DataFrame) -> Tuple[str, float, str, str, bool]:
-    """
-    Returns:
-      project_name, net_factor, split_mode, currency, project_active
-    """
-    df = df_settings.copy().fillna("")
-    if "Project_Name" not in df.columns:
+    if "Project_Name" not in settings_df.columns:
         st.error("Settings に Project_Name 列がありません。")
-        st.stop()
-
-    # Active列がなくても動く
-    if "Active" not in df.columns:
-        df["Active"] = "TRUE"
-
-    projects = df[df["Project_Name"].astype(str).str.strip() != ""]
-    if projects.empty:
-        st.error("Settings にプロジェクトがありません。")
-        st.stop()
-
-    # ONのみを基本リストに（なければ全部）
-    on_df = projects[projects["Active"].astype(str).str.strip().str.upper().isin(["TRUE", "YES", "1", "はい", "ON"])]
-    use_df = on_df if not on_df.empty else projects
-
-    project_list = use_df["Project_Name"].astype(str).tolist()
-    project = st.sidebar.selectbox("プロジェクトを選択", project_list)
-
-    row = projects[projects["Project_Name"].astype(str) == str(project)].iloc[0]
-
-    net_factor = to_f(row.get("NetFactor", 0.67))
-    if net_factor <= 0:
-        net_factor = 0.67
-
-    split_mode = s(row.get("SplitMode", "equal")).strip() or "equal"
-    currency = s(row.get("Currency", "USD")).strip() or "USD"
-    active = s(row.get("Active", "TRUE")).strip().upper() in ["TRUE", "YES", "1", "はい", "ON"]
-
-    return project, net_factor, split_mode, currency, active
-
-
-def ui_apr(
-    spreadsheet_id: str,
-    sheets: AppSheets,
-    df_settings: pd.DataFrame,
-    df_members: pd.DataFrame,
-    df_ledger: pd.DataFrame,
-    project: str,
-    net_factor: float,
-    split_mode: str,
-) -> None:
-    st.subheader("📈 APR（収益確定・画像付きLINE一斉送信）")
-    st.caption("※ 本日の収益報告は全員に送るため、個人名はメッセージ本文に入れません。")
-
-    members_active = members_for_project(df_members, project, active_only=True)
-    people = members_active["PersonName"].astype(str).tolist() if not members_active.empty else []
-    line_ids = members_active["Line_User_ID"].astype(str).tolist() if not members_active.empty else []
-    line_ids = [x for x in line_ids if x.strip().startswith("U")]
-
-    if not people:
-        st.warning("このプロジェクトの Active メンバーがいません（Members を確認してください）。")
         return
 
-    apr_percent = st.number_input("本日のAPR (%)", value=100.0, step=0.1)
-    st.write(f"NetFactor: **{net_factor:.2f}**（Settingsでプロジェクト別に設定） / SplitMode: **{split_mode}**")
+    project_list = settings_df["Project_Name"].dropna().astype(str).unique().tolist()
+    if not project_list:
+        st.error("Settings に Project_Name がありません。")
+        return
 
-    uploaded = st.file_uploader("エビデンス画像（任意）", type=["png", "jpg", "jpeg"])
+    project = st.selectbox("プロジェクト", project_list, key="apr_project")
+
+    p = get_project_row(settings_df, project)
+
+    # 必須列
+    required = ["Num_People", "IndividualPrincipals", "ProfitRates", "IsCompound", "MemberNames"]
+    missing = [c for c in required if c not in settings_df.columns]
+    if missing:
+        st.error(f"Settings の列が不足しています: {missing}")
+        return
+
+    num_people = int(to_f(p["Num_People"]))
+    member_names = split_names(p["MemberNames"], num_people)
+    principals = [to_f(x) for x in split_csv(p["IndividualPrincipals"], num_people)]
+
+    # ProfitRates は「%」扱いで、個別配分に使う（例: 100,100,100 なら等分）
+    # 等分したいなら ProfitRates を全員100にしておくのが確実
+    rates = [to_f(x) for x in split_csv(p["ProfitRates"], num_people)]
+    is_compound = truthy(p["IsCompound"])
+
+    st.caption(f"計算モード: {'複利（収益を元本に反映）' if is_compound else '単利（元本固定）'}")
+    net_factor = 0.67  # 要望により 67%
+
+    apr_percent = st.number_input("本日のAPR（%）", value=100.0, step=0.1, key="apr_percent")
+    uploaded = st.file_uploader("エビデンス画像（任意）", type=["png", "jpg", "jpeg"], key="apr_image")
     if uploaded:
         st.image(uploaded, caption="送信プレビュー", width=420)
 
-    # balances
-    project_total_balance = compute_project_total_balance(df_ledger, project, people)
+    today_yields = compute_today_yields(principals, rates, apr_percent, net_factor=net_factor)
 
-    # distribution
-    dist = calc_daily_apr_distribution(
-        project_total_balance=project_total_balance,
-        apr_percent=apr_percent,
-        net_factor=net_factor,
-        people=people,
-        split_mode=split_mode,
-        df_ledger=df_ledger,
-        project=project,
-    )
+    # 表示（個人名はUIではOK、LINEはNo.のみ）
+    st.write("### 本日の収益（確認）")
+    rows = []
+    for i in range(num_people):
+        rows.append(
+            {
+                "No": f"No.{i+1}",
+                "Member": member_names[i],
+                "Principal": money(principals[i]),
+                "Yield": money(today_yields[i]),
+            }
+        )
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    st.write("### 本日の分配（プレビュー）")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("プロジェクト合計残高", f"${project_total_balance:,.2f}")
-    with col2:
-        total_profit = sum(dist.values())
-        st.metric("本日の合計利益（合計）", f"${total_profit:,.4f}")
-    with col3:
-        st.metric("人数", f"{len(people)}")
+    if st.button("APRを確定して全員へLINE送信", type="primary"):
+        token = require_line_token()
 
-    preview_df = pd.DataFrame({"PersonName": list(dist.keys()), "APR_Profit": list(dist.values())})
-    st.dataframe(preview_df, use_container_width=True, hide_index=True)
-
-    if st.button("APRを確定（台帳保存）→ 全員にLINE送信", type="primary"):
-        token = s(st.secrets.get("line", {}).get("channel_access_token", "")).strip()
-        if not token:
-            st.error("Secrets の [line].channel_access_token が未設定です。")
-            return
-
-        # evidence upload (optional)
+        # 画像URL（任意）
         image_url = None
         if uploaded:
-            api_key = s(st.secrets.get("imgbb", {}).get("api_key", "")).strip()
-            if not api_key:
-                st.error("画像を送るには Secrets の [imgbb].api_key が必要です。")
-                return
-            with st.spinner("ImgBBへ画像アップロード中..."):
-                image_url = upload_imgbb(api_key, uploaded.getvalue())
+            with st.spinner("画像をアップロード中（ImgBB）..."):
+                image_url = upload_imgbb(uploaded.getvalue())
             if uploaded and not image_url:
-                st.error("ImgBBアップロードに失敗しました。画像なしで送る場合は画像を外して再実行してください。")
+                st.error("画像アップロードに失敗しました（ImgBB）。画像なしで続行する場合は画像を外してください。")
                 return
 
-        # write ledger rows (APR is per person)
-        ts = now_jst().strftime("%Y-%m-%d %H:%M:%S")
-        for person_name, profit in dist.items():
-            bal_before = compute_person_balance_from_ledger(df_ledger, project, person_name)
-            signed = float(profit)
-            bal_after = bal_before + signed
-            row = {
-                "Datetime_JST": ts,
-                "Project_Name": project,
-                "PersonName": person_name,
-                "Type": "APR",
-                "Amount": float(abs(profit)),
-                "Signed_Amount": signed,
-                "Balance_After": bal_after,
-                "Note": f"APR:{apr_percent}% NetFactor:{net_factor}",
-                "Evidence_Image_URL": image_url or "",
-            }
-            append_ledger_row(
-                spreadsheet_id=spreadsheet_id,
-                row=row,
-                settings_sheet=sheets.settings,
-                members_sheet=sheets.members,
-                ledger_sheet=sheets.ledger,
+        # 元本更新（複利のみ増える）
+        new_principals = principals[:]
+        for i in range(num_people):
+            if is_compound:
+                new_principals[i] = float(new_principals[i]) + float(today_yields[i])
+
+        # Settingsへ自動反映（TotalPrincipal/IndividualPrincipals）
+        gs.update_project_principals(project, num_people, new_principals)
+
+        # Ledgerに記録（各人行）
+        ts = fmt_dt_jst(now_jst())
+        for i in range(num_people):
+            # Members紐付け（通知先集計にも使うため、保存）
+            m = gs.get_member_by_person(member_names[i])  # 名前がPersonNameと一致している運用が理想
+            uid = safe_str(m.get("Line_User_ID")) if m else ""
+            disp = safe_str(m.get("LINE_DisplayName")) if m else ""
+            gs.append_row(
+                gs.cfg.ledger_sheet,
+                [
+                    ts,
+                    project,
+                    member_names[i],
+                    "APR",
+                    today_yields[i],
+                    new_principals[i] if is_compound else principals[i],
+                    apr_percent,
+                    net_factor,
+                    f"APR確定",
+                    uid,
+                    disp,
+                    image_url or "",
+                ],
             )
 
-        # APR report message (NO personal names)
-        now_str = now_jst().strftime("%Y/%m/%d %H:%M")
-        msg = ""
-        msg += "🏦 【資産運用収益報告】\n"
-        msg += f"プロジェクト: {project}\n"
-        msg += f"報告日時: {now_str}\n"
-        msg += f"本日のAPR: {apr_percent}%\n"
-        msg += f"NetFactor: {net_factor:.2f}\n"
-        msg += f"人数: {len(people)}\n"
-        msg += f"本日の合計利益: ${sum(dist.values()):,.4f}\n"
-        if image_url:
-            msg += "\n📎 エビデンス画像を添付します。"
+        # 全員へ送信（個人名は入れない）
+        active_ids = gs.active_line_ids()
+        if not active_ids:
+            st.warning("送信先（MembersでIsActive=TRUEかつLine_User_ID）がありません。")
+        else:
+            msg = "🏦 【APR 収益報告】\n"
+            msg += f"プロジェクト: {project}\n"
+            msg += f"報告日時: {fmt_dt_jst(now_jst())}\n"
+            msg += f"本日のAPR: {apr_percent}%\n"
+            msg += f"ネット係数: {int(net_factor*100)}%\n"
+            msg += "\n💰 本日の配分（No.別）\n"
+            for i in range(num_people):
+                msg += f"・No.{i+1}: {money(today_yields[i])}\n"
+            msg += "\n※個人名は記載していません。"
+            if image_url:
+                msg += "\n📎 エビデンス画像を添付します。"
 
-        # send to all (project active members)
-        success, fail = 0, 0
-        for uid in line_ids:
-            code = send_line_message(token, uid, msg, image_url=image_url)
-            if code == 200:
-                success += 1
-            else:
-                fail += 1
+            ok_cnt, ng_cnt = 0, 0
+            for uid in active_ids:
+                code = send_line(token, uid, msg, image_url=image_url)
+                if code == 200:
+                    ok_cnt += 1
+                else:
+                    ng_cnt += 1
 
-        cache_bust()
-        st.success(f"APR確定 & LINE送信完了：成功 {success} / 失敗 {fail}")
+            st.success(f"送信完了：成功 {ok_cnt} / 失敗 {ng_cnt}")
+
+        # 書き込み後はキャッシュクリア（429 & 表示反映）
+        gs.clear_cache()
+        st.toast("確定しました（キャッシュクリア済み）。")
 
 
-def ui_ledger(
-    spreadsheet_id: str,
-    sheets: AppSheets,
-    df_members: pd.DataFrame,
-    df_ledger: pd.DataFrame,
-    project: str,
-) -> None:
-    st.subheader("💸 入金 / 出金（本人へLINE通知）")
+def ui_cashflow(gs: GSheets) -> None:
+    st.subheader("💸 入金 / 出金（個人へLINE通知）")
 
-    members_active = members_for_project(df_members, project, active_only=True)
-    if members_active.empty:
-        st.warning("このプロジェクトに Active メンバーがいません。")
+    settings_df = gs.read_settings()
+    if settings_df.empty:
+        st.error("Settings シートが空です。")
+        return
+    settings_df = normalize_cols(settings_df).fillna("")
+    if "Project_Name" not in settings_df.columns:
+        st.error("Settings に Project_Name 列がありません。")
         return
 
-    # person list
-    person_list = members_active["PersonName"].astype(str).tolist()
-    person = st.selectbox("メンバー（PersonName）", person_list)
+    project_list = settings_df["Project_Name"].dropna().astype(str).unique().tolist()
+    project = st.selectbox("プロジェクト", project_list, key="cf_project")
 
-    # current balance
-    cur_balance = compute_person_balance_from_ledger(df_ledger, project, person)
-    st.info(f"現在残高: **${cur_balance:,.2f}**")
+    p = get_project_row(settings_df, project)
+    required = ["Num_People", "IndividualPrincipals", "MemberNames"]
+    missing = [c for c in required if c not in settings_df.columns]
+    if missing:
+        st.error(f"Settings の列が不足しています: {missing}")
+        return
 
-    typ = st.selectbox("種別", ["Deposit", "Withdraw"], index=0)
-    amt = st.number_input("金額（$）", min_value=0.0, value=0.0, step=100.0)
-    note = st.text_input("メモ（任意）", value="")
+    num_people = int(to_f(p["Num_People"]))
+    member_names = split_names(p["MemberNames"], num_people)
+    principals = [to_f(x) for x in split_csv(p["IndividualPrincipals"], num_people)]
 
-    uploaded = st.file_uploader("エビデンス画像（任意）", type=["png", "jpg", "jpeg"], key="ledger_evidence")
-    if uploaded:
-        st.image(uploaded, caption="送信プレビュー", width=420)
+    # 送信先
+    token = require_line_token()
 
-    if st.button("台帳に保存 → 本人へLINE通知", type="primary"):
+    # 入金/出金は同タブ
+    typ = st.radio("種別", ["Deposit（入金）", "Withdraw（出金）"], horizontal=True)
+    person = st.selectbox("個人（MemberNames）", member_names, key="cf_person")
+    idx = member_names.index(person)
+
+    # 現在残高
+    st.info(f"現在元本: {money(principals[idx])}")
+
+    amt = st.number_input("金額（$）", min_value=0.0, step=100.0, key="cf_amt")
+    note = st.text_input("メモ（任意）", value="", key="cf_note")
+
+    if st.button("確定（記録＋個人へLINE通知）", type="primary"):
         if amt <= 0:
-            st.error("金額が0です。")
+            st.warning("金額が0です。")
             return
 
-        token = s(st.secrets.get("line", {}).get("channel_access_token", "")).strip()
-        if not token:
-            st.error("Secrets の [line].channel_access_token が未設定です。")
-            return
+        is_withdraw = typ.startswith("Withdraw")
+        delta = -float(amt) if is_withdraw else float(amt)
 
-        # resolve member line id
-        rowm = members_active[members_active["PersonName"].astype(str) == str(person)].iloc[0]
-        uid = s(rowm.get("Line_User_ID", "")).strip()
-        disp = s(rowm.get("LINE_DisplayName", "")).strip()
-        if not uid.startswith("U"):
-            st.error("このメンバーは Line_User_ID が未設定です（Members を確認してください）。")
-            return
+        new_principals = principals[:]
+        new_principals[idx] = float(new_principals[idx]) + delta
 
-        # evidence upload (optional)
-        image_url = None
-        if uploaded:
-            api_key = s(st.secrets.get("imgbb", {}).get("api_key", "")).strip()
-            if not api_key:
-                st.error("画像を送るには Secrets の [imgbb].api_key が必要です。")
-                return
-            with st.spinner("ImgBBへ画像アップロード中..."):
-                image_url = upload_imgbb(api_key, uploaded.getvalue())
-            if uploaded and not image_url:
-                st.error("ImgBBアップロードに失敗しました。画像なしで送る場合は画像を外して再実行してください。")
-                return
+        # 負になっても記録はできるが、UI崩壊防止のため警告
+        if new_principals[idx] < 0:
+            st.warning("結果の元本がマイナスになります（運用上OKなら続行）。")
 
-        # signed amount & balance after
-        signed = float(amt) if typ == "Deposit" else -float(amt)
-        bal_after = cur_balance + signed
-        ts = now_jst().strftime("%Y-%m-%d %H:%M:%S")
+        # Settingsへ自動反映
+        gs.update_project_principals(project, num_people, new_principals)
 
-        # write ledger
-        row = {
-            "Datetime_JST": ts,
-            "Project_Name": project,
-            "PersonName": person,
-            "Type": typ,
-            "Amount": float(amt),
-            "Signed_Amount": signed,
-            "Balance_After": bal_after,
-            "Note": note,
-            "Evidence_Image_URL": image_url or "",
-        }
-        append_ledger_row(
-            spreadsheet_id=spreadsheet_id,
-            row=row,
-            settings_sheet=sheets.settings,
-            members_sheet=sheets.members,
-            ledger_sheet=sheets.ledger,
+        # MembersからLINE紐付け
+        m = gs.get_member_by_person(person)
+        line_uid = safe_str(m.get("Line_User_ID")) if m else ""
+        disp = safe_str(m.get("LINE_DisplayName")) if m else ""
+
+        # Ledgerへ記録
+        ts = fmt_dt_jst(now_jst())
+        event_type = "Withdraw" if is_withdraw else "Deposit"
+        gs.append_row(
+            gs.cfg.ledger_sheet,
+            [
+                ts,
+                project,
+                person,
+                event_type,
+                float(amt),
+                new_principals[idx],
+                "",
+                "",
+                note,
+                line_uid,
+                disp,
+                "",
+            ],
         )
 
-        # send LINE to person
-        now_str = now_jst().strftime("%Y/%m/%d %H:%M")
-        action_jp = "入金" if typ == "Deposit" else "出金"
-        msg = ""
-        msg += f"🏦 【{action_jp}通知】\n"
-        msg += f"プロジェクト: {project}\n"
-        msg += f"日時: {now_str}\n"
-        msg += f"金額: ${amt:,.2f}\n"
-        msg += f"反映後残高: ${bal_after:,.2f}\n"
-        if note:
-            msg += f"メモ: {note}\n"
-        if image_url:
-            msg += "\n📎 エビデンス画像を添付します。"
-
-        code = send_line_message(token, uid, msg, image_url=image_url)
-        cache_bust()
-        if code == 200:
-            st.success("保存 & LINE通知が完了しました。")
+        # 個人へLINE通知（Line_User_IDが無い場合は通知できない）
+        if line_uid and line_uid.startswith("U"):
+            msg = "🏦 【入出金通知】\n"
+            msg += f"プロジェクト: {project}\n"
+            msg += f"日時: {ts}\n"
+            msg += f"種別: {'出金' if is_withdraw else '入金'}\n"
+            msg += f"金額: {money(amt)}\n"
+            msg += f"反映後元本: {money(new_principals[idx])}\n"
+            if note.strip():
+                msg += f"\nメモ: {note.strip()}"
+            code = send_line(token, line_uid, msg)
+            if code == 200:
+                st.success("記録し、本人へLINE通知しました。")
+            else:
+                st.warning(f"記録しましたが、LINE送信に失敗しました（HTTP {code}）。")
         else:
-            st.warning(f"保存は完了しましたが、LINE送信が失敗しました（HTTP {code}）。")
+            st.success("記録しました（この個人はLine_User_ID未登録のためLINE通知なし）。")
 
-    st.divider()
-    st.write("### 台帳（最新200件）")
-    if df_ledger.empty:
+        gs.clear_cache()
+        st.toast("反映しました（キャッシュクリア済み）。")
+
+
+def ui_ledger_view(gs: GSheets) -> None:
+    st.subheader("📒 台帳（Ledger）閲覧")
+
+    df = gs.read_df(gs.cfg.ledger_sheet).fillna("")
+    if df.empty:
         st.info("Ledger が空です。")
         return
 
-    show = df_ledger.copy().fillna("")
-    # ensure columns exist
-    for c in DEFAULT_LEDGER_HEADERS:
-        if c not in show.columns:
-            show[c] = ""
-
-    show = show[show["Project_Name"].astype(str) == str(project)]
-    # latest 200
-    if len(show) > 200:
-        show = show.tail(200)
-
-    st.dataframe(show, use_container_width=True, hide_index=True)
-
-
-def ui_members_view(df_members: pd.DataFrame, project: str) -> None:
-    st.subheader("👤 メンバー（閲覧）")
-    if df_members.empty:
-        st.info("Members が空です。")
-        return
-    df = df_members.copy().fillna("")
-    for col in ["Project_Name", "PersonName", "Line_User_ID", "LINE_DisplayName", "Active", "CreatedAt_JST"]:
-        if col not in df.columns:
-            df[col] = ""
-    df = df[df["Project_Name"].astype(str) == str(project)]
-    st.dataframe(df, use_container_width=True, hide_index=True)
-    st.caption("※ 追加/更新は管理者タブから行います。")
-
-
-def ui_admin(
-    spreadsheet_id: str,
-    sheets: AppSheets,
-    df_settings: pd.DataFrame,
-    df_members: pd.DataFrame,
-) -> None:
-    st.subheader("⚙ 管理（管理者のみ）")
-    admin_login_block()
-    if not is_admin():
-        st.info("管理者PINを入力すると管理機能が表示されます。")
-        return
-
-    st.success("管理者機能が有効です。")
-
-    st.divider()
-    st.write("## ✅ ヘッダー（コピペ用）")
-    st.write("**Settings**")
-    st.code("\t".join(DEFAULT_SETTINGS_HEADERS))
-    st.write("**Members**")
-    st.code("\t".join(DEFAULT_MEMBERS_HEADERS))
-    st.write("**Ledger**")
-    st.code("\t".join(DEFAULT_LEDGER_HEADERS))
-    st.caption("※ 1行目に貼り付け（区切りはタブ）")
-
-    st.divider()
-    st.write("## 🧩 プロジェクト設定（注意: 編集はシートで行う運用が安定）")
-    st.dataframe(df_settings.fillna(""), use_container_width=True, hide_index=True)
-    st.caption("Settings の NetFactor（0.67/0.60）と SplitMode（equal/proportional）をプロジェクト毎に設定します。")
-
-    st.divider()
-    st.write("## 👤 メンバー追加（管理者のみ）")
-    # LS button state
-    if "members_filter" not in st.session_state:
-        st.session_state["members_filter"] = "active"
-
-    b1, b2, _ = st.columns([1, 1, 2])
-    with b1:
-        if st.button("LS Active", use_container_width=True):
-            st.session_state["members_filter"] = "active"
-    with b2:
-        if st.button("LS All", use_container_width=True):
-            st.session_state["members_filter"] = "all"
-
-    filt = st.session_state["members_filter"]
-    st.caption(f"表示: {filt}")
-
-    with st.form("admin_add_member", clear_on_submit=False):
-        # project options from Settings
-        projects = []
-        if not df_settings.empty and "Project_Name" in df_settings.columns:
-            projects = df_settings["Project_Name"].dropna().astype(str).tolist()
-        project = st.selectbox("Project_Name", options=projects if projects else [""])
-        person = st.text_input("PersonName（個人名）")
-        line_uid = st.text_input("Line_User_ID（Uから始まる）")
-        line_disp = st.text_input("LINE_DisplayName（任意）")
-        active = st.checkbox("Active", value=True)
-        ok = st.form_submit_button("追加（※同一Line_User_IDがあれば更新せずスキップ）")
-
-    if ok:
-        if not project or not person or not line_uid:
-            st.error("Project_Name / PersonName / Line_User_ID は必須です。")
-        else:
-            created, msg = add_member_if_new_line_user_id(
-                spreadsheet_id=spreadsheet_id,
-                project=project,
-                person_name=person,
-                line_user_id=line_uid.strip(),
-                line_display_name=line_disp.strip(),
-                active=active,
-                members_sheet=sheets.members,
-            )
-            cache_bust()
-            if created:
-                st.success(msg)
-            else:
-                st.warning(msg)
-
-    st.divider()
-    st.write("## 👤 メンバー一覧")
-    if df_members.empty:
-        st.info("Members が空です。")
-        return
-
-    df = df_members.copy().fillna("")
-    for col in DEFAULT_MEMBERS_HEADERS:
-        if col not in df.columns:
-            df[col] = ""
-
-    if filt == "active":
-        df = df[df["Active"].astype(str).str.strip().str.upper().isin(["TRUE", "YES", "1", "はい", "ON"])]
-
     st.dataframe(df, use_container_width=True, hide_index=True)
 
+    # 簡易フィルタ
+    st.write("### フィルタ")
+    cols = st.columns(4)
+    with cols[0]:
+        proj = st.selectbox("Project", ["(all)"] + sorted(df.get("Project_Name", pd.Series([""])).unique().tolist()))
+    with cols[1]:
+        person = st.selectbox("Person", ["(all)"] + sorted(df.get("PersonName", pd.Series([""])).unique().tolist()))
+    with cols[2]:
+        typ = st.selectbox("Type", ["(all)"] + sorted(df.get("Type", pd.Series([""])).unique().tolist()))
+    with cols[3]:
+        if st.button("再読込（キャッシュクリア）"):
+            gs.clear_cache()
+            st.toast("再読込しました。")
 
-# -----------------------------
+    f = df.copy()
+    if proj != "(all)" and "Project_Name" in f.columns:
+        f = f[f["Project_Name"] == proj]
+    if person != "(all)" and "PersonName" in f.columns:
+        f = f[f["PersonName"] == person]
+    if typ != "(all)" and "Type" in f.columns:
+        f = f[f["Type"] == typ]
+
+    st.dataframe(f, use_container_width=True, hide_index=True)
+
+
+# =========================
 # Main
-# -----------------------------
+# =========================
 def main():
     st.set_page_config(page_title="APR管理システム", layout="wide", page_icon="🏦")
-    st.title("🏦 APR管理システム")
+    st.title("🏦 APR資産運用管理システム")
 
-    # Spreadsheet open & ensure sheets
+    cfg = load_cfg()
+    if cfg is None:
+        st.error("Secrets の [connections.gsheets].spreadsheet が未設定です。")
+        st.stop()
+
+    # 429が出ている間は、起動直後のreadを増やさないため、ここでの読取はしない
     try:
-        sp = open_spreadsheet()
-        spreadsheet_id = sp.id
+        gs = GSheets(cfg)
     except Exception as e:
         st.error(f"Spreadsheet を開けません。共有設定（編集者）とIDを確認してください。: {e}")
-        ui_debug_quota_hint(e)
-        return
+        st.stop()
 
-    sheets = AppSheets()
-
-    try:
-        # Ensure base sheets exist (minimal calls)
-        ensure_sheet(sp, sheets.settings, DEFAULT_SETTINGS_HEADERS)
-        ensure_sheet(sp, sheets.members, DEFAULT_MEMBERS_HEADERS)
-        ensure_sheet(sp, sheets.ledger, DEFAULT_LEDGER_HEADERS)
-    except Exception as e:
-        st.error(f"シート初期化に失敗: {e}")
-        ui_debug_quota_hint(e)
-        return
-
-    # Read with cache
-    try:
-        df_settings = read_sheet_df_cached(spreadsheet_id, sheets.settings)
-        df_members = read_sheet_df_cached(spreadsheet_id, sheets.members)
-        df_ledger = read_sheet_df_cached(spreadsheet_id, sheets.ledger)
-    except Exception as e:
-        st.error(f"読み取りエラー: {e}")
-        ui_debug_quota_hint(e)
-        return
-
-    df_settings = clean_columns(df_settings).fillna("")
-    df_members = clean_columns(df_members).fillna("")
-    df_ledger = clean_columns(df_ledger).fillna("")
-
-    # Project select
-    project, net_factor, split_mode, currency, proj_active = ui_project_selector(df_settings)
-    st.sidebar.write(f"選択プロジェクト: **{project}**")
-    st.sidebar.write(f"NetFactor: **{net_factor:.2f}** / SplitMode: **{split_mode}**")
-    st.sidebar.write(f"通貨: **$**（表示固定）")
-
-    if not proj_active:
-        st.warning("このプロジェクトは Settings で Active=FALSE です。")
-
-    tab1, tab2, tab3, tab4 = st.tabs(["📈 APR", "💸 入出金", "👤 メンバー", "⚙ 管理"])
+    tab1, tab2, tab3, tab4 = st.tabs(
+        [
+            "📈 APR（全員へ送信）",
+            "💸 入金/出金（個人へ送信）",
+            "📒 台帳（Ledger）",
+            "⚙️ 管理（管理者のみ）",
+        ]
+    )
 
     with tab1:
-        ui_apr(
-            spreadsheet_id=spreadsheet_id,
-            sheets=sheets,
-            df_settings=df_settings,
-            df_members=df_members,
-            df_ledger=df_ledger,
-            project=project,
-            net_factor=net_factor,
-            split_mode=split_mode,
-        )
+        ui_apr(gs)
 
     with tab2:
-        ui_ledger(
-            spreadsheet_id=spreadsheet_id,
-            sheets=sheets,
-            df_members=df_members,
-            df_ledger=df_ledger,
-            project=project,
-        )
+        ui_cashflow(gs)
 
     with tab3:
-        ui_members_view(df_members=df_members, project=project)
+        ui_ledger_view(gs)
 
     with tab4:
-        ui_admin(
-            spreadsheet_id=spreadsheet_id,
-            sheets=sheets,
-            df_settings=df_settings,
-            df_members=df_members,
-        )
+        # 管理者のみ：Members操作 / Settings確認
+        admin_gate_ui()
+        if not is_admin():
+            st.info("管理者ログインすると操作できます。")
+        else:
+            st.success("管理者機能が有効です。")
+
+        st.divider()
+        if is_admin():
+            ui_members_admin(gs)
+            st.divider()
+            ui_settings_readonly(gs)
 
 
 if __name__ == "__main__":
