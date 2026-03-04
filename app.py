@@ -1,56 +1,21 @@
-# app.py
-# Streamlit APR / 入出金管理 + 管理者(⚙️)画面復旧テンプレート
-# - 管理者PINログイン（Secretsの admin.pin）
-# - メンバー（個人名 ↔ LINE User ID）管理
-# - 入金/出金/APR記録（中央台帳シート）
-# - 必要なら「個人別スプレッドシート」にも同時書き込み（任意）
-#
-# 重要:
-# 1) Secrets を必ず設定してください（下の REQUIRED SECRETS を参照）
-# 2) Google Sheets 構成は「中央台帳」方式が壊れにくいです（個人別はオプション扱いにしています）
-#
-# REQUIRED SECRETS（Streamlit Cloud > Settings > Secrets）例:
-# [admin]
-# pin = "1234"
-#
-# [gsheets]
-# service_account_json = '''{ ... service account json ... }'''
-# registry_spreadsheet_id = "中央台帳スプレッドシートID"
-# members_sheet_name = "Members"
-# ledger_sheet_name = "Ledger"
-#
-# # （任意）個人別スプレッドシートへも書く場合
-# use_personal_sheets = true
-# personal_map_sheet_name = "PersonalMap"   # 個人名→スプレッドシートID を持つシート（中央台帳内）
-#
-# ※ service account に対象スプレッドシートを共有（編集者）してください。
-
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
+import requests
 import streamlit as st
 
-# ---- Optional deps (gspread/google-auth) ----
-# Streamlit Cloud で requirements.txt に入れてください:
-# gspread
-# google-auth
-try:
-    import gspread
-    from google.oauth2.service_account import Credentials
-except Exception:
-    gspread = None
-    Credentials = None
+import gspread
+from google.oauth2.service_account import Credentials
 
 
 # =========================
-# Utilities
+# Timezone
 # =========================
-
 JST = timezone(timedelta(hours=9), "JST")
 
 
@@ -58,475 +23,386 @@ def now_jst() -> datetime:
     return datetime.now(JST)
 
 
-def to_jst_from_epoch_ms(epoch_ms: int) -> datetime:
-    """
-    LINEのWebhook timestamp(ms) などを JST に変換。
-    """
-    dt_utc = datetime.fromtimestamp(epoch_ms / 1000, tz=timezone.utc)
-    return dt_utc.astimezone(JST)
-
-
-def safe_str(x: Any) -> str:
+def s(x: Any) -> str:
     return "" if x is None else str(x)
 
 
-def require_gspread():
-    if gspread is None or Credentials is None:
-        st.error("Google Sheets 連携に必要なライブラリ(gspread/google-auth)がインストールされていません。")
-        st.stop()
-
-
-def is_truthy(v: Any) -> bool:
-    if isinstance(v, bool):
-        return v
-    if v is None:
-        return False
-    s = str(v).strip().lower()
-    return s in ("1", "true", "yes", "y", "on")
+# =========================
+# LINE
+# =========================
+def send_line_text(token: str, user_id: str, text: str) -> int:
+    if not token or not user_id:
+        return 400
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+    payload = {"to": str(user_id), "messages": [{"type": "text", "text": text}]}
+    try:
+        r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=20)
+        return r.status_code
+    except Exception:
+        return 500
 
 
 # =========================
 # Admin Auth
 # =========================
+def admin_password() -> str:
+    return s(st.secrets.get("admin", {}).get("password", "")).strip()
+
 
 def is_admin() -> bool:
     return bool(st.session_state.get("admin_ok", False))
 
 
 def admin_login_ui() -> None:
-    """
-    管理者PIN入力フォームを描画して、成功時に session_state.admin_ok を True にする。
-    st.stop() は呼ばない（呼ぶとフォームが消える原因になる）。
-    """
-    pin_required = safe_str(st.secrets.get("admin", {}).get("pin", ""))
-    if not pin_required:
-        st.warning("Secrets に admin.pin が未設定です。管理画面を保護できません。")
+    pw_required = admin_password()
+    if not pw_required:
+        st.warning("Secrets の [admin].password が未設定です。管理画面の保護ができません。")
         st.session_state["admin_ok"] = False
         return
 
-    # すでにログイン済み
     if is_admin():
-        col1, col2 = st.columns([1, 1])
-        with col1:
+        c1, c2 = st.columns([1, 1])
+        with c1:
             st.success("管理者ログイン中")
-        with col2:
+        with c2:
             if st.button("ログアウト", use_container_width=True):
                 st.session_state["admin_ok"] = False
-                st.toast("ログアウトしました")
-        st.divider()
+                st.rerun()
         return
 
     with st.form("admin_login_form", clear_on_submit=False):
-        pin = st.text_input("管理者PIN", type="password", help="Secrets の admin.pin と一致すると管理画面が開きます。")
-        ok = st.form_submit_button("管理者ログイン")
+        pw = st.text_input("管理者パスワード", type="password")
+        ok = st.form_submit_button("ログイン")
         if ok:
-            if pin == pin_required:
+            if pw == pw_required:
                 st.session_state["admin_ok"] = True
-                st.success("管理者ログインに成功しました。")
+                st.success("ログイン成功")
+                st.rerun()
             else:
                 st.session_state["admin_ok"] = False
-                st.error("PINが違います。")
+                st.error("パスワードが違います")
 
 
 # =========================
-# Google Sheets Client
+# Google Sheets (connections style secrets)
 # =========================
-
 @dataclass
-class GSheetsConfig:
-    registry_spreadsheet_id: str
-    members_sheet_name: str
-    ledger_sheet_name: str
-    use_personal_sheets: bool = False
-    personal_map_sheet_name: str = "PersonalMap"
+class GCfg:
+    spreadsheet_url: str
+    credentials: Dict[str, Any]
+    members_sheet: str = "Members"
+    ledger_sheet: str = "Ledger"
+
+
+MEMBERS_HEADERS = ["PersonName", "Line_User_ID", "LINE_DisplayName", "CreatedAt_JST", "UpdatedAt_JST"]
+LEDGER_HEADERS = [
+    "Datetime_JST",
+    "PersonName",
+    "Type",      # Deposit / Withdraw / APR / Other
+    "Amount",
+    "Currency",
+    "Note",
+    "Line_User_ID",
+    "LINE_DisplayName",
+    "Source",    # app
+]
+
+
+def load_cfg() -> GCfg:
+    con = st.secrets.get("connections", {}).get("gsheets", {})
+    spreadsheet_url = s(con.get("spreadsheet", "")).strip()
+
+    cred = con.get("credentials", None)
+    if not spreadsheet_url:
+        st.error('Secrets に [connections.gsheets].spreadsheet がありません（URLを入れてください）。')
+        st.stop()
+    if not isinstance(cred, dict):
+        st.error('Secrets に [connections.gsheets.credentials] がありません。')
+        st.stop()
+
+    # 必須フィールド確認（あなたのエラー対策）
+    need = ["token_uri", "client_email", "private_key", "project_id"]
+    missing = [k for k in need if not s(cred.get(k, "")).strip()]
+    if missing:
+        st.error(f"Service Account 情報が不足しています: {missing}")
+        st.stop()
+
+    return GCfg(
+        spreadsheet_url=spreadsheet_url,
+        credentials=cred,
+        members_sheet=s(st.secrets.get("gsheets", {}).get("members_sheet_name", "Members")) or "Members",
+        ledger_sheet=s(st.secrets.get("gsheets", {}).get("ledger_sheet_name", "Ledger")) or "Ledger",
+    )
 
 
 class GSheets:
-    def __init__(self, cfg: GSheetsConfig):
-        require_gspread()
-        self.cfg = cfg
-
-        raw = st.secrets.get("gsheets", {}).get("service_account_json", "")
-        if not raw:
-            st.error("Secrets に gsheets.service_account_json がありません。")
-            st.stop()
-
-        try:
-            sa_info = json.loads(raw) if isinstance(raw, str) else raw
-        except Exception:
-            # '''{...}''' の形でも入るので json.loads が失敗する場合はそのまま
-            sa_info = json.loads(str(raw))
-
+    def __init__(self, cfg: GCfg):
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive",
         ]
-        creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
+        creds = Credentials.from_service_account_info(cfg.credentials, scopes=scopes)
         self.gc = gspread.authorize(creds)
-
-        self.registry = self.gc.open_by_key(self.cfg.registry_spreadsheet_id)
+        self.book = self.gc.open_by_url(cfg.spreadsheet_url)
+        self.cfg = cfg
 
     def ws(self, name: str):
-        return self.registry.worksheet(name)
+        return self.book.worksheet(name)
 
-    # ---- read helpers ----
-    def read_df(self, sheet_name: str, header_row: int = 1) -> pd.DataFrame:
-        ws = self.ws(sheet_name)
+    def ensure_sheet_with_header(self, name: str, headers: List[str]) -> None:
+        try:
+            ws = self.ws(name)
+        except Exception:
+            ws = self.book.add_worksheet(title=name, rows=1000, cols=max(10, len(headers) + 5))
+        vals = ws.get_all_values()
+        if not vals:
+            ws.append_row(headers, value_input_option="USER_ENTERED")
+            return
+        # 1行目ヘッダーが違う場合は上書き（安全側）
+        if vals and [c.strip() for c in vals[0]] != headers:
+            ws.update("1:1", [headers])
+
+    def read_df(self, name: str) -> pd.DataFrame:
+        ws = self.ws(name)
         values = ws.get_all_values()
         if not values:
             return pd.DataFrame()
-        header_idx = header_row - 1
-        if len(values) <= header_idx:
-            return pd.DataFrame()
-        headers = values[header_idx]
-        rows = values[header_idx + 1 :]
-        df = pd.DataFrame(rows, columns=headers)
-        return df
-
-    def append_row(self, sheet_name: str, row: List[Any]) -> None:
-        ws = self.ws(sheet_name)
-        ws.append_row([safe_str(x) for x in row], value_input_option="USER_ENTERED")
-
-    def upsert_member(self, person_name: str, line_user_id: str, line_display_name: str) -> None:
-        """
-        Members シート:
-        - PersonName
-        - Line_User_ID
-        - LINE_DisplayName
-        - CreatedAt_JST
-        - UpdatedAt_JST
-        """
-        ws = self.ws(self.cfg.members_sheet_name)
-        values = ws.get_all_values()
-        if not values:
-            # create header if empty
-            header = ["PersonName", "Line_User_ID", "LINE_DisplayName", "CreatedAt_JST", "UpdatedAt_JST"]
-            ws.append_row(header, value_input_option="USER_ENTERED")
-            values = [header]
-
         headers = values[0]
-        col = {h: i for i, h in enumerate(headers)}
+        rows = values[1:]
+        return pd.DataFrame(rows, columns=headers)
 
-        # ensure required columns exist
-        required = ["PersonName", "Line_User_ID", "LINE_DisplayName", "CreatedAt_JST", "UpdatedAt_JST"]
-        missing = [h for h in required if h not in col]
-        if missing:
-            # extend headers
-            new_headers = headers + missing
-            ws.update("1:1", [new_headers])
-            headers = new_headers
-            col = {h: i for i, h in enumerate(headers)}
+    def append_row(self, name: str, row: List[Any]) -> None:
+        ws = self.ws(name)
+        ws.append_row([s(x) for x in row], value_input_option="USER_ENTERED")
 
-        # find existing by Line_User_ID
+    # --- Members upsert ---
+    def upsert_member(self, person: str, line_uid: str, line_disp: str) -> None:
+        self.ensure_sheet_with_header(self.cfg.members_sheet, MEMBERS_HEADERS)
+        ws = self.ws(self.cfg.members_sheet)
+        values = ws.get_all_values()
+        headers = values[0]
+        idx = {h: i for i, h in enumerate(headers)}
+
         target_row = None
-        for r_i in range(2, len(values) + 1):
-            row = values[r_i - 1]
-            uid = row[col["Line_User_ID"]] if col["Line_User_ID"] < len(row) else ""
-            if uid == line_user_id:
-                target_row = r_i
+        for r in range(2, len(values) + 1):
+            row = values[r - 1]
+            uid = row[idx["Line_User_ID"]] if idx["Line_User_ID"] < len(row) else ""
+            if uid == line_uid and uid:
+                target_row = r
                 break
 
         ts = now_jst().strftime("%Y-%m-%d %H:%M:%S")
-
         if target_row is None:
-            # append
             out = [""] * len(headers)
-            out[col["PersonName"]] = person_name
-            out[col["Line_User_ID"]] = line_user_id
-            out[col["LINE_DisplayName"]] = line_display_name
-            out[col["CreatedAt_JST"]] = ts
-            out[col["UpdatedAt_JST"]] = ts
+            out[idx["PersonName"]] = person
+            out[idx["Line_User_ID"]] = line_uid
+            out[idx["LINE_DisplayName"]] = line_disp
+            out[idx["CreatedAt_JST"]] = ts
+            out[idx["UpdatedAt_JST"]] = ts
             ws.append_row(out, value_input_option="USER_ENTERED")
         else:
-            # update row
-            def set_cell(h: str, v: str):
-                c = col[h] + 1
-                ws.update_cell(target_row, c, v)
+            ws.update_cell(target_row, idx["PersonName"] + 1, person)
+            ws.update_cell(target_row, idx["LINE_DisplayName"] + 1, line_disp)
+            ws.update_cell(target_row, idx["UpdatedAt_JST"] + 1, ts)
 
-            set_cell("PersonName", person_name)
-            set_cell("LINE_DisplayName", line_display_name)
-            set_cell("UpdatedAt_JST", ts)
-
-    def find_member_by_person(self, person_name: str) -> Optional[Dict[str, str]]:
-        df = self.read_df(self.cfg.members_sheet_name)
+    def member_by_person(self, person: str) -> Optional[Dict[str, str]]:
+        df = self.read_df(self.cfg.members_sheet).fillna("")
         if df.empty:
             return None
-        df = df.fillna("")
-        m = df[df["PersonName"] == person_name]
+        m = df[df["PersonName"] == person]
         if m.empty:
             return None
-        r = m.iloc[0].to_dict()
-        return {k: safe_str(v) for k, v in r.items()}
+        return {k: s(v) for k, v in m.iloc[0].to_dict().items()}
 
-    def find_member_by_line_user_id(self, line_user_id: str) -> Optional[Dict[str, str]]:
-        df = self.read_df(self.cfg.members_sheet_name)
-        if df.empty:
-            return None
-        df = df.fillna("")
-        m = df[df["Line_User_ID"] == line_user_id]
-        if m.empty:
-            return None
-        r = m.iloc[0].to_dict()
-        return {k: safe_str(v) for k, v in r.items()}
-
-    # ---- personal sheets mapping (optional) ----
-    def personal_sheet_id_for_person(self, person_name: str) -> Optional[str]:
-        if not self.cfg.use_personal_sheets:
-            return None
-        df = self.read_df(self.cfg.personal_map_sheet_name)
-        if df.empty:
-            return None
-        df = df.fillna("")
-        if "PersonName" not in df.columns or "SpreadsheetId" not in df.columns:
-            return None
-        m = df[df["PersonName"] == person_name]
-        if m.empty:
-            return None
-        return safe_str(m.iloc[0]["SpreadsheetId"])
-
-    def append_to_personal_ledger(self, person_name: str, row: List[Any]) -> None:
-        """
-        個人別スプレッドシートへ Ledger と同じ形式で書き込みたい場合。
-        その個人の spreadsheet_id を PersonalMap から引く。
-        """
-        sid = self.personal_sheet_id_for_person(person_name)
-        if not sid:
-            return
-        book = self.gc.open_by_key(sid)
-        ws = book.worksheet(self.cfg.ledger_sheet_name)
-        ws.append_row([safe_str(x) for x in row], value_input_option="USER_ENTERED")
+    def all_line_ids(self) -> List[str]:
+        df = self.read_df(self.cfg.members_sheet).fillna("")
+        if df.empty or "Line_User_ID" not in df.columns:
+            return []
+        ids = [s(x).strip() for x in df["Line_User_ID"].tolist() if s(x).strip().startswith("U")]
+        # uniq preserve order
+        seen, out = set(), []
+        for x in ids:
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
 
 
 # =========================
-# App Config
+# UI
 # =========================
-
-def load_gsheets_cfg() -> Optional[GSheetsConfig]:
-    g = st.secrets.get("gsheets", {})
-    rid = safe_str(g.get("registry_spreadsheet_id"))
-    members = safe_str(g.get("members_sheet_name", "Members"))
-    ledger = safe_str(g.get("ledger_sheet_name", "Ledger"))
-    if not rid:
-        return None
-    use_personal = is_truthy(g.get("use_personal_sheets", False))
-    pmap = safe_str(g.get("personal_map_sheet_name", "PersonalMap")) or "PersonalMap"
-    return GSheetsConfig(
-        registry_spreadsheet_id=rid,
-        members_sheet_name=members,
-        ledger_sheet_name=ledger,
-        use_personal_sheets=use_personal,
-        personal_map_sheet_name=pmap,
-    )
-
-
-# =========================
-# UI: Headers copy (for your sheet creation standard)
-# =========================
-
-DEFAULT_MEMBERS_HEADERS = ["PersonName", "Line_User_ID", "LINE_DisplayName", "CreatedAt_JST", "UpdatedAt_JST"]
-DEFAULT_LEDGER_HEADERS = [
-    "Datetime_JST",
-    "PersonName",
-    "Type",             # Deposit / Withdraw / APR / Other
-    "Amount",
-    "Currency",         # JPY / USDT etc
-    "Note",
-    "Line_User_ID",
-    "LINE_DisplayName",
-    "Source",           # app / line / make
-]
-
-
-def ui_show_headers():
-    st.write("### シートのヘッダー（コピペ用）")
+def ui_headers_help():
+    st.write("### シートヘッダー（コピペ用）")
     st.write("**Members**")
-    st.code("\t".join(DEFAULT_MEMBERS_HEADERS))
+    st.code("\t".join(MEMBERS_HEADERS))
     st.write("**Ledger**")
-    st.code("\t".join(DEFAULT_LEDGER_HEADERS))
-    st.caption("※ シート1行目に貼り付けてください（区切りはタブ）。")
+    st.code("\t".join(LEDGER_HEADERS))
 
 
-# =========================
-# UI: Member Management
-# =========================
+def main():
+    st.set_page_config(page_title="APRシステム", layout="wide", page_icon="🏦")
+    st.title("🏦 APRシステム（安定版）")
 
-def ui_members(gs: GSheets):
-    st.subheader("👤 メンバー管理（個人名 ↔ LINE）")
+    cfg = load_cfg()
+    gs = GSheets(cfg)
 
-    colA, colB = st.columns([1, 1])
-    with colA:
-        st.write("#### 現在のメンバー一覧")
-        df = gs.read_df(gs.cfg.members_sheet_name)
+    # ensure sheets exist
+    gs.ensure_sheet_with_header(gs.cfg.members_sheet, MEMBERS_HEADERS)
+    gs.ensure_sheet_with_header(gs.cfg.ledger_sheet, LEDGER_HEADERS)
+
+    token = s(st.secrets.get("line", {}).get("channel_access_token", "")).strip()
+
+    tab_ledger, tab_members, tab_admin = st.tabs(["💰 入出金/APR", "👤 メンバー", "⚙ 管理"])
+
+    # -------------------
+    # Ledger (Deposit/Withdraw/APR)
+    # -------------------
+    with tab_ledger:
+        st.subheader("💰 入金 / 出金 / APR 記録（JSTで保存）")
+
+        dfm = gs.read_df(gs.cfg.members_sheet).fillna("")
+        persons = sorted([s(x).strip() for x in dfm.get("PersonName", pd.Series([])).tolist() if s(x).strip()])
+
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            st.write("#### 記録する")
+            with st.form("ledger_form"):
+                dt = st.date_input("日付（JST）", value=now_jst().date())
+                tm = st.time_input("時刻（JST）", value=now_jst().time().replace(second=0, microsecond=0))
+                dt_jst = datetime(dt.year, dt.month, dt.day, tm.hour, tm.minute, 0, tzinfo=JST)
+
+                person = st.selectbox("個人名（PersonName）", options=[""] + persons)
+                typ = st.selectbox("種別", options=["Deposit", "Withdraw", "APR", "Other"])
+                amount = st.number_input("金額", min_value=0.0, value=0.0, step=1000.0)
+                currency = st.text_input("通貨", value="JPY")
+                note = st.text_input("メモ", value="")
+                submit = st.form_submit_button("台帳に追加")
+
+            if submit:
+                if not person:
+                    st.error("個人名を選んでください。")
+                else:
+                    m = gs.member_by_person(person) or {}
+                    uid = s(m.get("Line_User_ID", "")).strip()
+                    disp = s(m.get("LINE_DisplayName", "")).strip()
+
+                    row = [
+                        dt_jst.strftime("%Y-%m-%d %H:%M:%S"),
+                        person,
+                        typ,
+                        float(amount),
+                        currency,
+                        note,
+                        uid,
+                        disp,
+                        "app",
+                    ]
+                    gs.append_row(gs.cfg.ledger_sheet, row)
+
+                    # 入金・出金は個人にLINE通知
+                    if token and uid and typ in ("Deposit", "Withdraw"):
+                        sign = "+" if typ == "Deposit" else "-"
+                        msg = (
+                            f"🏦 入出金通知\n"
+                            f"日時: {dt_jst.strftime('%Y/%m/%d %H:%M')} (JST)\n"
+                            f"種別: {typ}\n"
+                            f"金額: {sign}{amount:,.0f} {currency}\n"
+                        )
+                        if note:
+                            msg += f"メモ: {note}\n"
+                        code = send_line_text(token, uid, msg)
+                        if code == 200:
+                            st.success("台帳に記録し、本人へLINE通知しました。")
+                        else:
+                            st.warning(f"台帳に記録しましたが、LINE送信に失敗しました（HTTP {code}）。")
+                    else:
+                        st.success("台帳に記録しました。")
+
+                    st.rerun()
+
+        with col2:
+            st.write("#### APR報告（全員へ一斉送信・個人名なし）")
+            st.caption("APR報告は全員に送る前提なので、メッセージに個人名は入れません。")
+            apr = st.number_input("本日のAPR（%）", value=0.0, step=0.1)
+            memo = st.text_input("メモ（任意）", value="")
+
+            if st.button("APR報告を全員に送信", use_container_width=True):
+                ids = gs.all_line_ids()
+                if not token:
+                    st.error("Secrets の [line].channel_access_token が未設定です。")
+                elif not ids:
+                    st.error("Members に Line_User_ID がありません。")
+                else:
+                    dt = now_jst().strftime("%Y/%m/%d %H:%M")
+                    msg = f"🏦 本日のAPR報告\n日時: {dt} (JST)\nAPR: {apr}%\n"
+                    if memo:
+                        msg += f"メモ: {memo}\n"
+                    ok = 0
+                    ng = 0
+                    for uid in ids:
+                        code = send_line_text(token, uid, msg)
+                        if code == 200:
+                            ok += 1
+                        else:
+                            ng += 1
+                    st.success(f"送信完了：成功 {ok} / 失敗 {ng}")
+
+        st.divider()
+        st.write("#### Ledger（最新）")
+        dfl = gs.read_df(gs.cfg.ledger_sheet).fillna("")
+        if dfl.empty:
+            st.info("Ledger は空です。")
+        else:
+            st.dataframe(dfl.tail(200), use_container_width=True, hide_index=True)
+
+    # -------------------
+    # Members
+    # -------------------
+    with tab_members:
+        st.subheader("👤 メンバー一覧（閲覧）")
+        df = gs.read_df(gs.cfg.members_sheet).fillna("")
         if df.empty:
-            st.info("Members シートが空です。")
+            st.info("Members は空です。")
         else:
             st.dataframe(df, use_container_width=True, hide_index=True)
+        st.caption("※ メンバーの追加/編集は管理タブから行ってください。")
 
-    with colB:
-        st.write("#### 手動で紐付け/更新（管理者）")
-        with st.form("member_upsert", clear_on_submit=False):
-            person = st.text_input("PersonName（個人名）", placeholder="例: 田中太郎")
-            line_uid = st.text_input("Line_User_ID", placeholder="例: Uxxxxxxxxxxxxxxxx")
-            disp = st.text_input("LINE_DisplayName", placeholder="例: taro")
+    # -------------------
+    # Admin
+    # -------------------
+    with tab_admin:
+        st.subheader("⚙ 管理（管理者のみ）")
+        admin_login_ui()
+
+        if not is_admin():
+            st.info("管理者パスワードを入力すると管理機能が表示されます。")
+            st.stop()
+
+        st.success("管理者機能が有効です。")
+        ui_headers_help()
+        st.divider()
+
+        st.write("### メンバー追加/更新（個人名 ↔ LINE ID）")
+        with st.form("member_form"):
+            person = st.text_input("PersonName（個人名）", placeholder="例: 祥子")
+            uid = st.text_input("Line_User_ID", placeholder="例: Uxxxxxxxxxxxxxxxx")
+            disp = st.text_input("LINE_DisplayName（任意）", placeholder="例: sacho")
             ok = st.form_submit_button("保存（Upsert）")
 
         if ok:
-            if not person or not line_uid:
+            if not person or not uid:
                 st.error("PersonName と Line_User_ID は必須です。")
             else:
-                gs.upsert_member(person_name=person, line_user_id=line_uid, line_display_name=disp)
+                gs.upsert_member(person, uid.strip(), disp.strip())
                 st.success("保存しました。")
                 st.rerun()
 
-
-# =========================
-# UI: Ledger (Deposit/Withdraw/APR)
-# =========================
-
-def ui_ledger(gs: GSheets):
-    st.subheader("💰 入金 / 出金 / APR 記録")
-
-    tabs = st.tabs(["記録する", "台帳を見る"])
-    with tabs[0]:
-        df_members = gs.read_df(gs.cfg.members_sheet_name).fillna("")
-        person_list = []
-        if not df_members.empty and "PersonName" in df_members.columns:
-            person_list = sorted([p for p in df_members["PersonName"].tolist() if str(p).strip()])
-
-        with st.form("ledger_form", clear_on_submit=False):
-            dt = st.date_input("日付（JST）", value=now_jst().date())
-            tm = st.time_input("時刻（JST）", value=now_jst().time().replace(second=0, microsecond=0))
-            dt_jst = datetime(dt.year, dt.month, dt.day, tm.hour, tm.minute, tm.second, tzinfo=JST)
-
-            person = st.selectbox("個人名（PersonName）", options=[""] + person_list)
-            typ = st.selectbox("種別", options=["Deposit", "Withdraw", "APR", "Other"])
-            amount = st.number_input("金額", min_value=0.0, value=0.0, step=1000.0)
-            currency = st.text_input("通貨", value="JPY")
-            note = st.text_input("メモ", value="")
-            source = st.selectbox("Source", options=["app", "line", "make", "other"])
-
-            submit = st.form_submit_button("台帳に追加")
-
-        if submit:
-            if not person:
-                st.error("個人名（PersonName）を選んでください。")
-            else:
-                m = gs.find_member_by_person(person)
-                line_uid = safe_str(m.get("Line_User_ID")) if m else ""
-                disp = safe_str(m.get("LINE_DisplayName")) if m else ""
-
-                row = [
-                    dt_jst.strftime("%Y-%m-%d %H:%M:%S"),
-                    person,
-                    typ,
-                    amount,
-                    currency,
-                    note,
-                    line_uid,
-                    disp,
-                    source,
-                ]
-
-                # Central ledger
-                gs.append_row(gs.cfg.ledger_sheet_name, row)
-
-                # Optional personal sheet write
-                if gs.cfg.use_personal_sheets:
-                    gs.append_to_personal_ledger(person_name=person, row=row)
-
-                st.success("追加しました。")
-                st.rerun()
-
-    with tabs[1]:
-        df = gs.read_df(gs.cfg.ledger_sheet_name).fillna("")
-        if df.empty:
-            st.info("Ledger シートが空です。")
-        else:
-            st.dataframe(df, use_container_width=True, hide_index=True)
-
-            st.write("#### フィルタ（簡易）")
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                p = st.selectbox("PersonName", options=["(all)"] + sorted(df["PersonName"].unique().tolist()))
-            with col2:
-                t = st.selectbox("Type", options=["(all)"] + sorted(df["Type"].unique().tolist()))
-            with col3:
-                cur = st.selectbox("Currency", options=["(all)"] + sorted(df["Currency"].unique().tolist()))
-
-            f = df.copy()
-            if p != "(all)":
-                f = f[f["PersonName"] == p]
-            if t != "(all)":
-                f = f[f["Type"] == t]
-            if cur != "(all)":
-                f = f[f["Currency"] == cur]
-
-            st.dataframe(f, use_container_width=True, hide_index=True)
-
-
-# =========================
-# UI: Admin Panel (Fix)
-# =========================
-
-def ui_admin(gs: GSheets):
-    st.subheader("⚙️ 管理（管理者のみ）")
-
-    # ここが重要：フォームを表示してから、権限が無ければ停止
-    admin_login_ui()
-
-    if not is_admin():
-        st.info("管理者PINを入力すると管理機能が表示されます。")
-        st.stop()
-
-    st.success("管理者機能が有効です。")
-    st.divider()
-
-    st.write("### シート構造の確認")
-    st.write(f"- Registry Spreadsheet ID: `{gs.cfg.registry_spreadsheet_id}`")
-    st.write(f"- Members sheet: `{gs.cfg.members_sheet_name}`")
-    st.write(f"- Ledger sheet: `{gs.cfg.ledger_sheet_name}`")
-    st.write(f"- Personal sheets: `{gs.cfg.use_personal_sheets}`")
-    if gs.cfg.use_personal_sheets:
-        st.write(f"- Personal map sheet: `{gs.cfg.personal_map_sheet_name}`")
-
-    ui_show_headers()
-
-    st.divider()
-    ui_members(gs)
-
-
-# =========================
-# Main App
-# =========================
-
-def main():
-    st.set_page_config(page_title="APRシステム", layout="wide")
-    st.title("APRシステム")
-
-    cfg = load_gsheets_cfg()
-    if cfg is None:
-        st.error("Secrets の gsheets.registry_spreadsheet_id 等が未設定です。Secrets を設定してください。")
-        st.stop()
-
-    gs = GSheets(cfg)
-
-    tab_ledger, tab_members, tab_admin_ = st.tabs(["📒 台帳", "👤 メンバー", "⚙ 管理（管理者のみ）"])
-
-    with tab_ledger:
-        ui_ledger(gs)
-
-    with tab_members:
-        # 一般表示（閲覧）＋（必要なら）管理者だけ編集したい場合はここも制御できます
-        df = gs.read_df(gs.cfg.members_sheet_name).fillna("")
-        if df.empty:
-            st.info("Members シートが空です。")
-        else:
-            st.dataframe(df, use_container_width=True, hide_index=True)
-
-        st.caption("※ メンバーの追加/更新は管理タブから行ってください。")
-
-    with tab_admin_:
-        ui_admin(gs)
+        st.divider()
+        st.write("### 設定確認")
+        st.write(f"- spreadsheet: `{cfg.spreadsheet_url}`")
+        st.write(f"- members sheet: `{gs.cfg.members_sheet}`")
+        st.write(f"- ledger sheet: `{gs.cfg.ledger_sheet}`")
 
 
 if __name__ == "__main__":
