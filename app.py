@@ -1,6 +1,6 @@
 # app.py  (保存後にAPRへ戻らない：ページ状態を保持する版)
 from __future__ import annotations
-
+ 
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any, List, Optional
