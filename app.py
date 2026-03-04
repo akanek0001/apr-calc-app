@@ -95,3 +95,29 @@ st.success("Google Sheets 接続OK")
 ws = gs.ws("Members")
 st.write("Members sheet title:", ws.title)
 st.write("Rows:", ws.row_count, "Cols:", ws.col_count)
+
+
+
+def main():
+    st.set_page_config(page_title="APRシステム", layout="wide")
+    st.title("APRシステム")
+
+    cfg = load_gsheets_cfg()
+    gs = GSheets(cfg)
+
+    tab_ledger, tab_members, tab_admin = st.tabs(
+        ["📒 台帳", "👤 メンバー", "⚙ 管理"]
+    )
+
+    with tab_ledger:
+        ui_ledger(gs)
+
+    with tab_members:
+        ui_members(gs)
+
+    with tab_admin:
+        ui_admin(gs)
+
+
+if __name__ == "__main__":
+    main()
