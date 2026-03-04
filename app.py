@@ -16,7 +16,7 @@ from gspread.exceptions import APIError
 
 JST = timezone(timedelta(hours=9), "JST")
 
-# -----------------------------
+# ----------------------------- 
 # Utils
 # -----------------------------
 def now_jst() -> datetime:
