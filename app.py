@@ -21,7 +21,7 @@ JST = timezone(timedelta(hours=9), "JST")
 
 STATUS_ON = "🟢運用中"
 STATUS_OFF = "🔴停止"
-
+RANK_LABEL = "👑Master=67% / 🥈Elite=60%"
 
 # -----------------------------
 # Utils
