@@ -639,35 +639,115 @@ def ui_cash(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) ->
 # -----------------------------
 # UI: Admin（PRO + 個別LINE送信）
 # -----------------------------
-def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> pd.DataFrame:
-    st.subheader("⚙️ 管理（管理者のみ）")
-    admin_login_ui()
+    # --- ★ 個別LINE送信（メンバー選択） ---
+    st.markdown("#### 📨 メンバーから選択して個別にLINE送信（管理者）")
 
-    if not is_admin():
-        st.info("ログインすると、メンバー追加・編集が表示されます。")
-        return members_df
+    if view_all.empty:
+        st.info("メンバーがいないため送信できません。")
+    else:
+        # 送信対象リスト（全員 or 運用中のみ）
+        target_mode = st.radio("対象", ["🟢運用中のみ", "全メンバー（停止含む）"], horizontal=True)
+        cand = view_all.copy() if target_mode.startswith("全") else view_all[view_all["IsActive"] == True].copy()
+        cand = cand.reset_index(drop=True)
 
-    projects = active_projects(settings_df)
-    if not projects:
-        st.warning("有効（Active=TRUE）のプロジェクトがありません。Settingsを確認してください。")
-        return members_df
+        def _label(r: pd.Series) -> str:
+            name = str(r.get("PersonName", "")).strip()
+            disp = str(r.get("LINE_DisplayName", "")).strip()
+            uid = str(r.get("Line_User_ID", "")).strip()
+            stt = bool_to_status(r.get("IsActive", True))
+            if disp:
+                return f"{stt} {name} / {disp}"
+            return f"{stt} {name} / {uid}"
 
-    project = st.selectbox("対象プロジェクト", projects, key="admin_project")
+        options = [_label(cand.loc[i]) for i in range(len(cand))]
+        selected = st.multiselect("送信先（複数可）", options=options)
 
-    # Make.com 登録台帳
-    line_users_df = load_line_users(gs)
-    line_users = []
-    if not line_users_df.empty:
-        tmp = line_users_df.copy()
-        tmp = tmp[tmp["Line_User_ID"].astype(str).str.startswith("U")]
-        tmp = tmp.drop_duplicates(subset=["Line_User_ID"], keep="last")
-        for _, r in tmp.iterrows():
-            uid = str(r["Line_User_ID"]).strip()
-            name = str(r.get("Line_User", "")).strip()
-            label = f"{name} ({uid})" if name else uid
-            line_users.append((label, uid, name))
+        # 共通本文（※個人名は送信時に自動挿入）
+        default_msg = "【ご連絡】\n"
+        default_msg += f"プロジェクト: {project}\n"
+        default_msg += f"日時: {now_jst().strftime('%Y/%m/%d %H:%M')}\n\n"
 
-    st.divider()
+        msg_common = st.text_area(
+            "メッセージ本文（共通）※送信時に「〇〇様」を自動挿入します",
+            value=st.session_state.get("direct_line_msg", default_msg),
+            height=180
+        )
+        st.session_state["direct_line_msg"] = msg_common
+
+        img = st.file_uploader("添付画像（任意・ImgBB）", type=["png", "jpg", "jpeg"], key="direct_line_img")
+
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            do_send = st.button("選択メンバーへ送信", use_container_width=True)
+        with c2:
+            clear_msg = st.button("本文を初期化", use_container_width=True)
+
+        if clear_msg:
+            st.session_state["direct_line_msg"] = default_msg
+            st.rerun()
+
+        if do_send:
+            if not selected:
+                st.warning("送信先を選択してください。")
+            elif not msg_common.strip():
+                st.warning("メッセージが空です。")
+            else:
+                evidence_url = None
+                if img:
+                    with st.spinner("画像アップロード中..."):
+                        evidence_url = upload_imgbb(img.getvalue())
+                    if not evidence_url:
+                        st.error("画像アップロードに失敗しました（ImgBB）。画像を外して再実行してください。")
+                        return members_df
+
+                token = st.secrets["line"]["channel_access_token"]
+
+                # label -> row
+                label_to_row = {_label(cand.loc[i]): cand.loc[i] for i in range(len(cand))}
+
+                success, fail = 0, 0
+                failed_list = []
+
+                for lab in selected:
+                    r = label_to_row.get(lab)
+                    if r is None:
+                        fail += 1
+                        failed_list.append(lab)
+                        continue
+
+                    uid = str(r.get("Line_User_ID", "")).strip()
+                    person_name = str(r.get("PersonName", "")).strip()
+
+                    if not is_line_uid(uid):
+                        fail += 1
+                        failed_list.append(f"{lab}（Line_User_ID不正）")
+                        continue
+
+                    # ★ 個人名を本文へ自動挿入（「【ご連絡】」の次の行に 〇〇様 を入れる）
+                    # 既に入っている場合は二重挿入しない
+                    lines = msg_common.splitlines()
+                    name_line = f"{person_name} 様"
+                    if name_line not in lines:
+                        if lines and lines[0].strip() == "【ご連絡】":
+                            personalized = "\n".join([lines[0], name_line] + lines[1:])
+                        else:
+                            personalized = "\n".join([name_line] + lines)
+                    else:
+                        personalized = msg_common
+
+                    code = send_line_push(token, uid, personalized, evidence_url)
+                    if code == 200:
+                        success += 1
+                    else:
+                        fail += 1
+                        failed_list.append(f"{lab}（HTTP {code}）")
+
+                if fail == 0:
+                    st.success(f"送信完了（成功:{success} / 失敗:{fail}）")
+                else:
+                    st.warning(f"送信結果（成功:{success} / 失敗:{fail}）")
+                    with st.expander("失敗詳細", expanded=False):
+                        st.write("\n".join(failed_list))
 
     # --- 一覧（検索 + 表示） ---
     view_all = project_members_all(members_df, project)
