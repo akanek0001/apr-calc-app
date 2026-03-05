@@ -1,12 +1,7 @@
-管理画面付き完璧コード
-
-
-
-
-
 # app.py  (PRO版: ページ状態保持 + ヘルプ内蔵 + Master/Elite(67/60) + LINE登録台帳(LineUsers)連携
 #         + サイドバー行間 + 管理画面プロ機能（検索/編集/停止切替）
-#         + メンバー選択で個別LINE送信（送信時に個人名「〇〇 様」を自動挿入 / 任意で画像添付）)
+#         + メンバー選択で個別LINE送信（送信時に個人名「〇〇 様」を自動挿入 / 任意で画像添付）
+#         + ★変更：アプリ全体を「管理者ログイン必須」に（ログイン無しでは中に入れない）
 
 from __future__ import annotations
 
@@ -28,6 +23,7 @@ JST = timezone(timedelta(hours=9), "JST")
 STATUS_ON = "🟢運用中"
 STATUS_OFF = "🔴停止"
 RANK_LABEL = "👑Master=67% / 🥈Elite=60%"
+
 
 # -----------------------------
 # Utils
@@ -139,7 +135,6 @@ def insert_person_name(msg_common: str, person_name: str) -> str:
     lines = msg_common.splitlines()
     if name_line in lines:
         return msg_common
-
     if lines and lines[0].strip() == "【ご連絡】":
         return "\n".join([lines[0], name_line] + lines[1:])
     return "\n".join([name_line] + lines)
@@ -306,7 +301,7 @@ class GSheets:
 
 
 # -----------------------------
-# Admin Auth（pin優先、なければpassword）
+# ★ App-wide Admin Gate（ここが変更点）
 # -----------------------------
 def admin_secret() -> str:
     a = st.secrets.get("admin", {})
@@ -315,28 +310,21 @@ def admin_secret() -> str:
     return pin or pw
 
 
-def is_admin() -> bool:
-    return bool(st.session_state.get("admin_ok", False))
-
-
-def admin_login_ui() -> None:
+def require_admin_login() -> None:
+    """
+    アプリ全体を管理者ログイン必須にする。
+    ログイン成功するまで、他のUIに進ませない。
+    """
     required = admin_secret()
     if not required:
-        st.warning("Secrets に [admin].pin（または password）が未設定です。")
-        st.session_state["admin_ok"] = False
+        st.error("Secrets に [admin].pin（または password）が未設定です。")
+        st.stop()
+
+    if st.session_state.get("admin_ok", False):
         return
 
-    if is_admin():
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            st.success("管理者ログイン中")
-        with c2:
-            if st.button("ログアウト", use_container_width=True):
-                st.session_state["admin_ok"] = False
-                st.rerun()
-        return
-
-    with st.form("admin_login", clear_on_submit=False):
+    st.markdown("## 🔐 管理者ログイン")
+    with st.form("admin_gate", clear_on_submit=False):
         pw = st.text_input("管理者PIN", type="password")
         ok = st.form_submit_button("ログイン")
         if ok:
@@ -346,6 +334,8 @@ def admin_login_ui() -> None:
             else:
                 st.session_state["admin_ok"] = False
                 st.error("PINが違います。")
+
+    st.stop()
 
 
 # -----------------------------
@@ -467,6 +457,7 @@ def validate_no_dup_lineid_within_project(members_df: pd.DataFrame, project: str
 # -----------------------------
 def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> None:
     st.subheader("📈 APR 確定（Master=67% / Elite=60%）")
+    st.caption(RANK_LABEL)
 
     projects = active_projects(settings_df)
     if not projects:
@@ -510,10 +501,6 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
         show["DailyAPR"] = show["DailyAPR"].apply(lambda x: fmt_usd(float(x)))
         st.dataframe(show, use_container_width=True, hide_index=True)
 
-    if not is_admin():
-        st.info("APR確定は管理者のみ実行できます（⚙️管理でログイン）。")
-        return
-
     if st.button("APRを確定して全員にLINE送信"):
         evidence_url = None
         if uploaded:
@@ -552,7 +539,7 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
         msg += f"プロジェクト: {project}\n"
         msg += f"報告日時: {now_jst().strftime('%Y/%m/%d %H:%M')}\n\n"
         msg += f"APR: {apr}%\n"
-        msg += "Master: 67% / Elite: 60%\n"
+        msg += f"{RANK_LABEL}\n"
         msg += f"人数: {n_total}（Master {n_master} / Elite {n_elite}）\n"
         msg += f"本日総配当: {fmt_usd(total_reward)}\n"
         msg += f"モード: {'複利' if is_compound else '単利'}\n"
@@ -577,6 +564,7 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
 # -----------------------------
 def ui_cash(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> None:
     st.subheader("💸 入金 / 出金（個別LINE通知）")
+    st.caption(RANK_LABEL)
 
     projects = active_projects(settings_df)
     if not projects:
@@ -599,10 +587,6 @@ def ui_cash(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) ->
     amt = st.number_input("金額", min_value=0.0, value=0.0, step=100.0)
     note = st.text_input("メモ（任意）", value="")
     uploaded = st.file_uploader("エビデンス画像（任意）", type=["png", "jpg", "jpeg"], key="cash_img")
-
-    if not is_admin():
-        st.info("入金/出金の記録は管理者のみ実行できます（⚙️管理でログイン）。")
-        return
 
     if st.button("確定して保存＆個別にLINE通知"):
         if amt <= 0:
@@ -663,12 +647,8 @@ def ui_cash(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) ->
 # UI: Admin（PRO + 個別LINE送信）
 # -----------------------------
 def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> pd.DataFrame:
-    st.subheader("⚙️ 管理（管理者のみ）")
-    admin_login_ui()
-
-    if not is_admin():
-        st.info("ログインすると、メンバー追加・編集が表示されます。")
-        return members_df
+    st.subheader("⚙️ 管理（管理者）")
+    st.caption(RANK_LABEL)
 
     projects = active_projects(settings_df)
     if not projects:
@@ -719,7 +699,7 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
     st.divider()
 
     # --- ★ 個別LINE送信（メンバー選択 / 個人名自動挿入） ---
-    st.markdown("#### 📨 メンバーから選択して個別にLINE送信（管理者）")
+    st.markdown("#### 📨 メンバーから選択して個別にLINE送信（個人名 自動挿入）")
 
     if view_all.empty:
         st.info("メンバーがいないため送信できません。")
@@ -778,8 +758,6 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
                         return members_df
 
                 token = st.secrets["line"]["channel_access_token"]
-
-                # label -> row（labelが重複する運用は避ける：PersonNameをユニーク推奨）
                 label_to_row = {_label(cand.loc[i]): cand.loc[i] for i in range(len(cand))}
 
                 success, fail = 0, 0
@@ -982,6 +960,7 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
 # -----------------------------
 def ui_help() -> None:
     st.subheader("❓ ヘルプ / 使い方")
+    st.caption(RANK_LABEL)
 
     st.markdown(
         f"""
@@ -990,62 +969,8 @@ def ui_help() -> None:
 
 - **{STATUS_ON}**：APR計算対象 / LINE送信対象  
 - **{STATUS_OFF}**：対象外（運用から外す）
-
-⚙️管理の「個別LINE送信」は、送信時に **個人名（〇〇 様）** を自動挿入します。
 """
     )
-
-    with st.expander("0) Make.com（LINE登録フローのゴール）", expanded=False):
-        st.markdown(
-            """
-ゴール（完成形）  
-`LINE Watch Events → HTTP(プロフィール取得) → Google Sheets(Search Rowsで重複チェック) → Filter(0件のみ) → Google Sheets(Add a Rowで追記)`
-
-このアプリは、その結果として作られる **LineUsers** シートを読み込み、⚙️管理の「追加」で自動入力に使います。
-"""
-        )
-
-    with st.expander("1) 事前準備（最初だけ）", expanded=False):
-        st.markdown(
-            """
-- **Google Sheets（編集者共有）**  
-  サービスアカウント（`client_email`）を、対象スプレッドシートに **編集者** で共有してください。
-- **Secrets（Streamlit Cloud）**  
-  - `[connections.gsheets].spreadsheet`：スプレッドシートURLまたはID  
-  - `[connections.gsheets.credentials]`：サービスアカウントJSONの各キー  
-  - `[line].channel_access_token`：LINE Messaging API  
-  - `[imgbb].api_key`：ImgBB（画像添付するなら）
-  - `[admin].pin`（またはpassword）：管理者ログイン用
-"""
-        )
-
-    with st.expander("2) シート構成（列名は変更しない）", expanded=False):
-        st.markdown("### Settings（プロジェクト設定）")
-        st.code("\t".join(SETTINGS_HEADERS))
-
-        st.markdown("### Members（メンバー台帳）")
-        st.code("\t".join(MEMBERS_HEADERS))
-
-        st.markdown("### Ledger（履歴）")
-        st.code("\t".join(LEDGER_HEADERS))
-
-        st.markdown("### LineUsers（Make.comで作るLINEユーザー登録台帳）")
-        st.code("\t".join(LINEUSERS_HEADERS))
-
-    with st.expander("3) ⚙️管理の機能", expanded=False):
-        st.markdown(
-            f"""
-- 検索でメンバーを絞り込み
-- ワンタップで {STATUS_ON}/{STATUS_OFF} 切替
-- 一括編集（Rank/残高/状態/LINE名など）→ 保存で反映
-- メンバー選択で **個別LINE送信**（画像添付も可 / 個人名自動挿入）
-- 追加はLineUsers台帳から選択すると Line_User_ID / LINE_DisplayName を自動入力
-
-**重要（重複防止）**  
-同一プロジェクト内で `Line_User_ID` が既に存在する場合、  
-**追加もしない／更新もしない** 仕様です。
-"""
-        )
 
 
 # -----------------------------
@@ -1054,6 +979,9 @@ def ui_help() -> None:
 def main():
     st.set_page_config(page_title="APR資産運用管理", layout="wide", page_icon="🏦")
     st.title("🏦 APR資産運用管理システム")
+
+    # ★ここでアプリ全体をロック（ログイン成功まで進めない）
+    require_admin_login()
 
     # Sidebar spacing（メニュー行間）
     st.markdown(
@@ -1070,6 +998,12 @@ def main():
         """,
         unsafe_allow_html=True,
     )
+
+    # ログアウト（全ページ共通）
+    with st.sidebar:
+        if st.button("🔓 ログアウト", use_container_width=True):
+            st.session_state["admin_ok"] = False
+            st.rerun()
 
     if "page" not in st.session_state:
         st.session_state["page"] = "📈 APR"
@@ -1103,7 +1037,7 @@ def main():
     elif page == "💸 入金/出金":
         ui_cash(gs, settings_df, members_df)
     elif page == "⚙️ 管理":
-        members_df = ui_admin(gs, settings_df, members_df)
+        ui_admin(gs, settings_df, members_df)
     else:
         ui_help()
 
