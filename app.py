@@ -1,6 +1,6 @@
 # app.py  (ページ状態保持 + ヘルプページ内蔵 + Master/Elite(67/60)対応)
 from __future__ import annotations
-
+ 
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any, List, Optional, Tuple
