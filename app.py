@@ -826,6 +826,26 @@ Make.com で友だち追加時に LineUsers に追記しておくと、
 # -----------------------------
 # Main (sidebar radio)
 # -----------------------------
+
+# --- Sidebar spacing（radioの行間を広げる）---
+st.markdown(
+    """
+    <style>
+      /* sidebar内のradio項目の行間を調整 */
+      section[data-testid="stSidebar"] div[role="radiogroup"] > label {
+        margin: 10px 0 !important;   /* ←行間（上下） */
+        padding: 6px 8px !important; /* ←クリックしやすく */
+      }
+
+      /* 文字サイズも少し上げたい場合（任意） */
+      section[data-testid="stSidebar"] div[role="radiogroup"] > label p {
+        font-size: 16px !important;
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 def main():
     st.set_page_config(page_title="APR資産運用管理", layout="wide", page_icon="🏦")
     st.title("🏦 APR資産運用管理システム")
