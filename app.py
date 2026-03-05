@@ -1,13 +1,14 @@
 # app.py  (PRO版: ページ状態保持 + ヘルプ内蔵 + Master/Elite(67/60) + LINE登録台帳(LineUsers)連携
 #         + サイドバー行間 + 管理画面プロ機能（検索/編集/停止切替）
-#         + ★メンバー選択で個別LINE送信（任意で画像添付）)
+#         + メンバー選択で個別LINE送信（送信時に個人名「〇〇 様」を自動挿入 / 任意で画像添付）)
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any, List, Optional
 
-import json　
+import json
 import pandas as pd
 import requests
 import streamlit as st
@@ -121,6 +122,23 @@ def dedup_line_ids(df: pd.DataFrame) -> List[str]:
     return out
 
 
+def insert_person_name(msg_common: str, person_name: str) -> str:
+    """
+    送信時に個人名「〇〇 様」を自動挿入する。
+    - 1行目が「【ご連絡】」ならその次に挿入
+    - それ以外なら先頭に挿入
+    - すでに「〇〇 様」が含まれていれば二重挿入しない
+    """
+    name_line = f"{person_name} 様"
+    lines = msg_common.splitlines()
+    if name_line in lines:
+        return msg_common
+
+    if lines and lines[0].strip() == "【ご連絡】":
+        return "\n".join([lines[0], name_line] + lines[1:])
+    return "\n".join([name_line] + lines)
+
+
 # -----------------------------
 # LINE
 # -----------------------------
@@ -191,6 +209,7 @@ LEDGER_HEADERS = [
     "Source",
 ]
 
+# Make.com の登録台帳（LINE Watch EventsフローでAdd a Rowする）
 LINEUSERS_SHEET = "LineUsers"
 LINEUSERS_HEADERS = ["Date", "Time", "Type", "Line_User_ID", "Line_User"]
 
@@ -389,9 +408,7 @@ def load_line_users(gs: GSheets) -> pd.DataFrame:
     need = ["Line_User_ID", "Line_User"]
     missing = [c for c in need if c not in df.columns]
     if missing:
-        st.error(
-            f"{gs.cfg.lineusers_sheet} シートの列が不足: {missing}（Make.com の Add a Row の列名を合わせてください）"
-        )
+        st.error(f"{gs.cfg.lineusers_sheet} シートの列が不足: {missing}")
         return pd.DataFrame()
 
     df["Line_User_ID"] = df["Line_User_ID"].astype(str).str.strip()
@@ -639,13 +656,68 @@ def ui_cash(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) ->
 # -----------------------------
 # UI: Admin（PRO + 個別LINE送信）
 # -----------------------------
-    # --- ★ 個別LINE送信（メンバー選択） ---
+def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> pd.DataFrame:
+    st.subheader("⚙️ 管理（管理者のみ）")
+    admin_login_ui()
+
+    if not is_admin():
+        st.info("ログインすると、メンバー追加・編集が表示されます。")
+        return members_df
+
+    projects = active_projects(settings_df)
+    if not projects:
+        st.warning("有効（Active=TRUE）のプロジェクトがありません。Settingsを確認してください。")
+        return members_df
+
+    project = st.selectbox("対象プロジェクト", projects, key="admin_project")
+
+    # Make.com 登録台帳
+    line_users_df = load_line_users(gs)
+    line_users = []
+    if not line_users_df.empty:
+        tmp = line_users_df.copy()
+        tmp = tmp[tmp["Line_User_ID"].astype(str).str.startswith("U")]
+        tmp = tmp.drop_duplicates(subset=["Line_User_ID"], keep="last")
+        for _, r in tmp.iterrows():
+            uid = str(r["Line_User_ID"]).strip()
+            name = str(r.get("Line_User", "")).strip()
+            label = f"{name} ({uid})" if name else uid
+            line_users.append((label, uid, name))
+
+    st.divider()
+
+    # --- 一覧（検索 + 表示） ---
+    view_all = project_members_all(members_df, project)
+    if view_all.empty:
+        st.info("このプロジェクトにメンバーがいません。下のフォームから追加してください。")
+    else:
+        q = st.text_input("検索（PersonName / LINE名 / Line_User_ID）", value="")
+        view = view_all.copy()
+        if q.strip():
+            qq = q.strip().lower()
+            view = view[
+                view["PersonName"].astype(str).str.lower().str.contains(qq, na=False)
+                | view["LINE_DisplayName"].astype(str).str.lower().str.contains(qq, na=False)
+                | view["Line_User_ID"].astype(str).str.lower().str.contains(qq, na=False)
+            ]
+
+        show = view.copy()
+        show["Principal"] = show["Principal"].apply(lambda x: fmt_usd(float(x)))
+        show["Rank"] = show["Rank"].apply(normalize_rank)
+        show["状態"] = show["IsActive"].apply(bool_to_status)
+        show = show.drop(columns=["IsActive"])
+
+        st.markdown("#### 現在のメンバー一覧")
+        st.dataframe(show, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # --- ★ 個別LINE送信（メンバー選択 / 個人名自動挿入） ---
     st.markdown("#### 📨 メンバーから選択して個別にLINE送信（管理者）")
 
     if view_all.empty:
         st.info("メンバーがいないため送信できません。")
     else:
-        # 送信対象リスト（全員 or 運用中のみ）
         target_mode = st.radio("対象", ["🟢運用中のみ", "全メンバー（停止含む）"], horizontal=True)
         cand = view_all.copy() if target_mode.startswith("全") else view_all[view_all["IsActive"] == True].copy()
         cand = cand.reset_index(drop=True)
@@ -662,13 +734,12 @@ def ui_cash(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) ->
         options = [_label(cand.loc[i]) for i in range(len(cand))]
         selected = st.multiselect("送信先（複数可）", options=options)
 
-        # 共通本文（※個人名は送信時に自動挿入）
         default_msg = "【ご連絡】\n"
         default_msg += f"プロジェクト: {project}\n"
         default_msg += f"日時: {now_jst().strftime('%Y/%m/%d %H:%M')}\n\n"
 
         msg_common = st.text_area(
-            "メッセージ本文（共通）※送信時に「〇〇様」を自動挿入します",
+            "メッセージ本文（共通）※送信時に「〇〇 様」を自動挿入します",
             value=st.session_state.get("direct_line_msg", default_msg),
             height=180
         )
@@ -702,7 +773,7 @@ def ui_cash(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) ->
 
                 token = st.secrets["line"]["channel_access_token"]
 
-                # label -> row
+                # label -> row（labelが重複する運用は避ける：PersonNameをユニーク推奨）
                 label_to_row = {_label(cand.loc[i]): cand.loc[i] for i in range(len(cand))}
 
                 success, fail = 0, 0
@@ -723,138 +794,9 @@ def ui_cash(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) ->
                         failed_list.append(f"{lab}（Line_User_ID不正）")
                         continue
 
-                    # ★ 個人名を本文へ自動挿入（「【ご連絡】」の次の行に 〇〇様 を入れる）
-                    # 既に入っている場合は二重挿入しない
-                    lines = msg_common.splitlines()
-                    name_line = f"{person_name} 様"
-                    if name_line not in lines:
-                        if lines and lines[0].strip() == "【ご連絡】":
-                            personalized = "\n".join([lines[0], name_line] + lines[1:])
-                        else:
-                            personalized = "\n".join([name_line] + lines)
-                    else:
-                        personalized = msg_common
-
+                    personalized = insert_person_name(msg_common, person_name)
                     code = send_line_push(token, uid, personalized, evidence_url)
-                    if code == 200:
-                        success += 1
-                    else:
-                        fail += 1
-                        failed_list.append(f"{lab}（HTTP {code}）")
 
-                if fail == 0:
-                    st.success(f"送信完了（成功:{success} / 失敗:{fail}）")
-                else:
-                    st.warning(f"送信結果（成功:{success} / 失敗:{fail}）")
-                    with st.expander("失敗詳細", expanded=False):
-                        st.write("\n".join(failed_list))
-
-    # --- 一覧（検索 + 表示） ---
-    view_all = project_members_all(members_df, project)
-    if view_all.empty:
-        st.info("このプロジェクトにメンバーがいません。下のフォームから追加してください。")
-    else:
-        q = st.text_input("検索（PersonName / LINE名 / Line_User_ID）", value="")
-        view = view_all.copy()
-        if q.strip():
-            qq = q.strip().lower()
-            view = view[
-                view["PersonName"].astype(str).str.lower().str.contains(qq, na=False)
-                | view["LINE_DisplayName"].astype(str).str.lower().str.contains(qq, na=False)
-                | view["Line_User_ID"].astype(str).str.lower().str.contains(qq, na=False)
-            ]
-
-        show = view.copy()
-        show["Principal"] = show["Principal"].apply(lambda x: fmt_usd(float(x)))
-        show["Rank"] = show["Rank"].apply(normalize_rank)
-        show["状態"] = show["IsActive"].apply(bool_to_status)
-        show = show.drop(columns=["IsActive"])
-
-        st.markdown("#### 現在のメンバー一覧")
-        st.dataframe(show, use_container_width=True, hide_index=True)
-
-    st.divider()
-
-    # --- ★ 個別LINE送信（メンバー選択） ---
-    st.markdown("#### 📨 メンバーから選択して個別にLINE送信（管理者）")
-
-    if view_all.empty:
-        st.info("メンバーがいないため送信できません。")
-    else:
-        # 送信対象リスト（全員 or 運用中のみ）
-        target_mode = st.radio("対象", ["🟢運用中のみ", "全メンバー（停止含む）"], horizontal=True)
-        cand = view_all.copy() if target_mode.startswith("全") else view_all[view_all["IsActive"] == True].copy()
-        cand = cand.reset_index(drop=True)
-
-        # 選択肢ラベル
-        def _label(r: pd.Series) -> str:
-            name = str(r.get("PersonName", "")).strip()
-            disp = str(r.get("LINE_DisplayName", "")).strip()
-            uid = str(r.get("Line_User_ID", "")).strip()
-            stt = bool_to_status(r.get("IsActive", True))
-            # 表示名が空ならUIDも見せる
-            if disp:
-                return f"{stt} {name} / {disp}"
-            return f"{stt} {name} / {uid}"
-
-        options = [_label(cand.loc[i]) for i in range(len(cand))]
-        selected = st.multiselect("送信先（複数可）", options=options)
-
-        default_msg = "【ご連絡】\n"
-        default_msg += f"プロジェクト: {project}\n"
-        default_msg += f"日時: {now_jst().strftime('%Y/%m/%d %H:%M')}\n\n"
-
-        msg = st.text_area("メッセージ本文", value=st.session_state.get("direct_line_msg", default_msg), height=180)
-        st.session_state["direct_line_msg"] = msg
-
-        img = st.file_uploader("添付画像（任意・ImgBB）", type=["png", "jpg", "jpeg"], key="direct_line_img")
-
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            do_send = st.button("選択メンバーへ送信", use_container_width=True)
-        with c2:
-            clear_msg = st.button("本文を初期化", use_container_width=True)
-
-        if clear_msg:
-            st.session_state["direct_line_msg"] = default_msg
-            st.rerun()
-
-        if do_send:
-            if not selected:
-                st.warning("送信先を選択してください。")
-            elif not msg.strip():
-                st.warning("メッセージが空です。")
-            else:
-                evidence_url = None
-                if img:
-                    with st.spinner("画像アップロード中..."):
-                        evidence_url = upload_imgbb(img.getvalue())
-                    if not evidence_url:
-                        st.error("画像アップロードに失敗しました（ImgBB）。画像を外して再実行してください。")
-                        return members_df
-
-                token = st.secrets["line"]["channel_access_token"]
-
-                # 選択ラベル -> 行に復元（ラベルはユニークとは限らないので index で処理）
-                # ここでは label一致で拾う（重複の可能性がある運用なら PersonName をユニークにしてください）
-                label_to_row = { _label(cand.loc[i]): cand.loc[i] for i in range(len(cand)) }
-
-                success, fail = 0, 0
-                failed_list = []
-
-                for lab in selected:
-                    r = label_to_row.get(lab)
-                    if r is None:
-                        fail += 1
-                        failed_list.append(lab)
-                        continue
-                    uid = str(r.get("Line_User_ID", "")).strip()
-                    if not is_line_uid(uid):
-                        fail += 1
-                        failed_list.append(f"{lab}（Line_User_ID不正）")
-                        continue
-
-                    code = send_line_push(token, uid, msg, evidence_url)
                     if code == 200:
                         success += 1
                     else:
@@ -961,7 +903,7 @@ def ui_cash(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) ->
 
     st.divider()
 
-    # --- 追加（LINE登録台帳から自動入力） --- 
+    # --- 追加（LINE登録台帳から自動入力） ---
     st.markdown("#### 追加（同一プロジェクト内で Line_User_ID が一致したら『追加しない／更新もしない』）")
 
     if line_users:
@@ -1043,7 +985,7 @@ def ui_help() -> None:
 - **{STATUS_ON}**：APR計算対象 / LINE送信対象  
 - **{STATUS_OFF}**：対象外（運用から外す）
 
-⚙️管理には、**メンバー選択で個別LINE送信**（任意で画像添付）があります。
+⚙️管理の「個別LINE送信」は、送信時に **個人名（〇〇 様）** を自動挿入します。
 """
     )
 
@@ -1077,14 +1019,6 @@ def ui_help() -> None:
 
         st.markdown("### Members（メンバー台帳）")
         st.code("\t".join(MEMBERS_HEADERS))
-        st.markdown(
-            f"""
-- `Rank`：Master / Elite  
-  - Master = 67%
-  - Elite = 60%
-- `IsActive`：内部フラグ（UIでは **{STATUS_ON} / {STATUS_OFF}** と表示）
-"""
-        )
 
         st.markdown("### Ledger（履歴）")
         st.code("\t".join(LEDGER_HEADERS))
@@ -1098,7 +1032,7 @@ def ui_help() -> None:
 - 検索でメンバーを絞り込み
 - ワンタップで {STATUS_ON}/{STATUS_OFF} 切替
 - 一括編集（Rank/残高/状態/LINE名など）→ 保存で反映
-- メンバー選択で **個別LINE送信**（画像添付も可）
+- メンバー選択で **個別LINE送信**（画像添付も可 / 個人名自動挿入）
 - 追加はLineUsers台帳から選択すると Line_User_ID / LINE_DisplayName を自動入力
 
 **重要（重複防止）**  
