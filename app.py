@@ -961,7 +961,7 @@ def ui_cash(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) ->
 
     st.divider()
 
-    # --- 追加（LINE登録台帳から自動入力） ---
+    # --- 追加（LINE登録台帳から自動入力） --- 
     st.markdown("#### 追加（同一プロジェクト内で Line_User_ID が一致したら『追加しない／更新もしない』）")
 
     if line_users:
