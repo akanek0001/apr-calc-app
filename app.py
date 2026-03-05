@@ -1,13 +1,14 @@
 # app.py  (PRO版: 管理者ごとに分離して同じAPR運用ができるマルチ管理者版)
 # - 管理者ログインは「管理者選択 + PIN」
 # - 管理者ごとに別シートでデータを分離（Settings/Members/Ledger/LineUsers を admin_namespace で分岐）
+# - ★LINE tokenも admin_namespace に応じて切替（line.tokens[namespace]）
 # - UI/機能はこれまでのPRO版と同等（APR / 入出金 / 管理 / ヘルプ + サイドバー行間 + 個別LINE送信）
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import json
 import pandas as pd
@@ -158,6 +159,36 @@ def sheet_name(base: str, ns: str) -> str:
     return f"{base}__{ns}"
 
 
+def get_line_token(ns: str) -> str:
+    """
+    ★LINE token を namespace ごとに切替する。
+    secrets 推奨:
+      [line]
+      tokens = { A="...", B="...", C="...", D="..." }
+
+    互換:
+      [line]
+      channel_access_token = "..."
+    """
+    ns = str(ns or "").strip()
+    line = st.secrets.get("line", {}) or {}
+
+    tokens = line.get("tokens", None)
+    if tokens:
+        # tomlのinline tableは dict として読めます
+        tok = str(tokens.get(ns, "")).strip()
+        if tok:
+            return tok
+
+    # legacy fallback
+    legacy = str(line.get("channel_access_token", "")).strip()
+    if legacy:
+        return legacy
+
+    st.error("LINEトークンが未設定です。secretsの [line].tokens または channel_access_token を確認してください。")
+    st.stop()
+
+
 # -----------------------------
 # LINE
 # -----------------------------
@@ -237,7 +268,7 @@ LINEUSERS_HEADERS = ["Date", "Time", "Type", "Line_User_ID", "Line_User"]
 class AdminUser:
     name: str
     pin: str
-    namespace: str  # シート分離用（例: "adminA", "adminB"）
+    namespace: str  # シート分離/LINE分離用（例: "A", "B", "C", "D"）
 
 
 def load_admin_users() -> List[AdminUser]:
@@ -619,7 +650,8 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
                         members_df.loc[i, "UpdatedAt_JST"] = ts
             write_members(gs, members_df)
 
-        token = st.secrets["line"]["channel_access_token"]
+        ns = str(st.session_state.get("admin_namespace", "")).strip() or "default"
+        token = get_line_token(ns)
         targets = dedup_line_ids(mem)
 
         msg = "🏦【APR収益報告】\n"
@@ -706,7 +738,9 @@ def ui_cash(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) ->
 
         write_members(gs, members_df)
 
-        token = st.secrets["line"]["channel_access_token"]
+        ns = str(st.session_state.get("admin_namespace", "")).strip() or "default"
+        token = get_line_token(ns)
+
         msg = "💸【入出金通知】\n"
         msg += f"プロジェクト: {project}\n"
         msg += f"日時: {now_jst().strftime('%Y/%m/%d %H:%M')}\n"
@@ -842,7 +876,9 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
                         st.error("画像アップロードに失敗しました（ImgBB）。画像を外して再実行してください。")
                         return members_df
 
-                token = st.secrets["line"]["channel_access_token"]
+                ns = str(st.session_state.get("admin_namespace", "")).strip() or "default"
+                token = get_line_token(ns)
+
                 label_to_row = {_label(cand.loc[i]): cand.loc[i] for i in range(len(cand))}
 
                 success, fail = 0, 0
@@ -1077,7 +1113,7 @@ def ui_help(gs: GSheets) -> None:
 - **Secrets（Streamlit Cloud）**  
   - `[connections.gsheets].spreadsheet`：スプレッドシートURLまたはID  
   - `[connections.gsheets.credentials]`：サービスアカウントJSONの各キー  
-  - `[line].channel_access_token`：LINE Messaging API  
+  - `[line].tokens`：LINE Messaging API（管理者namespaceごとに分ける）
   - `[imgbb].api_key`：ImgBB（画像添付するなら）
   - `[admin].users`：管理者ごとのPIN（推奨）
 """
