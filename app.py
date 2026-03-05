@@ -1,7 +1,8 @@
-# app.py  (PRO版: ページ状態保持 + ヘルプ内蔵 + Master/Elite(67/60) + LINE登録台帳(LineUsers)連携
+# app.py  (PRO版: ページ状態保持 + ヘルプ内蔵（指定の内容に復元）
+#         + Master/Elite(67/60) + LINE登録台帳(LineUsers)連携
 #         + サイドバー行間 + 管理画面プロ機能（検索/編集/停止切替）
 #         + メンバー選択で個別LINE送信（送信時に個人名「〇〇 様」を自動挿入 / 任意で画像添付）
-#         + ★変更：アプリ全体を「管理者ログイン必須」に（ログイン無しでは中に入れない）
+#         + アプリ全体を管理者ログイン必須に（ログイン無しでは中に入れない）
 
 from __future__ import annotations
 
@@ -23,7 +24,6 @@ JST = timezone(timedelta(hours=9), "JST")
 STATUS_ON = "🟢運用中"
 STATUS_OFF = "🔴停止"
 RANK_LABEL = "👑Master=67% / 🥈Elite=60%"
-
 
 # -----------------------------
 # Utils
@@ -135,6 +135,7 @@ def insert_person_name(msg_common: str, person_name: str) -> str:
     lines = msg_common.splitlines()
     if name_line in lines:
         return msg_common
+
     if lines and lines[0].strip() == "【ご連絡】":
         return "\n".join([lines[0], name_line] + lines[1:])
     return "\n".join([name_line] + lines)
@@ -301,7 +302,7 @@ class GSheets:
 
 
 # -----------------------------
-# ★ App-wide Admin Gate（ここが変更点）
+# App-wide Admin Gate（アプリ全体をログイン必須）
 # -----------------------------
 def admin_secret() -> str:
     a = st.secrets.get("admin", {})
@@ -956,7 +957,7 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
 
 
 # -----------------------------
-# UI: Help
+# UI: Help（★指定どおりのヘルプに復元）
 # -----------------------------
 def ui_help() -> None:
     st.subheader("❓ ヘルプ / 使い方")
@@ -969,8 +970,62 @@ def ui_help() -> None:
 
 - **{STATUS_ON}**：APR計算対象 / LINE送信対象  
 - **{STATUS_OFF}**：対象外（運用から外す）
+
+⚙️管理の「個別LINE送信」は、送信時に **個人名（〇〇 様）** を自動挿入します。
 """
     )
+
+    with st.expander("0) Make.com（LINE登録フローのゴール）", expanded=False):
+        st.markdown(
+            """
+ゴール（完成形）  
+`LINE Watch Events → HTTP(プロフィール取得) → Google Sheets(Search Rowsで重複チェック) → Filter(0件のみ) → Google Sheets(Add a Rowで追記)`
+
+このアプリは、その結果として作られる **LineUsers** シートを読み込み、⚙️管理の「追加」で自動入力に使います。
+"""
+        )
+
+    with st.expander("1) 事前準備（最初だけ）", expanded=False):
+        st.markdown(
+            """
+- **Google Sheets（編集者共有）**  
+  サービスアカウント（`client_email`）を、対象スプレッドシートに **編集者** で共有してください。
+- **Secrets（Streamlit Cloud）**  
+  - `[connections.gsheets].spreadsheet`：スプレッドシートURLまたはID  
+  - `[connections.gsheets.credentials]`：サービスアカウントJSONの各キー  
+  - `[line].channel_access_token`：LINE Messaging API  
+  - `[imgbb].api_key`：ImgBB（画像添付するなら）
+  - `[admin].pin`（またはpassword）：管理者ログイン用
+"""
+        )
+
+    with st.expander("2) シート構成（列名は変更しない）", expanded=False):
+        st.markdown("### Settings（プロジェクト設定）")
+        st.code("\t".join(SETTINGS_HEADERS))
+
+        st.markdown("### Members（メンバー台帳）")
+        st.code("\t".join(MEMBERS_HEADERS))
+
+        st.markdown("### Ledger（履歴）")
+        st.code("\t".join(LEDGER_HEADERS))
+
+        st.markdown("### LineUsers（Make.comで作るLINEユーザー登録台帳）")
+        st.code("\t".join(LINEUSERS_HEADERS))
+
+    with st.expander("3) ⚙️管理の機能", expanded=False):
+        st.markdown(
+            f"""
+- 検索でメンバーを絞り込み
+- ワンタップで {STATUS_ON}/{STATUS_OFF} 切替
+- 一括編集（Rank/残高/状態/LINE名など）→ 保存で反映
+- メンバー選択で **個別LINE送信**（画像添付も可 / 個人名自動挿入）
+- 追加はLineUsers台帳から選択すると Line_User_ID / LINE_DisplayName を自動入力
+
+**重要（重複防止）**  
+同一プロジェクト内で `Line_User_ID` が既に存在する場合、  
+**追加もしない／更新もしない** 仕様です。
+"""
+        )
 
 
 # -----------------------------
@@ -1005,9 +1060,11 @@ def main():
             st.session_state["admin_ok"] = False
             st.rerun()
 
+    # page state
     if "page" not in st.session_state:
         st.session_state["page"] = "📈 APR"
 
+    # Spreadsheet ID
     con = st.secrets.get("connections", {}).get("gsheets", {})
     sid_raw = str(con.get("spreadsheet", "")).strip()
     sid = extract_sheet_id(sid_raw)
