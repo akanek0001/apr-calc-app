@@ -11,7 +11,7 @@ import requests
 import streamlit as st
 
 import gspread
-from google.oauth2.service_account import Credentials
+from google.oauth2.service_account import Credentials 
 from gspread.exceptions import APIError
 
 JST = timezone(timedelta(hours=9), "JST")
