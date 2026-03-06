@@ -9,6 +9,7 @@
 #     Elite  = 60%
 #     日次配当 = Principal × (APR% / 100) × Rank係数 ÷ 365
 # - LineUsers シートは Line_User_ID / LineID のどちらでも読めるように対応
+# - PERSONAL プロジェクト対応
 
 from __future__ import annotations
 
@@ -540,7 +541,6 @@ def load_line_users(gs: GSheets) -> pd.DataFrame:
     if df.empty:
         return df
 
-    # 列名互換
     if "Line_User_ID" not in df.columns and "LineID" in df.columns:
         df = df.rename(columns={"LineID": "Line_User_ID"})
 
@@ -627,8 +627,6 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
 
     mem = mem.copy()
     mem["Factor"] = mem["Rank"].apply(rank_to_factor)
-
-    # APR計算
     mem["DailyAPR"] = mem.apply(
         lambda r: (float(r["Principal"]) * (apr / 100.0) * float(r["Factor"])) / 365.0,
         axis=1
@@ -822,7 +820,6 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
 
     st.divider()
 
-    # --- 一覧 ---
     view_all = project_members_all(members_df, project)
     if view_all.empty:
         st.info("このプロジェクトにメンバーがいません。下のフォームから追加してください。")
@@ -848,7 +845,6 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
 
     st.divider()
 
-    # --- 個別LINE送信 ---
     st.markdown("#### 📨 メンバーから選択して個別にLINE送信（個人名 自動挿入）")
 
     if view_all.empty:
@@ -948,7 +944,6 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
 
     st.divider()
 
-    # --- ワンタップ停止/再開 ---
     if not view_all.empty:
         st.markdown("#### ワンタップで 🟢運用中 / 🔴停止 を切替")
         names = view_all["PersonName"].astype(str).tolist()
@@ -978,7 +973,6 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
 
     st.divider()
 
-    # --- 一括編集 ---
     if not view_all.empty:
         st.markdown("#### 一括編集（保存ボタンで確定）")
 
@@ -1042,7 +1036,6 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
 
     st.divider()
 
-    # --- 追加 ---
     st.markdown("#### 追加（同一プロジェクト内で Line_User_ID が一致したら『追加しない／更新もしない』）")
 
     if line_users:
