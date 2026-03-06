@@ -8,7 +8,7 @@
 #   ・本日APR
 #   ・グループ別残高 
 #   ・個人残高
-#   ・LINE通知履歴
+#   ・LINE通知履歴 
 # - APR計算仕様
 #   1) PERSONAL:
 #      日次配当 = Principal × (APR% / 100) × Rank係数 ÷ 365
