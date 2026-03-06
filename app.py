@@ -1,8 +1,14 @@
-# app.py  (PRO版: 管理者ごとに分離して同じAPR運用ができるマルチ管理者版)
+# app.py
+# PRO版: 管理者ごとに分離して同じAPR運用ができるマルチ管理者版
 # - 管理者ログインは「管理者選択 + PIN」
 # - 管理者ごとに別シートでデータを分離（Settings/Members/Ledger/LineUsers を admin_namespace で分岐）
-# - ★LINE tokenも admin_namespace に応じて切替（line.tokens[namespace]）
-# - UI/機能はこれまでのPRO版と同等（APR / 入出金 / 管理 / ヘルプ + サイドバー行間 + 個別LINE送信）
+# - LINE token も admin_namespace に応じて切替（line.tokens[namespace]）
+# - UI/機能は PRO版と同等（APR / 入出金 / 管理 / ヘルプ + サイドバー行間 + 個別LINE送信）
+# - APR計算:
+#     Master = 67%
+#     Elite  = 60%
+#     日次配当 = Principal × (APR% / 100) × Rank係数 ÷ 365
+# - LineUsers シートは Line_User_ID / LineID のどちらでも読めるように対応
 
 from __future__ import annotations
 
@@ -50,7 +56,7 @@ def to_f(v: Any) -> float:
     try:
         s = str(v).replace(",", "").replace("$", "").replace("%", "").strip()
         return float(s) if s else 0.0
-    except:
+    except Exception:
         return 0.0
 
 
@@ -76,7 +82,7 @@ def extract_sheet_id(value: str) -> str:
     if "/spreadsheets/d/" in sid:
         try:
             sid = sid.split("/spreadsheets/d/")[1].split("/")[0]
-        except:
+        except Exception:
             pass
     return sid
 
@@ -117,11 +123,13 @@ def is_line_uid(v: Any) -> bool:
 def dedup_line_ids(df: pd.DataFrame) -> List[str]:
     if df.empty or "Line_User_ID" not in df.columns:
         return []
+
     ids = []
     for v in df["Line_User_ID"].tolist():
         s = str(v).strip()
         if s.startswith("U"):
             ids.append(s)
+
     seen, out = set(), []
     for x in ids:
         if x not in seen:
@@ -161,7 +169,7 @@ def sheet_name(base: str, ns: str) -> str:
 
 def get_line_token(ns: str) -> str:
     """
-    ★LINE token を namespace ごとに切替する。
+    LINE token を namespace ごとに切替する。
     secrets 推奨:
       [line]
       tokens = { A="...", B="...", C="...", D="..." }
@@ -175,12 +183,10 @@ def get_line_token(ns: str) -> str:
 
     tokens = line.get("tokens", None)
     if tokens:
-        # tomlのinline tableは dict として読めます
         tok = str(tokens.get(ns, "")).strip()
         if tok:
             return tok
 
-    # legacy fallback
     legacy = str(line.get("channel_access_token", "")).strip()
     if legacy:
         return legacy
@@ -195,18 +201,28 @@ def get_line_token(ns: str) -> str:
 def send_line_push(token: str, user_id: str, text: str, image_url: Optional[str] = None) -> int:
     if not user_id:
         return 400
+
     url = "https://api.line.me/v2/bot/message/push"
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
 
     messages = [{"type": "text", "text": text}]
     if image_url:
-        messages.append({"type": "image", "originalContentUrl": image_url, "previewImageUrl": image_url})
+        messages.append(
+            {
+                "type": "image",
+                "originalContentUrl": image_url,
+                "previewImageUrl": image_url,
+            }
+        )
 
     payload = {"to": str(user_id), "messages": messages}
     try:
         r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=25)
         return r.status_code
-    except:
+    except Exception:
         return 500
 
 
@@ -216,8 +232,9 @@ def send_line_push(token: str, user_id: str, text: str, image_url: Optional[str]
 def upload_imgbb(file_bytes: bytes) -> Optional[str]:
     try:
         key = st.secrets["imgbb"]["api_key"]
-    except:
+    except Exception:
         return None
+
     try:
         res = requests.post(
             "https://api.imgbb.com/1/upload",
@@ -227,14 +244,15 @@ def upload_imgbb(file_bytes: bytes) -> Optional[str]:
         )
         data = res.json()
         return data["data"]["url"]
-    except:
+    except Exception:
         return None
 
 
 # -----------------------------
-# Sheets headers（列名は変えない。足りない列だけ追加）
+# Sheets headers
 # -----------------------------
 SETTINGS_HEADERS = ["Project_Name", "Net_Factor", "IsCompound", "UpdatedAt_JST", "Active"]
+
 MEMBERS_HEADERS = [
     "Project_Name",
     "PersonName",
@@ -246,6 +264,7 @@ MEMBERS_HEADERS = [
     "CreatedAt_JST",
     "UpdatedAt_JST",
 ]
+
 LEDGER_HEADERS = [
     "Datetime_JST",
     "Project_Name",
@@ -258,6 +277,7 @@ LEDGER_HEADERS = [
     "LINE_DisplayName",
     "Source",
 ]
+
 LINEUSERS_HEADERS = ["Date", "Time", "Type", "Line_User_ID", "Line_User"]
 
 
@@ -268,7 +288,7 @@ LINEUSERS_HEADERS = ["Date", "Time", "Type", "Line_User_ID", "Line_User"]
 class AdminUser:
     name: str
     pin: str
-    namespace: str  # シート分離/LINE分離用（例: "A", "B", "C", "D"）
+    namespace: str  # A / B / C / D など
 
 
 def load_admin_users() -> List[AdminUser]:
@@ -299,7 +319,6 @@ def load_admin_users() -> List[AdminUser]:
         if out:
             return out
 
-    # legacy
     pin = str(a.get("pin", "")).strip() or str(a.get("password", "")).strip()
     if pin:
         return [AdminUser(name="Admin", pin=pin, namespace="default")]
@@ -308,9 +327,6 @@ def load_admin_users() -> List[AdminUser]:
 
 
 def require_admin_login_multi() -> None:
-    """
-    管理者を選択してログイン。ログイン成功するまでアプリに入れない。
-    """
     admins = load_admin_users()
     if not admins:
         st.error("Secrets に [admin].users（推奨）または [admin].pin が未設定です。")
@@ -515,9 +531,21 @@ def load_members(gs: GSheets) -> pd.DataFrame:
 
 
 def load_line_users(gs: GSheets) -> pd.DataFrame:
+    """
+    Make 側の列名差異を吸収:
+    - 正式: Line_User_ID
+    - 互換 : LineID
+    """
     df = gs.read_df(gs.cfg.lineusers_sheet)
     if df.empty:
         return df
+
+    # 列名互換
+    if "Line_User_ID" not in df.columns and "LineID" in df.columns:
+        df = df.rename(columns={"LineID": "Line_User_ID"})
+
+    if "Line_User" not in df.columns and "LINE_DisplayName" in df.columns:
+        df = df.rename(columns={"LINE_DisplayName": "Line_User"})
 
     need = ["Line_User_ID", "Line_User"]
     missing = [c for c in need if c not in df.columns]
@@ -561,11 +589,13 @@ def validate_no_dup_lineid_within_project(members_df: pd.DataFrame, project: str
     df = members_df[members_df["Project_Name"] == str(project)].copy()
     if df.empty:
         return None
+
     df["Line_User_ID"] = df["Line_User_ID"].astype(str).str.strip()
     df = df[df["Line_User_ID"] != ""]
     dup = df[df.duplicated(subset=["Line_User_ID"], keep=False)]
     if dup.empty:
         return None
+
     ids = dup["Line_User_ID"].unique().tolist()
     return f"同一プロジェクト内で Line_User_ID が重複しています: {ids}"
 
@@ -597,6 +627,8 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
 
     mem = mem.copy()
     mem["Factor"] = mem["Rank"].apply(rank_to_factor)
+
+    # APR計算
     mem["DailyAPR"] = mem.apply(
         lambda r: (float(r["Principal"]) * (apr / 100.0) * float(r["Factor"])) / 365.0,
         axis=1
@@ -763,7 +795,7 @@ def ui_cash(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) ->
 
 
 # -----------------------------
-# UI: Admin（PRO + 個別LINE送信）
+# UI: Admin
 # -----------------------------
 def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> pd.DataFrame:
     st.subheader("⚙️ 管理")
@@ -776,7 +808,6 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
 
     project = st.selectbox("対象プロジェクト", projects, key="admin_project")
 
-    # Make.com 登録台帳
     line_users_df = load_line_users(gs)
     line_users: List[Tuple[str, str, str]] = []
     if not line_users_df.empty:
@@ -791,7 +822,7 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
 
     st.divider()
 
-    # --- 一覧（検索 + 表示） ---
+    # --- 一覧 ---
     view_all = project_members_all(members_df, project)
     if view_all.empty:
         st.info("このプロジェクトにメンバーがいません。下のフォームから追加してください。")
@@ -924,6 +955,7 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
         pick = st.selectbox("対象メンバー", names, key="toggle_member")
         cur_row = view_all[view_all["PersonName"] == pick].iloc[0]
         cur_status = bool_to_status(cur_row["IsActive"])
+
         c1, c2 = st.columns([2, 1])
         with c1:
             st.write(f"現在: **{cur_status}**")
@@ -934,9 +966,11 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
                     if members_df.loc[i, "Project_Name"] == str(project) and str(members_df.loc[i, "PersonName"]).strip() == str(pick).strip():
                         members_df.loc[i, "IsActive"] = (not truthy(members_df.loc[i, "IsActive"]))
                         members_df.loc[i, "UpdatedAt_JST"] = ts
+
                 msg2 = validate_no_dup_lineid_within_project(members_df, project)
                 if msg2:
                     st.error(msg2)
+
                 write_members(gs, members_df)
                 gs.clear_cache()
                 st.success("更新しました。")
@@ -1008,7 +1042,7 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
 
     st.divider()
 
-    # --- 追加（LINE登録台帳から自動入力） ---
+    # --- 追加 ---
     st.markdown("#### 追加（同一プロジェクト内で Line_User_ID が一致したら『追加しない／更新もしない』）")
 
     if line_users:
@@ -1036,6 +1070,7 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
         if not person or not line_uid:
             st.error("PersonName と Line_User_ID は必須です。")
             return members_df
+
         if not is_line_uid(line_uid):
             st.warning("Line_User_ID の形式が不正の可能性があります（通常Uから始まる）。続行は可能です。")
 
@@ -1077,7 +1112,7 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
 
 
 # -----------------------------
-# UI: Help（あなたが指定したヘルプ構成）
+# UI: Help
 # -----------------------------
 def ui_help(gs: GSheets) -> None:
     st.subheader("❓ ヘルプ / 使い方")
@@ -1099,8 +1134,9 @@ def ui_help(gs: GSheets) -> None:
         st.markdown(
             f"""
 ゴール（完成形）  
-`LINE Watch Events → HTTP(プロフィール取得) → Google Sheets(Search Rowsで重複チェック) → Filter(0件のみ) → Google Sheets(Add a Rowで追記)`
+`LINE Watch Events → HTTP(プロフィール取得) → Google Sheets(Add a Rowで追記)`
 
+※重複は現在シート側で管理している前提でも運用可能です。  
 このアプリは、その結果として作られる **{gs.cfg.lineusers_sheet}** シートを読み込み、⚙️管理の「追加」で自動入力に使います。
 """
         )
@@ -1149,6 +1185,22 @@ def ui_help(gs: GSheets) -> None:
 """
         )
 
+    with st.expander("4) APR計算ロジック", expanded=False):
+        st.markdown(
+            """
+- Master = **67%**
+- Elite = **60%**
+- 日次配当 = `Principal × (APR% / 100) × Rank係数 ÷ 365`
+
+例:
+- Principal = 100,000
+- 本日のAPR = 100%
+- Rank = Master
+
+`100,000 × 1.0 × 0.67 ÷ 365 ≒ 183.56`
+"""
+        )
+
 
 # -----------------------------
 # Main
@@ -1157,10 +1209,8 @@ def main():
     st.set_page_config(page_title="APR資産運用管理", layout="wide", page_icon="🏦")
     st.title("🏦 APR資産運用管理システム")
 
-    # ★管理者選択 + PIN ログイン（成功まで進めない）
     require_admin_login_multi()
 
-    # Sidebar spacing（メニュー行間）
     st.markdown(
         """
         <style>
@@ -1176,7 +1226,6 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # ログアウト（全ページ共通）
     with st.sidebar:
         st.caption(f"👤 {current_admin_label()}")
         if st.button("🔓 ログアウト", use_container_width=True):
@@ -1185,11 +1234,9 @@ def main():
             st.session_state["admin_namespace"] = ""
             st.rerun()
 
-    # page state
     if "page" not in st.session_state:
         st.session_state["page"] = "📈 APR"
 
-    # Spreadsheet ID
     con = st.secrets.get("connections", {}).get("gsheets", {})
     sid_raw = str(con.get("spreadsheet", "")).strip()
     sid = extract_sheet_id(sid_raw)
