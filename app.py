@@ -17,6 +17,10 @@
 #      グループ総額 × (APR% / 100) × Settings.Net_Factor ÷ 365
 #      を、そのプロジェクトの有効メンバー人数で均等割
 # - LineUsers シートは Line_User_ID / LineID のどちらでも読めるように対応
+# - 管理追加画面:
+#      追加先区分 = 「プロジェクト」「個人(PERSONAL)」をプルダウン選択
+#      「プロジェクト」なら PERSONAL 以外の案件を選択
+#      「個人(PERSONAL)」なら PERSONAL に登録
 
 from __future__ import annotations
 
@@ -623,7 +627,7 @@ def calc_project_apr(mem: pd.DataFrame, apr_percent: float, project_net_factor: 
 # -----------------------------
 def ui_dashboard(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> None:
     st.subheader("📊 管理画面ダッシュボード")
-    st.caption(f"総資産 / 本日APR実績 / グループ別残高 / 個人残高 / LINE通知履歴 / 管理者: {current_admin_label()}")
+    st.caption("総資産 / 本日APR / グループ別残高 / 個人残高 / LINE通知履歴")
 
     ledger_df = load_ledger(gs)
 
@@ -633,58 +637,55 @@ def ui_dashboard(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFram
 
     total_assets = float(active_mem["Principal"].sum()) if not active_mem.empty else 0.0
 
-    today_str = now_jst().strftime("%Y-%m-%d")
+    today_prefix = now_jst().strftime("%Y-%m-%d")
     today_apr = 0.0
     if not ledger_df.empty:
-        mask_today = ledger_df["Datetime_JST"].astype(str).str.startswith(today_str)
-        mask_apr = ledger_df["Type"].astype(str) == "APR"
-        today_apr = float(ledger_df[mask_today & mask_apr]["Amount"].sum())
-
-    personal_df = pd.DataFrame()
-    if not active_mem.empty:
-        personal_df = active_mem[active_mem["Project_Name"].astype(str).str.upper() == PERSONAL_PROJECT].copy()
+        today_rows = ledger_df[
+            ledger_df["Datetime_JST"].astype(str).str.startswith(today_prefix)
+        ].copy()
+        today_apr = float(today_rows[today_rows["Type"] == "APR"]["Amount"].sum())
 
     group_df = pd.DataFrame()
+    personal_df = pd.DataFrame()
+
     if not active_mem.empty:
-        group_df = active_mem[active_mem["Project_Name"].astype(str).str.upper() != PERSONAL_PROJECT].copy()
+        group_df = active_mem[
+            active_mem["Project_Name"].astype(str).str.upper() != PERSONAL_PROJECT
+        ].copy()
+        personal_df = active_mem[
+            active_mem["Project_Name"].astype(str).str.upper() == PERSONAL_PROJECT
+        ].copy()
 
-    personal_assets = float(personal_df["Principal"].sum()) if not personal_df.empty else 0.0
-    group_assets = float(group_df["Principal"].sum()) if not group_df.empty else 0.0
-
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2 = st.columns(2)
     with c1:
         st.metric("総資産", fmt_usd(total_assets))
     with c2:
-        st.metric("本日APR実績", fmt_usd(today_apr))
-    with c3:
-        st.metric("グループ残高合計", fmt_usd(group_assets))
-    with c4:
-        st.metric("個人残高合計", fmt_usd(personal_assets))
+        st.metric("本日APR", fmt_usd(today_apr))
 
     st.divider()
 
-    left, right = st.columns(2)
+    c3, c4 = st.columns(2)
 
-    with left:
+    with c3:
         st.markdown("#### グループ別残高")
         if group_df.empty:
-            st.info("グループ案件のデータがありません。")
+            st.info("グループデータがありません。")
         else:
-            g = (
+            group_summary = (
                 group_df.groupby("Project_Name", as_index=False)
                 .agg(
                     人数=("PersonName", "count"),
-                    総残高=("Principal", "sum"),
+                    総残高=("Principal", "sum")
                 )
                 .sort_values("総残高", ascending=False)
             )
-            g["総残高"] = g["総残高"].apply(fmt_usd)
-            st.dataframe(g, use_container_width=True, hide_index=True)
+            group_summary["総残高"] = group_summary["総残高"].apply(fmt_usd)
+            st.dataframe(group_summary, use_container_width=True, hide_index=True)
 
-    with right:
-        st.markdown("#### 個人残高（PERSONAL）")
+    with c4:
+        st.markdown("#### 個人残高")
         if personal_df.empty:
-            st.info("PERSONAL のデータがありません。")
+            st.info("PERSONAL データがありません。")
         else:
             p = personal_df[["PersonName", "Principal", "Rank", "LINE_DisplayName"]].copy()
             p["Principal"] = p["Principal"].apply(fmt_usd)
@@ -704,7 +705,7 @@ def ui_dashboard(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFram
     else:
         hist = ledger_df.copy()
         hist = hist.sort_values("Datetime_JST", ascending=False)
-        hist = hist[["Datetime_JST", "Project_Name", "PersonName", "Type", "Amount", "LINE_DisplayName", "Source"]].copy()
+        hist = hist[["Datetime_JST", "Project_Name", "PersonName", "Type", "Amount", "LINE_DisplayName", "Source", "Note"]].copy()
         hist["Amount"] = hist["Amount"].apply(fmt_usd)
         hist = hist.rename(columns={
             "Datetime_JST": "日時",
@@ -714,8 +715,9 @@ def ui_dashboard(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFram
             "Amount": "金額",
             "LINE_DisplayName": "LINE名",
             "Source": "送信元",
+            "Note": "備考",
         })
-        st.dataframe(hist.head(30), use_container_width=True, hide_index=True)
+        st.dataframe(hist.head(50), use_container_width=True, hide_index=True)
 
 
 # -----------------------------
@@ -1244,44 +1246,33 @@ def ui_help(gs: GSheets) -> None:
         f"""
 このアプリは、プロジェクトごとの残高管理・APR確定・入金/出金の履歴管理（Ledger）と、LINE通知を行います。  
 左メニュー（サイドバー）の **📊ダッシュボード / 📈APR / 💸入金/出金 / ⚙️管理 / ❓ヘルプ** で画面を切り替えます。
-
-- **{STATUS_ON}**：APR計算対象 / LINE送信対象  
-- **{STATUS_OFF}**：対象外（運用から外す）
-
-APRロジック:
-- **PERSONAL** → 個別計算
-- **PERSONAL以外** → グループ総額均等割
 """
     )
 
-    with st.expander("1) ダッシュボード", expanded=False):
+    with st.expander("ダッシュボード", expanded=False):
         st.markdown(
             """
 - 総資産
-- 本日APR実績
+- 本日APR
 - グループ別残高
-- 個人残高（PERSONAL）
+- 個人残高
 - LINE通知履歴
 """
         )
 
-    with st.expander("2) APR計算ロジック", expanded=False):
+    with st.expander("APR計算ロジック", expanded=False):
         st.markdown(
             """
 ### PERSONAL
 日次配当 = `Principal × (APR% / 100) × Rank係数 ÷ 365`
 
-- Master = 0.67
-- Elite = 0.60
-
-### グループ案件（PERSONAL以外）
+### PERSONAL以外
 グループ日次総配当 = `グループ総元本 × (APR% / 100) × Net_Factor ÷ 365`
-
 1人あたり日次配当 = `グループ日次総配当 ÷ グループ人数`
 """
         )
 
-    with st.expander("3) シート構成", expanded=False):
+    with st.expander("シート構成", expanded=False):
         st.code("\t".join(SETTINGS_HEADERS))
         st.code("\t".join(MEMBERS_HEADERS))
         st.code("\t".join(LEDGER_HEADERS))
