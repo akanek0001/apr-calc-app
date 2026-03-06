@@ -1,6 +1,6 @@
 # app.py
 # PRO版: 管理者ごとに分離して同じAPR運用ができるマルチ管理者版
-# - 管理者ログインは「管理者選択 + PIN」
+# - 管理者ログインは「管理者選択 + PIN」 
 # - 管理者ごとに別シートでデータを分離（Settings/Members/Ledger/LineUsers を admin_namespace で分岐）
 # - LINE token も admin_namespace に応じて切替（line.tokens[namespace]）
 # - ダッシュボード追加
