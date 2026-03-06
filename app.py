@@ -18,9 +18,7 @@
 #      を、そのプロジェクトの有効メンバー人数で均等割
 # - LineUsers シートは Line_User_ID / LineID のどちらでも読めるように対応
 # - 管理追加画面:
-#      追加先区分 = 「プロジェクト」「個人(PERSONAL)」をプルダウン選択
-#      「プロジェクト」なら PERSONAL 以外の案件を選択
-#      「個人(PERSONAL)」なら PERSONAL に登録
+#      「個人(PERSONAL)」か「プロジェクト」をプルダウンで選択可能
 
 from __future__ import annotations
 
@@ -1169,6 +1167,30 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
 
     st.markdown("#### 追加（同一プロジェクト内で Line_User_ID が一致したら『追加しない／更新もしない』）")
 
+    # 追加先区分
+    add_mode = st.selectbox(
+        "追加先",
+        ["個人(PERSONAL)", "プロジェクト"],
+        key="member_add_mode",
+    )
+
+    all_projects = active_projects(settings_df)
+
+    if add_mode == "個人(PERSONAL)":
+        selected_project = PERSONAL_PROJECT
+        st.info("登録先: PERSONAL（個人運用）")
+    else:
+        project_candidates = [p for p in all_projects if str(p).strip().upper() != PERSONAL_PROJECT]
+        if not project_candidates:
+            st.warning("PERSONAL以外のプロジェクトがありません。Settingsを確認してください。")
+            return members_df
+
+        selected_project = st.selectbox(
+            "登録するプロジェクト",
+            project_candidates,
+            key="member_add_target_project",
+        )
+
     if line_users:
         labels = ["（選択しない）"] + [x[0] for x in line_users]
         picked = st.selectbox("登録済みLINEユーザーから選択（Make.comで追記された台帳）", labels, index=0)
@@ -1199,7 +1221,7 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
             st.warning("Line_User_ID の形式が不正の可能性があります（通常Uから始まる）。続行は可能です。")
 
         exists = members_df[
-            (members_df["Project_Name"] == str(project)) &
+            (members_df["Project_Name"] == str(selected_project)) &
             (members_df["Line_User_ID"].astype(str).str.strip() == str(line_uid).strip())
         ]
         if not exists.empty:
@@ -1208,7 +1230,7 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
 
         ts = fmt_dt(now_jst())
         new_row = {
-            "Project_Name": str(project).strip(),
+            "Project_Name": str(selected_project).strip(),
             "PersonName": str(person).strip(),
             "Principal": float(principal),
             "Line_User_ID": str(line_uid).strip(),
@@ -1220,7 +1242,7 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
         }
         members_df = pd.concat([members_df, pd.DataFrame([new_row])], ignore_index=True)
 
-        msg4 = validate_no_dup_lineid_within_project(members_df, project)
+        msg4 = validate_no_dup_lineid_within_project(members_df, selected_project)
         if msg4:
             st.error(msg4)
             return members_df
@@ -1229,7 +1251,7 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
         gs.clear_cache()
 
         st.session_state["page"] = "⚙️ 管理"
-        st.success("追加しました。")
+        st.success(f"追加しました。登録先: {selected_project}")
         st.rerun()
 
     return members_df
@@ -1269,6 +1291,19 @@ def ui_help(gs: GSheets) -> None:
 ### PERSONAL以外
 グループ日次総配当 = `グループ総元本 × (APR% / 100) × Net_Factor ÷ 365`
 1人あたり日次配当 = `グループ日次総配当 ÷ グループ人数`
+"""
+        )
+
+    with st.expander("追加画面", expanded=False):
+        st.markdown(
+            """
+追加先で次を選べます。
+
+- 個人(PERSONAL)
+- プロジェクト
+
+個人を選ぶと PERSONAL に登録されます。  
+プロジェクトを選ぶと PERSONAL 以外の案件を選択して登録できます。
 """
         )
 
