@@ -13,12 +13,9 @@
 #   1) PERSONAL:
 #      日次配当 = Principal × (APR% / 100) × Rank係数 ÷ 365
 #      Master=67%, Elite=60%
-#   2) グループ案件（PERSONAL 以外）:
+#   2) GROUP（PERSONAL以外）:
 #      グループ総額 × (APR% / 100) × Settings.Net_Factor ÷ 365
 #      を、そのプロジェクトの有効メンバー人数で均等割
-# - LineUsers シートは Line_User_ID / LineID のどちらでも読めるように対応
-# - 管理追加画面:
-#      「個人(PERSONAL)」か「プロジェクト」をプルダウンで選択可能
 # - 一括編集:
 #      元行番号ベースで保存し、確実にシートへ反映
 
@@ -601,6 +598,7 @@ def validate_no_dup_lineid_within_project(members_df: pd.DataFrame, project: str
 def calc_project_apr(mem: pd.DataFrame, apr_percent: float, project_net_factor: float, project_name: str) -> pd.DataFrame:
     mem = mem.copy()
 
+    # PERSONAL は個別計算
     if str(project_name).strip().upper() == PERSONAL_PROJECT:
         mem["Factor"] = mem["Rank"].apply(rank_to_factor)
         mem["DailyAPR"] = mem.apply(
@@ -610,9 +608,11 @@ def calc_project_apr(mem: pd.DataFrame, apr_percent: float, project_net_factor: 
         mem["CalcMode"] = "PERSONAL"
         return mem
 
+    # GROUP は総額均等割
     total_principal = float(mem["Principal"].sum())
     count = len(mem)
     factor = float(project_net_factor if project_net_factor > 0 else 0.67)
+
     total_group_reward = (total_principal * (apr_percent / 100.0) * factor) / 365.0
     each_reward = (total_group_reward / count) if count > 0 else 0.0
 
@@ -640,21 +640,15 @@ def ui_dashboard(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFram
     today_prefix = now_jst().strftime("%Y-%m-%d")
     today_apr = 0.0
     if not ledger_df.empty:
-        today_rows = ledger_df[
-            ledger_df["Datetime_JST"].astype(str).str.startswith(today_prefix)
-        ].copy()
+        today_rows = ledger_df[ledger_df["Datetime_JST"].astype(str).str.startswith(today_prefix)].copy()
         today_apr = float(today_rows[today_rows["Type"] == "APR"]["Amount"].sum())
 
     group_df = pd.DataFrame()
     personal_df = pd.DataFrame()
 
     if not active_mem.empty:
-        group_df = active_mem[
-            active_mem["Project_Name"].astype(str).str.upper() != PERSONAL_PROJECT
-        ].copy()
-        personal_df = active_mem[
-            active_mem["Project_Name"].astype(str).str.upper() == PERSONAL_PROJECT
-        ].copy()
+        group_df = active_mem[active_mem["Project_Name"].astype(str).str.upper() != PERSONAL_PROJECT].copy()
+        personal_df = active_mem[active_mem["Project_Name"].astype(str).str.upper() == PERSONAL_PROJECT].copy()
 
     c1, c2 = st.columns(2)
     with c1:
@@ -673,10 +667,7 @@ def ui_dashboard(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFram
         else:
             group_summary = (
                 group_df.groupby("Project_Name", as_index=False)
-                .agg(
-                    人数=("PersonName", "count"),
-                    総残高=("Principal", "sum")
-                )
+                .agg(人数=("PersonName", "count"), 総残高=("Principal", "sum"))
                 .sort_values("総残高", ascending=False)
             )
             group_summary["総残高"] = group_summary["総残高"].apply(fmt_usd)
@@ -703,8 +694,7 @@ def ui_dashboard(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFram
     if ledger_df.empty:
         st.info("通知履歴がありません。")
     else:
-        hist = ledger_df.copy()
-        hist = hist.sort_values("Datetime_JST", ascending=False)
+        hist = ledger_df.copy().sort_values("Datetime_JST", ascending=False)
         hist = hist[["Datetime_JST", "Project_Name", "PersonName", "Type", "Amount", "LINE_DisplayName", "Source", "Note"]].copy()
         hist["Amount"] = hist["Amount"].apply(fmt_usd)
         hist = hist.rename(columns={
@@ -725,7 +715,7 @@ def ui_dashboard(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFram
 # -----------------------------
 def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> None:
     st.subheader("📈 APR 確定")
-    st.caption(f"{RANK_LABEL} / PERSONAL=個別計算 / グループ=総額均等割 / 管理者: {current_admin_label()}")
+    st.caption(f"{RANK_LABEL} / PERSONAL=個別計算 / GROUP=総額均等割 / 管理者: {current_admin_label()}")
 
     projects = active_projects(settings_df)
     if not projects:
@@ -745,7 +735,12 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
         st.warning("このプロジェクトに 🟢運用中 のメンバーがいません（Membersを確認）。")
         return
 
-    mem = calc_project_apr(mem, apr_percent=float(apr), project_net_factor=project_net_factor, project_name=str(project))
+    mem = calc_project_apr(
+        mem=mem,
+        apr_percent=float(apr),
+        project_net_factor=project_net_factor,
+        project_name=str(project),
+    )
 
     total_principal = float(mem["Principal"].sum())
     total_reward = float(mem["DailyAPR"].sum())
@@ -789,10 +784,16 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
                 f"Factor:{r['Factor']}"
             )
             gs.append_row(gs.cfg.ledger_sheet, [
-                ts, project, r["PersonName"], "APR", float(r["DailyAPR"]),
+                ts,
+                project,
+                r["PersonName"],
+                "APR",
+                float(r["DailyAPR"]),
                 note,
                 evidence_url or "",
-                r["Line_User_ID"], r["LINE_DisplayName"], "app",
+                r["Line_User_ID"],
+                r["LINE_DisplayName"],
+                "app",
             ])
 
         if is_compound:
@@ -815,10 +816,10 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
         msg += f"報告日時: {now_jst().strftime('%Y/%m/%d %H:%M')}\n\n"
         msg += f"APR: {apr}%\n"
         if str(project).strip().upper() == PERSONAL_PROJECT:
-            msg += f"方式: PERSONAL 個別計算\n"
+            msg += "方式: PERSONAL 個別計算\n"
             msg += f"{RANK_LABEL}\n"
         else:
-            msg += f"方式: グループ総額均等割\n"
+            msg += "方式: グループ総額均等割\n"
             msg += f"Net_Factor: {project_net_factor:.2f}\n"
         msg += f"人数: {n_total}\n"
         msg += f"本日総配当: {fmt_usd(total_reward)}\n"
@@ -861,7 +862,7 @@ def ui_cash(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) ->
     person = st.selectbox("メンバー（🟢運用中のみ）", mem["PersonName"].tolist())
     row = mem[mem["PersonName"] == person].iloc[0]
     current = float(row["Principal"])
-    st.info(f"現在残高: {fmt_usd(current)} / Rank: {normalize_rank(row.get('Rank','Master'))} / {STATUS_ON}")
+    st.info(f"現在残高: {fmt_usd(current)} / Rank: {normalize_rank(row.get('Rank', 'Master'))} / {STATUS_ON}")
 
     typ = st.selectbox("種別", ["Deposit", "Withdraw"])
     amt = st.number_input("金額", min_value=0.0, value=0.0, step=100.0)
@@ -1262,25 +1263,14 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
 # -----------------------------
 def ui_help(gs: GSheets) -> None:
     st.subheader("❓ ヘルプ / 使い方")
-    st.caption(f"{RANK_LABEL} / PERSONAL=個別計算 / グループ=総額均等割 / 管理者: {current_admin_label()}")
+    st.caption(f"{RANK_LABEL} / PERSONAL=個別計算 / GROUP=総額均等割 / 管理者: {current_admin_label()}")
 
     st.markdown(
-        f"""
+        """
 このアプリは、プロジェクトごとの残高管理・APR確定・入金/出金の履歴管理（Ledger）と、LINE通知を行います。  
 左メニュー（サイドバー）の **📊ダッシュボード / 📈APR / 💸入金/出金 / ⚙️管理 / ❓ヘルプ** で画面を切り替えます。
 """
     )
-
-    with st.expander("ダッシュボード", expanded=False):
-        st.markdown(
-            """
-- 総資産
-- 本日APR
-- グループ別残高
-- 個人残高
-- LINE通知履歴
-"""
-        )
 
     with st.expander("APR計算ロジック", expanded=False):
         st.markdown(
@@ -1288,31 +1278,9 @@ def ui_help(gs: GSheets) -> None:
 ### PERSONAL
 日次配当 = `Principal × (APR% / 100) × Rank係数 ÷ 365`
 
-### PERSONAL以外
-グループ日次総配当 = `グループ総元本 × (APR% / 100) × Net_Factor ÷ 365`
+### GROUP（PERSONAL以外）
+グループ日次総配当 = `グループ総元本 × (APR% / 100) × Net_Factor ÷ 365`  
 1人あたり日次配当 = `グループ日次総配当 ÷ グループ人数`
-"""
-        )
-
-    with st.expander("追加画面", expanded=False):
-        st.markdown(
-            """
-追加先で次を選べます。
-
-- 個人(PERSONAL)
-- プロジェクト
-
-個人を選ぶと PERSONAL に登録されます。  
-プロジェクトを選ぶと PERSONAL 以外の案件を選択して登録できます。
-"""
-        )
-
-    with st.expander("一括編集", expanded=False):
-        st.markdown(
-            """
-一括編集は元行番号ベースで保存するため、
-Principal / Rank / 状態 / Line_User_ID / LINE_DisplayName の変更が
-そのまま Members シートへ反映されます。
 """
         )
 
