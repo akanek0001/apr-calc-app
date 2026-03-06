@@ -5,7 +5,7 @@
 # - LINE token も admin_namespace に応じて切替（line.tokens[namespace]）
 # - ダッシュボード追加
 #   ・総資産
-#   ・本日APR実績
+#   ・本日APR
 #   ・グループ別残高
 #   ・個人残高
 #   ・LINE通知履歴
@@ -19,6 +19,8 @@
 # - LineUsers シートは Line_User_ID / LineID のどちらでも読めるように対応
 # - 管理追加画面:
 #      「個人(PERSONAL)」か「プロジェクト」をプルダウンで選択可能
+# - 一括編集:
+#      元行番号ベースで保存し、確実にシートへ反映
 
 from __future__ import annotations
 
@@ -949,7 +951,9 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
 
     st.divider()
 
-    view_all = project_members_all(members_df, project)
+    view_all = members_df[members_df["Project_Name"] == str(project)].copy()
+    view_all["_row_id"] = view_all.index
+
     if view_all.empty:
         st.info("このプロジェクトにメンバーがいません。下のフォームから追加してください。")
     else:
@@ -967,7 +971,7 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
         show["Principal"] = show["Principal"].apply(lambda x: fmt_usd(float(x)))
         show["Rank"] = show["Rank"].apply(normalize_rank)
         show["状態"] = show["IsActive"].apply(bool_to_status)
-        show = show.drop(columns=["IsActive"])
+        show = show.drop(columns=["IsActive", "_row_id"], errors="ignore")
 
         st.markdown("#### 現在のメンバー一覧")
         st.dataframe(show, use_container_width=True, hide_index=True)
@@ -1086,10 +1090,9 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
         with c2:
             if st.button("切替", use_container_width=True):
                 ts = fmt_dt(now_jst())
-                for i in range(len(members_df)):
-                    if members_df.loc[i, "Project_Name"] == str(project) and str(members_df.loc[i, "PersonName"]).strip() == str(pick).strip():
-                        members_df.loc[i, "IsActive"] = (not truthy(members_df.loc[i, "IsActive"]))
-                        members_df.loc[i, "UpdatedAt_JST"] = ts
+                row_id = int(cur_row["_row_id"])
+                members_df.loc[row_id, "IsActive"] = (not truthy(members_df.loc[row_id, "IsActive"]))
+                members_df.loc[row_id, "UpdatedAt_JST"] = ts
 
                 msg2 = validate_no_dup_lineid_within_project(members_df, project)
                 if msg2:
@@ -1105,12 +1108,14 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
     if not view_all.empty:
         st.markdown("#### 一括編集（保存ボタンで確定）")
 
-        edit = view_all.copy()
-        edit["状態"] = edit["IsActive"].apply(bool_to_status)
+        edit_src = view_all.copy()
+        edit_src["状態"] = edit_src["IsActive"].apply(bool_to_status)
 
-        edit_show = edit[
+        edit_show = edit_src[
             ["PersonName", "Principal", "Rank", "状態", "Line_User_ID", "LINE_DisplayName"]
         ].copy()
+
+        row_ids = edit_src["_row_id"].tolist()
 
         edited = st.data_editor(
             edit_show,
@@ -1122,14 +1127,14 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
                 "Rank": st.column_config.SelectboxColumn("Rank", options=["Master", "Elite"]),
                 "状態": st.column_config.SelectboxColumn("状態", options=[STATUS_ON, STATUS_OFF]),
             },
-            key="members_editor",
+            key=f"members_editor_{project}",
         )
 
         c1, c2 = st.columns([1, 1])
         with c1:
-            save = st.button("編集内容を保存", use_container_width=True)
+            save = st.button("編集内容を保存", use_container_width=True, key=f"save_members_{project}")
         with c2:
-            cancel = st.button("編集を破棄（再読み込み）", use_container_width=True)
+            cancel = st.button("編集を破棄（再読み込み）", use_container_width=True, key=f"cancel_members_{project}")
 
         if cancel:
             gs.clear_cache()
@@ -1137,26 +1142,22 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
 
         if save:
             ts = fmt_dt(now_jst())
-            upd_map = {str(r["PersonName"]).strip(): r for _, r in edited.iterrows()}
+            edited = edited.copy()
+            edited["_row_id"] = row_ids
 
-            for i in range(len(members_df)):
-                if members_df.loc[i, "Project_Name"] != str(project):
-                    continue
-                pn = str(members_df.loc[i, "PersonName"]).strip()
-                if pn not in upd_map:
-                    continue
-                r = upd_map[pn]
-                members_df.loc[i, "Principal"] = float(to_f(r["Principal"]))
-                members_df.loc[i, "Rank"] = normalize_rank(r["Rank"])
-                members_df.loc[i, "IsActive"] = status_to_bool(r["状態"])
-                members_df.loc[i, "Line_User_ID"] = str(r["Line_User_ID"]).strip()
-                members_df.loc[i, "LINE_DisplayName"] = str(r["LINE_DisplayName"]).strip()
-                members_df.loc[i, "UpdatedAt_JST"] = ts
+            for _, r in edited.iterrows():
+                row_id = int(r["_row_id"])
+                members_df.loc[row_id, "Principal"] = float(to_f(r["Principal"]))
+                members_df.loc[row_id, "Rank"] = normalize_rank(r["Rank"])
+                members_df.loc[row_id, "IsActive"] = status_to_bool(r["状態"])
+                members_df.loc[row_id, "Line_User_ID"] = str(r["Line_User_ID"]).strip()
+                members_df.loc[row_id, "LINE_DisplayName"] = str(r["LINE_DisplayName"]).strip()
+                members_df.loc[row_id, "UpdatedAt_JST"] = ts
 
             msg3 = validate_no_dup_lineid_within_project(members_df, project)
             if msg3:
                 st.error(msg3)
-                st.stop()
+                return members_df
 
             write_members(gs, members_df)
             gs.clear_cache()
@@ -1167,7 +1168,6 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
 
     st.markdown("#### 追加（同一プロジェクト内で Line_User_ID が一致したら『追加しない／更新もしない』）")
 
-    # 追加先区分
     add_mode = st.selectbox(
         "追加先",
         ["個人(PERSONAL)", "プロジェクト"],
@@ -1304,6 +1304,15 @@ def ui_help(gs: GSheets) -> None:
 
 個人を選ぶと PERSONAL に登録されます。  
 プロジェクトを選ぶと PERSONAL 以外の案件を選択して登録できます。
+"""
+        )
+
+    with st.expander("一括編集", expanded=False):
+        st.markdown(
+            """
+一括編集は元行番号ベースで保存するため、
+Principal / Rank / 状態 / Line_User_ID / LINE_DisplayName の変更が
+そのまま Members シートへ反映されます。
 """
         )
 
