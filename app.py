@@ -191,7 +191,7 @@ def build_smart_vault_report(
         f"{final_apr:.4f}%\n\n"
         "💰 本日総配当\n"
         f"{fmt_usd(total_reward)}\n\n"
-        "⚙️ Compound_Timing\n"
+        "⚙️ 複利運用\n"
         f"{compound_timing}\n\n"
         "🕒 Report\n"
         f"{dt.strftime('%Y/%m/%d %H:%M')}"
