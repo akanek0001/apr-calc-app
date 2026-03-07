@@ -175,29 +175,6 @@ def get_line_token(ns: str) -> str:
     st.stop()
 
 
-def build_smart_vault_report(
-    project_name: str,
-    final_apr: float,
-    total_reward: float,
-    compound_timing: str,
-    report_dt: Optional[datetime] = None,
-) -> str:
-    dt = report_dt or now_jst()
-    return (
-        "🏦【smart-vault】\n\n"
-        "📊 プロジェクト\n"
-        f"{project_name}\n\n"
-        "📈 最終APR\n"
-        f"{final_apr:.4f}%\n\n"
-        "💰 本日総配当\n"
-        f"{fmt_usd(total_reward)}\n\n"
-        "⚙️ 複利運用\n"
-        f"{compound_timing}\n\n"
-        "🕒 Report\n"
-        f"{dt.strftime('%Y/%m/%d %H:%M')}"
-    )
-
-
 # -----------------------------
 # LINE / ImgBB
 # -----------------------------
@@ -884,13 +861,14 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
         ns = str(st.session_state.get("admin_namespace", "")).strip() or "default"
         token = get_line_token(ns)
 
-        msg = build_smart_vault_report(
-            project_name=project,
-            final_apr=apr,
-            total_reward=total_reward,
-            compound_timing=compound_timing,
-            report_dt=now_jst(),
-        )
+        msg = "🏦【APR収益報告】\n"
+        msg += f"プロジェクト: {project}\n"
+        msg += f"報告日時: {now_jst().strftime('%Y/%m/%d %H:%M')}\n"
+        msg += f"APR要素: {apr1:.4f}% / {apr2:.4f}% / {apr3:.4f}% / {apr4:.4f}% / {apr5:.4f}%\n"
+        msg += f"最終APR: {apr:.4f}%\n"
+        msg += f"人数: {n_total}\n"
+        msg += f"本日総配当: {fmt_usd(total_reward)}\n"
+        msg += f"Compound_Timing: {compound_timing}\n"
 
         success, fail = 0, 0
         for uid in dedup_line_ids(mem):
