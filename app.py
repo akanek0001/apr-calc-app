@@ -180,14 +180,9 @@ def extract_percent_candidates(text: str) -> List[float]:
     if not text:
         return []
 
-    # 67%
-    # 12.5%
-    # 0.8 %
-    # APR 15.25%
     pattern1 = r"(?i)(?:APR\s*)?(\d+(?:\.\d+)?)\s*%"
     vals1 = re.findall(pattern1, text)
 
-    # APR 15.25 \n %
     pattern2 = r"(?is)(?:APR\s*)?(\d+(?:\.\d+)?)\s*[\r\n]+\s*%"
     vals2 = re.findall(pattern2, text)
 
@@ -233,6 +228,56 @@ def ocr_space_extract_text(file_bytes: bytes) -> str:
         return "\n".join(texts)
     except Exception:
         return ""
+
+
+def append_ledger_safe(
+    gs: "GSheets",
+    dt_jst: str,
+    project: str,
+    person_name: str,
+    typ: str,
+    amount: float,
+    note: str,
+    evidence_url: str = "",
+    line_user_id: str = "",
+    line_display_name: str = "",
+    source: str = "app",
+) -> None:
+    gs.append_row(gs.cfg.ledger_sheet, [
+        dt_jst,
+        project,
+        person_name,
+        typ,
+        float(amount),
+        note,
+        evidence_url or "",
+        line_user_id or "",
+        line_display_name or "",
+        source,
+    ])
+
+
+def build_apr_personal_message(
+    person_name: str,
+    project: str,
+    apr: float,
+    apr1: float,
+    apr2: float,
+    apr3: float,
+    apr4: float,
+    apr5: float,
+    daily_apr: float,
+    compound_timing: str,
+) -> str:
+    msg = "🏦【APR収益報告】\n"
+    msg += f"{person_name} 様\n"
+    msg += f"プロジェクト: {project}\n"
+    msg += f"報告日時: {now_jst().strftime('%Y/%m/%d %H:%M')}\n"
+    msg += f"APR要素: {apr1:.4f}% / {apr2:.4f}% / {apr3:.4f}% / {apr4:.4f}% / {apr5:.4f}%\n"
+    msg += f"最終APR: {apr:.4f}%\n"
+    msg += f"本日配当: {fmt_usd(float(daily_apr))}\n"
+    msg += f"Compound_Timing: {compound_timing}\n"
+    return msg
 
 
 # -----------------------------
@@ -306,7 +351,7 @@ LEDGER_HEADERS = [
     "Datetime_JST",
     "Project_Name",
     "PersonName",
-    "Type",          # APR / Deposit / Withdraw / LINE
+    "Type",
     "Amount",
     "Note",
     "Evidence_URL",
@@ -597,12 +642,6 @@ def active_projects(settings_df: pd.DataFrame) -> List[str]:
         return []
     df = settings_df[settings_df["Active"] == True]
     return df["Project_Name"].dropna().astype(str).unique().tolist()
-
-
-def project_members_all(members_df: pd.DataFrame, project: str) -> pd.DataFrame:
-    if members_df.empty:
-        return members_df.copy()
-    return members_df[members_df["Project_Name"] == str(project)].copy().reset_index(drop=True)
 
 
 def project_members_active(members_df: pd.DataFrame, project: str) -> pd.DataFrame:
@@ -926,29 +965,34 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
 
             ts = fmt_dt(now_jst())
 
-            # 1) APRを先にLedgerへ必ず記録
-            ledger_count = 0
+            apr_ledger_count = 0
             for _, r in mem.iterrows():
+                person = str(r["PersonName"]).strip()
+                uid = str(r["Line_User_ID"]).strip()
+                disp = str(r["LINE_DisplayName"]).strip()
+
                 note = (
                     f"APR:{apr}%, "
                     f"APR1:{apr1}%, APR2:{apr2}%, APR3:{apr3}%, APR4:{apr4}%, APR5:{apr5}%, "
-                    f"Mode:{r['CalcMode']}, Rank:{r['Rank']}, Factor:{r['Factor']}, CompoundTiming:{compound_timing}"
+                    f"Mode:{r['CalcMode']}, Rank:{r['Rank']}, Factor:{r['Factor']}, "
+                    f"CompoundTiming:{compound_timing}"
                 )
-                gs.append_row(gs.cfg.ledger_sheet, [
-                    ts,
-                    project,
-                    r["PersonName"],
-                    "APR",
-                    float(r["DailyAPR"]),
-                    note,
-                    evidence_url or "",
-                    r["Line_User_ID"],
-                    r["LINE_DisplayName"],
-                    "app",
-                ])
-                ledger_count += 1
 
-            # 2) dailyのとき元本反映
+                append_ledger_safe(
+                    gs=gs,
+                    dt_jst=ts,
+                    project=project,
+                    person_name=person,
+                    typ="APR",
+                    amount=float(r["DailyAPR"]),
+                    note=note,
+                    evidence_url=evidence_url or "",
+                    line_user_id=uid,
+                    line_display_name=disp,
+                    source="app",
+                )
+                apr_ledger_count += 1
+
             if compound_timing == "daily":
                 mem_map = {str(r["PersonName"]).strip(): float(r["DailyAPR"]) for _, r in mem.iterrows()}
                 for i in range(len(members_df)):
@@ -960,51 +1004,57 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
                             members_df.loc[i, "UpdatedAt_JST"] = ts
                 write_members(gs, members_df)
 
-            # 3) LINE送信
             ns = str(st.session_state.get("admin_namespace", "")).strip() or "default"
             token = get_line_token(ns)
 
-            msg = "🏦【APR収益報告】\n"
-            msg += f"プロジェクト: {project}\n"
-            msg += f"報告日時: {now_jst().strftime('%Y/%m/%d %H:%M')}\n"
-            msg += f"APR要素: {apr1:.4f}% / {apr2:.4f}% / {apr3:.4f}% / {apr4:.4f}% / {apr5:.4f}%\n"
-            msg += f"最終APR: {apr:.4f}%\n"
-            msg += f"人数: {n_total}\n"
-            msg += f"本日総配当: {fmt_usd(total_reward)}\n"
-            msg += f"Compound_Timing: {compound_timing}\n"
-
+            line_log_count = 0
             success, fail = 0, 0
 
             for _, r in mem.iterrows():
+                person = str(r["PersonName"]).strip()
                 uid = str(r["Line_User_ID"]).strip()
                 disp = str(r["LINE_DisplayName"]).strip()
-                person = str(r["PersonName"]).strip()
+                daily_reward = float(r["DailyAPR"])
+
+                personalized_msg = build_apr_personal_message(
+                    person_name=person,
+                    project=project,
+                    apr=apr,
+                    apr1=apr1,
+                    apr2=apr2,
+                    apr3=apr3,
+                    apr4=apr4,
+                    apr5=apr5,
+                    daily_apr=daily_reward,
+                    compound_timing=compound_timing,
+                )
 
                 if not uid:
                     code = 0
-                    result_note = "LINE未送信: Line_User_IDなし"
+                    line_note = "LINE未送信: Line_User_IDなし"
                 else:
-                    code = send_line_push(token, uid, msg, evidence_url)
-                    result_note = (
+                    code = send_line_push(token, uid, personalized_msg, evidence_url)
+                    line_note = (
                         f"HTTP:{code}, "
                         f"APR:{apr}%, "
                         f"APR1:{apr1}%, APR2:{apr2}%, APR3:{apr3}%, APR4:{apr4}%, APR5:{apr5}%, "
-                        f"CompoundTiming:{compound_timing}"
+                        f"PersonalMessage:yes, CompoundTiming:{compound_timing}"
                     )
 
-                # 4) LINE送信結果もLedgerへ必ず記録
-                gs.append_row(gs.cfg.ledger_sheet, [
-                    ts,
-                    project,
-                    person,
-                    "LINE",
-                    0,
-                    result_note,
-                    evidence_url or "",
-                    uid,
-                    disp,
-                    "app",
-                ])
+                append_ledger_safe(
+                    gs=gs,
+                    dt_jst=ts,
+                    project=project,
+                    person_name=person,
+                    typ="LINE",
+                    amount=0,
+                    note=line_note,
+                    evidence_url=evidence_url or "",
+                    line_user_id=uid,
+                    line_display_name=disp,
+                    source="app",
+                )
+                line_log_count += 1
 
                 if code == 200:
                     success += 1
@@ -1013,7 +1063,7 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
 
             gs.clear_cache()
             st.success(
-                f"APR記録:{ledger_count}件 / LINE送信記録:{len(mem)}件 / "
+                f"APR記録:{apr_ledger_count}件 / LINE履歴記録:{line_log_count}件 / "
                 f"送信成功:{success} / 送信失敗:{fail} / Ledger:{gs.cfg.ledger_sheet}"
             )
             st.rerun()
@@ -1089,26 +1139,26 @@ def ui_cash(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) ->
                     members_df.loc[i, "Principal"] = float(new_balance)
                     members_df.loc[i, "UpdatedAt_JST"] = ts
 
-            # 1) 入出金をLedgerへ記録
-            gs.append_row(gs.cfg.ledger_sheet, [
-                ts,
-                project,
-                person,
-                typ,
-                float(amt),
-                note,
-                evidence_url or "",
-                row["Line_User_ID"],
-                row["LINE_DisplayName"],
-                "app"
-            ])
+            append_ledger_safe(
+                gs=gs,
+                dt_jst=ts,
+                project=project,
+                person_name=person,
+                typ=typ,
+                amount=float(amt),
+                note=note,
+                evidence_url=evidence_url or "",
+                line_user_id=str(row["Line_User_ID"]).strip(),
+                line_display_name=str(row["LINE_DisplayName"]).strip(),
+                source="app",
+            )
             write_members(gs, members_df)
 
-            # 2) LINE送信
             ns = str(st.session_state.get("admin_namespace", "")).strip() or "default"
             token = get_line_token(ns)
 
             msg = "💸【入出金通知】\n"
+            msg += f"{person} 様\n"
             msg += f"プロジェクト: {project}\n"
             msg += f"日時: {now_jst().strftime('%Y/%m/%d %H:%M')}\n"
             msg += f"種別: {typ}\n"
@@ -1123,19 +1173,19 @@ def ui_cash(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) ->
                 code = 0
                 line_note = "LINE未送信: Line_User_IDなし"
 
-            # 3) LINE送信結果をLedgerへ記録
-            gs.append_row(gs.cfg.ledger_sheet, [
-                ts,
-                project,
-                person,
-                "LINE",
-                0,
-                line_note,
-                evidence_url or "",
-                uid,
-                row["LINE_DisplayName"],
-                "app"
-            ])
+            append_ledger_safe(
+                gs=gs,
+                dt_jst=ts,
+                project=project,
+                person_name=person,
+                typ="LINE",
+                amount=0,
+                note=line_note,
+                evidence_url=evidence_url or "",
+                line_user_id=uid,
+                line_display_name=str(row["LINE_DisplayName"]).strip(),
+                source="app",
+            )
 
             gs.clear_cache()
             if code == 200:
@@ -1250,8 +1300,8 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
 
                 success, fail = 0, 0
                 failed_list = []
-
                 ts = fmt_dt(now_jst())
+                line_log_count = 0
 
                 for lab in selected:
                     r = label_to_row.get(lab)
@@ -1264,24 +1314,44 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
                     person_name = str(r.get("PersonName", "")).strip()
                     disp = str(r.get("LINE_DisplayName", "")).strip()
 
+                    personalized = insert_person_name(msg_common, person_name)
+
                     if not is_line_uid(uid):
                         fail += 1
                         failed_list.append(f"{lab}（Line_User_ID不正）")
-                        gs.append_row(gs.cfg.ledger_sheet, [
-                            ts, project, person_name, "LINE", 0,
-                            "LINE未送信: Line_User_ID不正",
-                            evidence_url or "", uid, disp, "app"
-                        ])
+
+                        append_ledger_safe(
+                            gs=gs,
+                            dt_jst=ts,
+                            project=project,
+                            person_name=person_name,
+                            typ="LINE",
+                            amount=0,
+                            note="LINE未送信: Line_User_ID不正",
+                            evidence_url=evidence_url or "",
+                            line_user_id=uid,
+                            line_display_name=disp,
+                            source="app",
+                        )
+                        line_log_count += 1
                         continue
 
-                    personalized = insert_person_name(msg_common, person_name)
                     code = send_line_push(token, uid, personalized, evidence_url)
 
-                    gs.append_row(gs.cfg.ledger_sheet, [
-                        ts, project, person_name, "LINE", 0,
-                        f"HTTP:{code}, DirectMessage",
-                        evidence_url or "", uid, disp, "app"
-                    ])
+                    append_ledger_safe(
+                        gs=gs,
+                        dt_jst=ts,
+                        project=project,
+                        person_name=person_name,
+                        typ="LINE",
+                        amount=0,
+                        note=f"HTTP:{code}, DirectMessage",
+                        evidence_url=evidence_url or "",
+                        line_user_id=uid,
+                        line_display_name=disp,
+                        source="app",
+                    )
+                    line_log_count += 1
 
                     if code == 200:
                         success += 1
@@ -1292,9 +1362,9 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
                 gs.clear_cache()
 
                 if fail == 0:
-                    st.success(f"送信完了（成功:{success} / 失敗:{fail}）")
+                    st.success(f"送信完了（成功:{success} / 失敗:{fail} / Ledger記録:{line_log_count}）")
                 else:
-                    st.warning(f"送信結果（成功:{success} / 失敗:{fail}）")
+                    st.warning(f"送信結果（成功:{success} / 失敗:{fail} / Ledger記録:{line_log_count}）")
                     with st.expander("失敗詳細", expanded=False):
                         st.write("\n".join(failed_list))
 
