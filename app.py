@@ -378,16 +378,22 @@ class GSheets:
         creds = Credentials.from_service_account_info(dict(creds_info), scopes=scopes)
         self.gc = gspread.authorize(creds)
 
-        try:
-            self.book = self.gc.open_by_key(self.cfg.spreadsheet_id)
-        except Exception as e:
-            st.error(f"Spreadsheet を開けません。: {e}")
-            st.stop()
+        self.book = self.gc.open_by_key(self.cfg.spreadsheet_id)
 
-        self._ensure_sheet(self.cfg.settings_sheet, SETTINGS_HEADERS)
-        self._ensure_sheet(self.cfg.members_sheet, MEMBERS_HEADERS)
-        self._ensure_sheet(self.cfg.ledger_sheet, LEDGER_HEADERS)
-        self._ensure_sheet(self.cfg.lineusers_sheet, LINEUSERS_HEADERS)
+        ensure_key = (
+            f"_sheet_ensured_"
+            f"{self.cfg.settings_sheet}_"
+            f"{self.cfg.members_sheet}_"
+            f"{self.cfg.ledger_sheet}_"
+            f"{self.cfg.lineusers_sheet}"
+        )
+
+        if not st.session_state.get(ensure_key, False):
+            self._ensure_sheet(self.cfg.settings_sheet, SETTINGS_HEADERS)
+            self._ensure_sheet(self.cfg.members_sheet, MEMBERS_HEADERS)
+            self._ensure_sheet(self.cfg.ledger_sheet, LEDGER_HEADERS)
+            self._ensure_sheet(self.cfg.lineusers_sheet, LINEUSERS_HEADERS)
+            st.session_state[ensure_key] = True
 
     def _ws(self, name: str):
         return self.book.worksheet(name)
@@ -414,7 +420,7 @@ class GSheets:
         if missing:
             ws.update("1:1", [colset + missing])
 
-    @st.cache_data(ttl=120)
+    @st.cache_data(ttl=600)
     def read_df(_self, sheet_name: str) -> pd.DataFrame:
         ws = _self._ws(sheet_name)
         values = ws.get_all_values()
@@ -1416,6 +1422,11 @@ LINEユーザー情報を `LineUsers` シートへ自動登録し、管理画面
 ### Ledger / LINE通知履歴に出ない
 - まず現在の管理者namespaceに対応する `Ledger__A` など正しいシートを見ているか確認
 - 画面に `APR確定処理でエラー:` が出た場合は、その内容を確認
+
+### 429 Quota exceeded が出る
+- 1〜2分待ってから再読み込みしてください
+- 連続リロードはさらに悪化します
+- このコードでは読取キャッシュを長くし、見出し確認を同一セッション中1回だけにしています
 """
         )
 
@@ -1473,7 +1484,16 @@ def main():
         st.stop()
 
     ns = str(st.session_state.get("admin_namespace", "")).strip() or "default"
-    gs = GSheets(build_gs_config(spreadsheet_id=sid, ns=ns))
+
+    try:
+        gs = GSheets(build_gs_config(spreadsheet_id=sid, ns=ns))
+    except Exception as e:
+        msg = str(e)
+        if "Quota exceeded" in msg or "429" in msg:
+            st.error("Google Sheets API の読み取り上限に達しています。1〜2分待ってから再読み込みしてください。")
+        else:
+            st.error(f"Spreadsheet を開けません。: {e}")
+        st.stop()
 
     settings_df = load_settings(gs)
     members_df = load_members(gs)
