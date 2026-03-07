@@ -751,7 +751,22 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
     project_net_factor = float(row.get("Net_Factor", 0.67))
     compound_timing = normalize_compound_timing(row.get("Compound_Timing", "none"))
 
-    apr = st.number_input("本日のAPR（%）", value=100.0, step=0.1)
+    st.markdown("#### 本日のAPR要素（単純合算）")
+    c1, c2 = st.columns(2)
+    with c1:
+        apr1 = st.number_input("APR要素1（%）", value=0.0, step=0.1, key="apr1")
+        apr2 = st.number_input("APR要素2（%）", value=0.0, step=0.1, key="apr2")
+        apr3 = st.number_input("APR要素3（%）", value=0.0, step=0.1, key="apr3")
+    with c2:
+        apr4 = st.number_input("APR要素4（%）", value=0.0, step=0.1, key="apr4")
+        apr5 = st.number_input("APR要素5（%）", value=0.0, step=0.1, key="apr5")
+
+    apr = float(apr1 + apr2 + apr3 + apr4 + apr5)
+
+    st.info(
+        f"最終APR = {apr1:.4f} + {apr2:.4f} + {apr3:.4f} + {apr4:.4f} + {apr5:.4f} = {apr:.4f}%"
+    )
+
     uploaded = st.file_uploader("エビデンス画像（任意）", type=["png", "jpg", "jpeg"])
 
     mem = project_members_active(members_df, project)
@@ -814,7 +829,11 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
         ts = fmt_dt(now_jst())
 
         for _, r in mem.iterrows():
-            note = f"APR:{apr}%, Mode:{r['CalcMode']}, Rank:{r['Rank']}, Factor:{r['Factor']}, CompoundTiming:{compound_timing}"
+            note = (
+                f"APR:{apr}%, "
+                f"APR1:{apr1}%, APR2:{apr2}%, APR3:{apr3}%, APR4:{apr4}%, APR5:{apr5}%, "
+                f"Mode:{r['CalcMode']}, Rank:{r['Rank']}, Factor:{r['Factor']}, CompoundTiming:{compound_timing}"
+            )
             gs.append_row(gs.cfg.ledger_sheet, [
                 ts,
                 project,
@@ -845,7 +864,8 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
         msg = "🏦【APR収益報告】\n"
         msg += f"プロジェクト: {project}\n"
         msg += f"報告日時: {now_jst().strftime('%Y/%m/%d %H:%M')}\n"
-        msg += f"APR: {apr}%\n"
+        msg += f"APR要素: {apr1:.4f}% / {apr2:.4f}% / {apr3:.4f}% / {apr4:.4f}% / {apr5:.4f}%\n"
+        msg += f"最終APR: {apr:.4f}%\n"
         msg += f"人数: {n_total}\n"
         msg += f"本日総配当: {fmt_usd(total_reward)}\n"
         msg += f"Compound_Timing: {compound_timing}\n"
@@ -1297,10 +1317,15 @@ def ui_help(gs: GSheets) -> None:
     with st.expander("3. APR計算ロジック", expanded=False):
         st.markdown(
             """
+### APRの決め方
+本日の最終APRは、APR要素1〜5を単純合算して決めます。
+
+`最終APR = APR1 + APR2 + APR3 + APR4 + APR5`
+
 ### PERSONAL
 個人ごとの元本で計算します。
 
-`DailyAPR = Principal × (APR% / 100) × Rank係数 ÷ 365`
+`DailyAPR = Principal × (最終APR% / 100) × Rank係数 ÷ 365`
 
 - Master = 0.67
 - Elite = 0.60
@@ -1308,7 +1333,7 @@ def ui_help(gs: GSheets) -> None:
 ### GROUP（PERSONAL以外）
 グループ総額を基準に計算し、人数で均等割します。
 
-`グループ総配当 = グループ総元本 × (APR% / 100) × Net_Factor ÷ 365`
+`グループ総配当 = グループ総元本 × (最終APR% / 100) × Net_Factor ÷ 365`
 
 `1人あたり配当 = グループ総配当 ÷ 人数`
 """
@@ -1362,6 +1387,10 @@ LINEユーザー情報を `LineUsers` シートへ自動登録し、管理画面
 ### シートの列名が読まれない
 - 列名は完全一致が必要
 - 余分なスペースや似た名前に注意
+
+### 最終APRが想定と違う
+- この版では `APR要素1〜5` を単純合算します
+- 平均や加重平均ではありません
 """
         )
 
