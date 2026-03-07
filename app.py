@@ -3,8 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any, List, Optional, Tuple
-
 import json
+import re
+
 import pandas as pd
 import requests
 import streamlit as st
@@ -175,6 +176,65 @@ def get_line_token(ns: str) -> str:
     st.stop()
 
 
+def extract_percent_candidates(text: str) -> List[float]:
+    if not text:
+        return []
+
+    # 67%
+    # 12.5%
+    # 0.8 %
+    # APR 15.25%
+    pattern1 = r"(?i)(?:APR\s*)?(\d+(?:\.\d+)?)\s*%"
+    vals1 = re.findall(pattern1, text)
+
+    # APR 15.25 \n %
+    pattern2 = r"(?is)(?:APR\s*)?(\d+(?:\.\d+)?)\s*[\r\n]+\s*%"
+    vals2 = re.findall(pattern2, text)
+
+    out: List[float] = []
+    seen = set()
+    for v in vals1 + vals2:
+        try:
+            f = float(v)
+            key = round(f, 6)
+            if key not in seen:
+                seen.add(key)
+                out.append(f)
+        except Exception:
+            pass
+    return out
+
+
+def ocr_space_extract_text(file_bytes: bytes) -> str:
+    try:
+        api_key = st.secrets["ocrspace"]["api_key"]
+    except Exception:
+        return ""
+
+    try:
+        res = requests.post(
+            "https://api.ocr.space/parse/image",
+            files={"filename": ("evidence.png", file_bytes)},
+            data={
+                "apikey": api_key,
+                "language": "eng",
+                "isOverlayRequired": False,
+                "OCREngine": 2,
+            },
+            timeout=60,
+        )
+        data = res.json()
+        parsed = data.get("ParsedResults", [])
+        texts = []
+        for p in parsed:
+            txt = str(p.get("ParsedText", "")).strip()
+            if txt:
+                texts.append(txt)
+        return "\n".join(texts)
+    except Exception:
+        return ""
+
+
 # -----------------------------
 # LINE / ImgBB
 # -----------------------------
@@ -246,7 +306,7 @@ LEDGER_HEADERS = [
     "Datetime_JST",
     "Project_Name",
     "PersonName",
-    "Type",
+    "Type",          # APR / Deposit / Withdraw / LINE
     "Amount",
     "Note",
     "Evidence_URL",
@@ -734,12 +794,25 @@ def ui_dashboard(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFram
     if ledger_df.empty:
         st.info("通知履歴がありません。")
     else:
-        hist = ledger_df.sort_values("Datetime_JST", ascending=False).copy()
-        show_cols = [c for c in ["Datetime_JST", "Project_Name", "PersonName", "Type", "Amount", "LINE_DisplayName", "Source", "Note"] if c in hist.columns]
-        hist = hist[show_cols].copy()
-        if "Amount" in hist.columns:
-            hist["Amount"] = hist["Amount"].apply(fmt_usd)
-        st.dataframe(hist.head(50), use_container_width=True, hide_index=True)
+        line_hist = ledger_df[ledger_df["Type"].astype(str).str.strip() == "LINE"].copy()
+
+        if line_hist.empty:
+            st.info("LINE通知履歴はまだありません。")
+        else:
+            line_hist = line_hist.sort_values("Datetime_JST", ascending=False).copy()
+            show_cols = [
+                c for c in [
+                    "Datetime_JST",
+                    "Project_Name",
+                    "PersonName",
+                    "Type",
+                    "Line_User_ID",
+                    "LINE_DisplayName",
+                    "Note",
+                    "Source",
+                ] if c in line_hist.columns
+            ]
+            st.dataframe(line_hist[show_cols].head(100), use_container_width=True, hide_index=True)
 
 
 # -----------------------------
@@ -776,7 +849,22 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
         f"最終APR = {apr1:.4f} + {apr2:.4f} + {apr3:.4f} + {apr4:.4f} + {apr5:.4f} = {apr:.4f}%"
     )
 
-    uploaded = st.file_uploader("エビデンス画像（任意）", type=["png", "jpg", "jpeg"])
+    uploaded = st.file_uploader("エビデンス画像（任意）", type=["png", "jpg", "jpeg"], key="apr_img")
+
+    if uploaded is not None:
+        if st.button("OCRで%候補を抽出"):
+            raw_text = ocr_space_extract_text(uploaded.getvalue())
+            candidates = extract_percent_candidates(raw_text)
+
+            if raw_text:
+                with st.expander("OCR生テキスト", expanded=False):
+                    st.text(raw_text)
+
+            if candidates:
+                st.success("OCRで%候補を抽出しました。")
+                st.write("候補:", candidates)
+            else:
+                st.warning("％付きの数値候補は見つかりませんでした。")
 
     mem = project_members_active(members_df, project)
     if mem.empty:
@@ -838,6 +926,7 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
 
             ts = fmt_dt(now_jst())
 
+            # 1) APRを先にLedgerへ必ず記録
             ledger_count = 0
             for _, r in mem.iterrows():
                 note = (
@@ -859,8 +948,7 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
                 ])
                 ledger_count += 1
 
-            st.info(f"Ledger追記件数: {ledger_count} / 書き込み先: {gs.cfg.ledger_sheet}")
-
+            # 2) dailyのとき元本反映
             if compound_timing == "daily":
                 mem_map = {str(r["PersonName"]).strip(): float(r["DailyAPR"]) for _, r in mem.iterrows()}
                 for i in range(len(members_df)):
@@ -872,6 +960,7 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
                             members_df.loc[i, "UpdatedAt_JST"] = ts
                 write_members(gs, members_df)
 
+            # 3) LINE送信
             ns = str(st.session_state.get("admin_namespace", "")).strip() or "default"
             token = get_line_token(ns)
 
@@ -885,15 +974,48 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
             msg += f"Compound_Timing: {compound_timing}\n"
 
             success, fail = 0, 0
-            for uid in dedup_line_ids(mem):
-                code = send_line_push(token, uid, msg, evidence_url)
+
+            for _, r in mem.iterrows():
+                uid = str(r["Line_User_ID"]).strip()
+                disp = str(r["LINE_DisplayName"]).strip()
+                person = str(r["PersonName"]).strip()
+
+                if not uid:
+                    code = 0
+                    result_note = "LINE未送信: Line_User_IDなし"
+                else:
+                    code = send_line_push(token, uid, msg, evidence_url)
+                    result_note = (
+                        f"HTTP:{code}, "
+                        f"APR:{apr}%, "
+                        f"APR1:{apr1}%, APR2:{apr2}%, APR3:{apr3}%, APR4:{apr4}%, APR5:{apr5}%, "
+                        f"CompoundTiming:{compound_timing}"
+                    )
+
+                # 4) LINE送信結果もLedgerへ必ず記録
+                gs.append_row(gs.cfg.ledger_sheet, [
+                    ts,
+                    project,
+                    person,
+                    "LINE",
+                    0,
+                    result_note,
+                    evidence_url or "",
+                    uid,
+                    disp,
+                    "app",
+                ])
+
                 if code == 200:
                     success += 1
                 else:
                     fail += 1
 
             gs.clear_cache()
-            st.success(f"Ledger保存完了 / LINE送信完了（成功:{success} / 失敗:{fail}）")
+            st.success(
+                f"APR記録:{ledger_count}件 / LINE送信記録:{len(mem)}件 / "
+                f"送信成功:{success} / 送信失敗:{fail} / Ledger:{gs.cfg.ledger_sheet}"
+            )
             st.rerun()
 
         except Exception as e:
@@ -967,12 +1089,22 @@ def ui_cash(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) ->
                     members_df.loc[i, "Principal"] = float(new_balance)
                     members_df.loc[i, "UpdatedAt_JST"] = ts
 
+            # 1) 入出金をLedgerへ記録
             gs.append_row(gs.cfg.ledger_sheet, [
-                ts, project, person, typ, float(amt), note, evidence_url or "",
-                row["Line_User_ID"], row["LINE_DisplayName"], "app"
+                ts,
+                project,
+                person,
+                typ,
+                float(amt),
+                note,
+                evidence_url or "",
+                row["Line_User_ID"],
+                row["LINE_DisplayName"],
+                "app"
             ])
             write_members(gs, members_df)
 
+            # 2) LINE送信
             ns = str(st.session_state.get("admin_namespace", "")).strip() or "default"
             token = get_line_token(ns)
 
@@ -983,13 +1115,33 @@ def ui_cash(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) ->
             msg += f"金額: {fmt_usd(float(amt))}\n"
             msg += f"更新後残高: {fmt_usd(float(new_balance))}\n"
 
-            code = send_line_push(token, str(row["Line_User_ID"]).strip(), msg, evidence_url)
+            uid = str(row["Line_User_ID"]).strip()
+            if uid:
+                code = send_line_push(token, uid, msg, evidence_url)
+                line_note = f"HTTP:{code}, Type:{typ}, Amount:{float(amt)}, NewBalance:{float(new_balance)}"
+            else:
+                code = 0
+                line_note = "LINE未送信: Line_User_IDなし"
+
+            # 3) LINE送信結果をLedgerへ記録
+            gs.append_row(gs.cfg.ledger_sheet, [
+                ts,
+                project,
+                person,
+                "LINE",
+                0,
+                line_note,
+                evidence_url or "",
+                uid,
+                row["LINE_DisplayName"],
+                "app"
+            ])
 
             gs.clear_cache()
             if code == 200:
-                st.success("保存＆送信完了")
+                st.success("入出金保存＆LINE送信記録完了")
             else:
-                st.warning(f"保存は完了。LINE送信失敗（HTTP {code}）")
+                st.warning(f"入出金保存完了 / LINE送信または送信記録あり（HTTP {code}）")
             st.rerun()
 
         except Exception as e:
@@ -1099,6 +1251,8 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
                 success, fail = 0, 0
                 failed_list = []
 
+                ts = fmt_dt(now_jst())
+
                 for lab in selected:
                     r = label_to_row.get(lab)
                     if r is None:
@@ -1108,20 +1262,34 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
 
                     uid = str(r.get("Line_User_ID", "")).strip()
                     person_name = str(r.get("PersonName", "")).strip()
+                    disp = str(r.get("LINE_DisplayName", "")).strip()
 
                     if not is_line_uid(uid):
                         fail += 1
                         failed_list.append(f"{lab}（Line_User_ID不正）")
+                        gs.append_row(gs.cfg.ledger_sheet, [
+                            ts, project, person_name, "LINE", 0,
+                            "LINE未送信: Line_User_ID不正",
+                            evidence_url or "", uid, disp, "app"
+                        ])
                         continue
 
                     personalized = insert_person_name(msg_common, person_name)
                     code = send_line_push(token, uid, personalized, evidence_url)
+
+                    gs.append_row(gs.cfg.ledger_sheet, [
+                        ts, project, person_name, "LINE", 0,
+                        f"HTTP:{code}, DirectMessage",
+                        evidence_url or "", uid, disp, "app"
+                    ])
 
                     if code == 200:
                         success += 1
                     else:
                         fail += 1
                         failed_list.append(f"{lab}（HTTP {code}）")
+
+                gs.clear_cache()
 
                 if fail == 0:
                     st.success(f"送信完了（成功:{success} / 失敗:{fail}）")
@@ -1349,6 +1517,16 @@ def ui_help(gs: GSheets) -> None:
 
 `最終APR = APR1 + APR2 + APR3 + APR4 + APR5`
 
+### OCR
+OCRでは `%` の数字候補だけを抽出します。
+
+例:
+- `67%`
+- `12.5%`
+- `0.8 %`
+- `APR 15.25%`
+- `APR 15.25` の次行に `%`
+
 ### PERSONAL
 個人ごとの元本で計算します。
 
@@ -1420,8 +1598,10 @@ LINEユーザー情報を `LineUsers` シートへ自動登録し、管理画面
 - 平均や加重平均ではありません
 
 ### Ledger / LINE通知履歴に出ない
-- まず現在の管理者namespaceに対応する `Ledger__A` など正しいシートを見ているか確認
-- 画面に `APR確定処理でエラー:` が出た場合は、その内容を確認
+- APR確定時は `Type=APR` が先に Ledger に記録されます
+- その後、LINE送信結果が `Type=LINE` で Ledger に記録されます
+- ダッシュボードの「LINE通知履歴」は Ledger の `Type=LINE` を表示しています
+- まず現在の管理者namespaceに対応する `Ledger__A` など正しいシートを見ているか確認してください
 
 ### 429 Quota exceeded が出る
 - 1〜2分待ってから再読み込みしてください
