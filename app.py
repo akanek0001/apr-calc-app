@@ -1,4 +1,3 @@
-# app.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -41,10 +40,6 @@ def fmt_dt(dt: datetime) -> str:
 
 def fmt_date(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d")
-
-
-def fmt_time(dt: datetime) -> str:
-    return dt.strftime("%H:%M:%S")
 
 
 def fmt_usd(x: float) -> str:
@@ -119,6 +114,13 @@ def is_line_uid(v: Any) -> bool:
     return s.startswith("U") and len(s) >= 10
 
 
+def normalize_compound_timing(v: Any) -> str:
+    s = str(v).strip().lower()
+    if s in ("daily", "monthly", "none"):
+        return s
+    return "none"
+
+
 def dedup_line_ids(df: pd.DataFrame) -> List[str]:
     if df.empty or "Line_User_ID" not in df.columns:
         return []
@@ -174,7 +176,7 @@ def get_line_token(ns: str) -> str:
 
 
 # -----------------------------
-# LINE
+# LINE / ImgBB
 # -----------------------------
 def send_line_push(token: str, user_id: str, text: str, image_url: Optional[str] = None) -> int:
     if not user_id:
@@ -204,9 +206,6 @@ def send_line_push(token: str, user_id: str, text: str, image_url: Optional[str]
         return 500
 
 
-# -----------------------------
-# ImgBB
-# -----------------------------
 def upload_imgbb(file_bytes: bytes) -> Optional[str]:
     try:
         key = st.secrets["imgbb"]["api_key"]
@@ -227,9 +226,9 @@ def upload_imgbb(file_bytes: bytes) -> Optional[str]:
 
 
 # -----------------------------
-# Sheets headers
+# Sheet headers
 # -----------------------------
-SETTINGS_HEADERS = ["Project_Name", "Net_Factor", "IsCompound", "UpdatedAt_JST", "Active"]
+SETTINGS_HEADERS = ["Project_Name", "Net_Factor", "IsCompound", "Compound_Timing", "UpdatedAt_JST", "Active"]
 
 MEMBERS_HEADERS = [
     "Project_Name",
@@ -334,7 +333,7 @@ def current_admin_label() -> str:
 
 
 # -----------------------------
-# Sheets
+# GSheets
 # -----------------------------
 @dataclass
 class GSheetsConfig:
@@ -375,7 +374,7 @@ class GSheets:
         try:
             self.book = self.gc.open_by_key(self.cfg.spreadsheet_id)
         except Exception as e:
-            st.error(f"Spreadsheet を開けません。共有設定（編集者）とIDを確認してください。: {e}")
+            st.error(f"Spreadsheet を開けません。: {e}")
             st.stop()
 
         self._ensure_sheet(self.cfg.settings_sheet, SETTINGS_HEADERS)
@@ -432,7 +431,7 @@ class GSheets:
 
 
 # -----------------------------
-# Loaders
+# Loaders / writers
 # -----------------------------
 def load_settings(gs: GSheets) -> pd.DataFrame:
     df = gs.read_df(gs.cfg.settings_sheet)
@@ -452,6 +451,10 @@ def load_settings(gs: GSheets) -> pd.DataFrame:
     if "IsCompound" not in df.columns:
         df["IsCompound"] = "FALSE"
     df["IsCompound"] = df["IsCompound"].apply(truthy)
+
+    if "Compound_Timing" not in df.columns:
+        df["Compound_Timing"] = "none"
+    df["Compound_Timing"] = df["Compound_Timing"].apply(normalize_compound_timing)
 
     if "Active" not in df.columns:
         df["Active"] = "TRUE"
@@ -520,6 +523,12 @@ def active_projects(settings_df: pd.DataFrame) -> List[str]:
     return df["Project_Name"].dropna().astype(str).unique().tolist()
 
 
+def project_members_all(members_df: pd.DataFrame, project: str) -> pd.DataFrame:
+    if members_df.empty:
+        return members_df.copy()
+    return members_df[members_df["Project_Name"] == str(project)].copy().reset_index(drop=True)
+
+
 def project_members_active(members_df: pd.DataFrame, project: str) -> pd.DataFrame:
     if members_df.empty:
         return members_df.copy()
@@ -575,6 +584,77 @@ def calc_project_apr(mem: pd.DataFrame, apr_percent: float, project_net_factor: 
     mem["DailyAPR"] = each_reward
     mem["CalcMode"] = "GROUP_EQUAL"
     return mem
+
+
+def apply_monthly_compound(gs: GSheets, members_df: pd.DataFrame, project: str) -> Tuple[int, float]:
+    ledger_df = load_ledger(gs)
+    if ledger_df.empty:
+        return 0, 0.0
+
+    target = ledger_df[
+        (ledger_df["Project_Name"].astype(str).str.strip() == str(project).strip()) &
+        (ledger_df["Type"].astype(str).str.strip() == "APR") &
+        (~ledger_df["Note"].astype(str).str.contains("COMPOUNDED", na=False))
+    ].copy()
+
+    if target.empty:
+        return 0, 0.0
+
+    sums = target.groupby("PersonName", as_index=False)["Amount"].sum()
+    if sums.empty:
+        return 0, 0.0
+
+    ts = fmt_dt(now_jst())
+    updated_count = 0
+    total_added = 0.0
+
+    for _, row in sums.iterrows():
+        person = str(row["PersonName"]).strip()
+        addv = float(row["Amount"])
+        if addv == 0:
+            continue
+
+        mask = (
+            members_df["Project_Name"].astype(str).str.strip() == str(project).strip()
+        ) & (
+            members_df["PersonName"].astype(str).str.strip() == person
+        )
+
+        idxs = members_df[mask].index.tolist()
+        if not idxs:
+            continue
+
+        idx = idxs[0]
+        members_df.loc[idx, "Principal"] = float(members_df.loc[idx, "Principal"]) + addv
+        members_df.loc[idx, "UpdatedAt_JST"] = ts
+        updated_count += 1
+        total_added += addv
+
+    if updated_count > 0:
+        write_members(gs, members_df)
+
+        ws = gs._ws(gs.cfg.ledger_sheet)
+        values = ws.get_all_values()
+        if values and len(values) >= 2:
+            headers = values[0]
+            note_idx = headers.index("Note") + 1 if "Note" in headers else None
+            if note_idx:
+                for row_no in range(2, len(values) + 1):
+                    row = values[row_no - 1]
+                    if len(row) < len(headers):
+                        row = row + [""] * (len(headers) - len(row))
+
+                    r_project = str(row[headers.index("Project_Name")]).strip()
+                    r_type = str(row[headers.index("Type")]).strip()
+                    r_note = str(row[headers.index("Note")]).strip()
+
+                    if r_project == str(project).strip() and r_type == "APR" and "COMPOUNDED" not in r_note:
+                        new_note = (r_note + " | " if r_note else "") + f"COMPOUNDED:{ts}"
+                        ws.update_cell(row_no, note_idx, new_note)
+
+        gs.clear_cache()
+
+    return updated_count, total_added
 
 
 # -----------------------------
@@ -660,7 +740,7 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
     project = st.selectbox("プロジェクト", projects)
     row = settings_df[settings_df["Project_Name"] == str(project)].iloc[0]
     project_net_factor = float(row.get("Net_Factor", 0.67))
-    is_compound = bool(row.get("IsCompound", False))
+    compound_timing = normalize_compound_timing(row.get("Compound_Timing", "none"))
 
     apr = st.number_input("本日のAPR（%）", value=100.0, step=0.1)
     uploaded = st.file_uploader("エビデンス画像（任意）", type=["png", "jpg", "jpeg"])
@@ -679,7 +759,7 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
     st.write(f"- 総元本: {fmt_usd(total_principal)}")
     st.write(f"- 人数: {n_total}")
     st.write(f"- 本日総配当: {fmt_usd(total_reward)}")
-    st.write(f"- 方式: {'個別計算' if str(project).upper() == PERSONAL_PROJECT else '総額均等割'}")
+    st.write(f"- Compound_Timing: {compound_timing}")
 
     with st.expander("個人別の本日配当（確認）", expanded=False):
         show = mem[["PersonName", "Rank", "Principal", "DailyAPR", "Line_User_ID", "LINE_DisplayName"]].copy()
@@ -698,7 +778,7 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
         ts = fmt_dt(now_jst())
 
         for _, r in mem.iterrows():
-            note = f"APR:{apr}%, Mode:{r['CalcMode']}, Rank:{r['Rank']}, Factor:{r['Factor']}"
+            note = f"APR:{apr}%, Mode:{r['CalcMode']}, Rank:{r['Rank']}, Factor:{r['Factor']}, CompoundTiming:{compound_timing}"
             gs.append_row(gs.cfg.ledger_sheet, [
                 ts,
                 project,
@@ -712,7 +792,7 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
                 "app",
             ])
 
-        if is_compound:
+        if compound_timing == "daily":
             mem_map = {str(r["PersonName"]).strip(): float(r["DailyAPR"]) for _, r in mem.iterrows()}
             for i in range(len(members_df)):
                 if members_df.loc[i, "Project_Name"] == str(project) and truthy(members_df.loc[i, "IsActive"]):
@@ -726,12 +806,13 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
         ns = str(st.session_state.get("admin_namespace", "")).strip() or "default"
         token = get_line_token(ns)
 
-        msg = "🏦【APR収益報告】\n" 
+        msg = "🏦【APR収益報告】\n"
         msg += f"プロジェクト: {project}\n"
         msg += f"報告日時: {now_jst().strftime('%Y/%m/%d %H:%M')}\n"
         msg += f"APR: {apr}%\n"
         msg += f"人数: {n_total}\n"
         msg += f"本日総配当: {fmt_usd(total_reward)}\n"
+        msg += f"Compound_Timing: {compound_timing}\n"
 
         success, fail = 0, 0
         for uid in dedup_line_ids(mem):
@@ -744,6 +825,17 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
         gs.clear_cache()
         st.success(f"送信完了（成功:{success} / 失敗:{fail}）")
         st.rerun()
+
+    if compound_timing == "monthly":
+        st.divider()
+        st.markdown("#### 月次複利反映")
+        if st.button("未反映APRを元本へ反映"):
+            count, total_added = apply_monthly_compound(gs, members_df, project)
+            if count == 0:
+                st.info("未反映のAPRはありません。")
+            else:
+                st.success(f"{count}名に反映しました。合計反映額: {fmt_usd(total_added)}")
+            st.rerun()
 
 
 # -----------------------------
@@ -999,17 +1091,13 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
 # -----------------------------
 # Help
 # -----------------------------
-def ui_help(gs: GSheets) -> None:
-    st.subheader("❓ ヘルプ / 使い方")
+def ui_help() -> None:
+    st.subheader("❓ ヘルプ")
     st.markdown(
         """
-このアプリは、プロジェクトごとの残高管理・APR確定・入金/出金履歴管理・LINE通知を行います。
-
-- PERSONAL → 個別APR
-- GROUP系 → 総額均等割APR
-- LineUsers → Makeで自動登録
-- Members → 実運用台帳
-- Ledger → APR/入出金履歴
+- `daily` → APR確定時に元本へ即時加算
+- `monthly` → Ledgerに記録のみ、ボタンで月次反映
+- `none` → 単利
 """
     )
 
@@ -1064,7 +1152,7 @@ def main():
     elif page == "⚙️ 管理":
         ui_admin(gs, settings_df, members_df)
     else:
-        ui_help(gs)
+        ui_help()
 
 
 if __name__ == "__main__":
