@@ -303,13 +303,17 @@ def require_admin_login_multi() -> None:
     st.markdown("## 🔐 管理者ログイン")
 
     names = [a.name for a in admins]
+    default_name = st.session_state.get("login_admin_name", names[0])
+    if default_name not in names:
+        default_name = names[0]
 
     with st.form("admin_gate_multi", clear_on_submit=False):
-        admin_name = st.selectbox("管理者を選択", names)
+        admin_name = st.selectbox("管理者を選択", names, index=names.index(default_name))
         pw = st.text_input("管理者PIN", type="password")
         ok = st.form_submit_button("ログイン")
 
         if ok:
+            st.session_state["login_admin_name"] = admin_name
             picked = next((a for a in admins if a.name == admin_name), None)
             if not picked:
                 st.error("管理者が見つかりません。")
@@ -321,6 +325,9 @@ def require_admin_login_multi() -> None:
                 st.session_state["admin_namespace"] = picked.namespace
                 st.rerun()
             else:
+                st.session_state["admin_ok"] = False
+                st.session_state["admin_name"] = ""
+                st.session_state["admin_namespace"] = ""
                 st.error("PINが違います。")
 
     st.stop()
@@ -952,6 +959,131 @@ def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -
 
     st.divider()
 
+    st.markdown("#### 📨 メンバーから選択して個別にLINE送信（個人名 自動挿入）")
+    if view_all.empty:
+        st.info("メンバーがいないため送信できません。")
+    else:
+        target_mode = st.radio("対象", ["🟢運用中のみ", "全メンバー（停止含む）"], horizontal=True)
+        cand = view_all.copy() if target_mode.startswith("全") else view_all[view_all["IsActive"] == True].copy()
+        cand = cand.reset_index(drop=True)
+
+        def _label(r: pd.Series) -> str:
+            name = str(r.get("PersonName", "")).strip()
+            disp = str(r.get("LINE_DisplayName", "")).strip()
+            uid = str(r.get("Line_User_ID", "")).strip()
+            stt = bool_to_status(r.get("IsActive", True))
+            if disp:
+                return f"{stt} {name} / {disp}"
+            return f"{stt} {name} / {uid}"
+
+        options = [_label(cand.loc[i]) for i in range(len(cand))]
+        selected = st.multiselect("送信先（複数可）", options=options)
+
+        default_msg = "【ご連絡】\n"
+        default_msg += f"プロジェクト: {project}\n"
+        default_msg += f"日時: {now_jst().strftime('%Y/%m/%d %H:%M')}\n\n"
+
+        msg_common = st.text_area(
+            "メッセージ本文（共通）※送信時に「〇〇 様」を自動挿入します",
+            value=st.session_state.get("direct_line_msg", default_msg),
+            height=180
+        )
+        st.session_state["direct_line_msg"] = msg_common
+
+        img = st.file_uploader("添付画像（任意・ImgBB）", type=["png", "jpg", "jpeg"], key="direct_line_img")
+
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            do_send = st.button("選択メンバーへ送信", use_container_width=True)
+        with c2:
+            clear_msg = st.button("本文を初期化", use_container_width=True)
+
+        if clear_msg:
+            st.session_state["direct_line_msg"] = default_msg
+            st.rerun()
+
+        if do_send:
+            if not selected:
+                st.warning("送信先を選択してください。")
+            elif not msg_common.strip():
+                st.warning("メッセージが空です。")
+            else:
+                evidence_url = None
+                if img:
+                    evidence_url = upload_imgbb(img.getvalue())
+                    if not evidence_url:
+                        st.error("画像アップロードに失敗しました。")
+                        return members_df
+
+                ns = str(st.session_state.get("admin_namespace", "")).strip() or "default"
+                token = get_line_token(ns)
+
+                label_to_row = {_label(cand.loc[i]): cand.loc[i] for i in range(len(cand))}
+
+                success, fail = 0, 0
+                failed_list = []
+
+                for lab in selected:
+                    r = label_to_row.get(lab)
+                    if r is None:
+                        fail += 1
+                        failed_list.append(lab)
+                        continue
+
+                    uid = str(r.get("Line_User_ID", "")).strip()
+                    person_name = str(r.get("PersonName", "")).strip()
+
+                    if not is_line_uid(uid):
+                        fail += 1
+                        failed_list.append(f"{lab}（Line_User_ID不正）")
+                        continue
+
+                    personalized = insert_person_name(msg_common, person_name)
+                    code = send_line_push(token, uid, personalized, evidence_url)
+
+                    if code == 200:
+                        success += 1
+                    else:
+                        fail += 1
+                        failed_list.append(f"{lab}（HTTP {code}）")
+
+                if fail == 0:
+                    st.success(f"送信完了（成功:{success} / 失敗:{fail}）")
+                else:
+                    st.warning(f"送信結果（成功:{success} / 失敗:{fail}）")
+                    with st.expander("失敗詳細", expanded=False):
+                        st.write("\n".join(failed_list))
+
+    st.divider()
+
+    if not view_all.empty:
+        st.markdown("#### ワンタップで 🟢運用中 / 🔴停止 を切替")
+        names = view_all["PersonName"].astype(str).tolist()
+        pick = st.selectbox("対象メンバー", names, key="toggle_member")
+        cur_row = view_all[view_all["PersonName"] == pick].iloc[0]
+        cur_status = bool_to_status(cur_row["IsActive"])
+
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            st.write(f"現在: **{cur_status}**")
+        with c2:
+            if st.button("切替", use_container_width=True):
+                ts = fmt_dt(now_jst())
+                row_id = int(cur_row["_row_id"])
+                members_df.loc[row_id, "IsActive"] = (not truthy(members_df.loc[row_id, "IsActive"]))
+                members_df.loc[row_id, "UpdatedAt_JST"] = ts
+
+                msg2 = validate_no_dup_lineid_within_project(members_df, project)
+                if msg2:
+                    st.error(msg2)
+
+                write_members(gs, members_df)
+                gs.clear_cache()
+                st.success("更新しました。")
+                st.rerun()
+
+    st.divider()
+
     if not view_all.empty:
         st.markdown("#### 一括編集（保存ボタンで確定）")
         edit_src = view_all.copy()
@@ -1110,6 +1242,21 @@ def main():
     st.title("🏦 APR資産運用管理システム")
 
     require_admin_login_multi()
+
+    st.markdown(
+        """
+        <style>
+          section[data-testid="stSidebar"] div[role="radiogroup"] > label {
+            margin: 10px 0 !important;
+            padding: 6px 8px !important;
+          }
+          section[data-testid="stSidebar"] div[role="radiogroup"] > label p {
+            font-size: 16px !important;
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
     with st.sidebar:
         st.caption(f"👤 {current_admin_label()}")
