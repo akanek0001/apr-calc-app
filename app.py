@@ -5,6 +5,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Any, List, Optional, Tuple
 
 import json
+import re
 import pandas as pd
 import requests
 import streamlit as st
@@ -173,6 +174,134 @@ def get_line_token(ns: str) -> str:
 
     st.error("LINEトークンが未設定です。secrets の [line].tokens または channel_access_token を確認してください。")
     st.stop()
+
+
+def build_smart_vault_report(
+    project_name: str,
+    final_apr: float,
+    total_reward: float,
+    compound_timing: str,
+    report_dt: Optional[datetime] = None,
+) -> str:
+    dt = report_dt or now_jst()
+    return (
+        "🏦【smart-vault】\n\n"
+        "📊 プロジェクト\n"
+        f"{project_name}\n\n"
+        "📈 最終APR\n"
+        f"{final_apr:.4f}%\n\n"
+        "💰 本日総配当\n"
+        f"{fmt_usd(total_reward)}\n\n"
+        "⚙️ 複利運用\n"
+        f"{compound_timing}\n\n"
+        "🕒 Report\n"
+        f"{dt.strftime('%Y/%m/%d %H:%M')}"
+    )
+
+
+# -----------------------------
+# OCR / APR image detection
+# -----------------------------
+def get_ocr_api_key() -> str:
+    try:
+        return str(st.secrets["ocr"]["api_key"]).strip()
+    except Exception:
+        return ""
+
+
+def ocr_apr_text_from_image(file_bytes: bytes, filename: str = "evidence.jpg") -> str:
+    """
+    OCR.space API を使って画像から文字列を抽出。
+    secrets.toml に [ocr] api_key が必要。
+    """
+    api_key = get_ocr_api_key()
+    if not api_key:
+        return ""
+
+    try:
+        res = requests.post(
+            "https://api.ocr.space/parse/image",
+            data={
+                "apikey": api_key,
+                "language": "jpn",
+                "isOverlayRequired": "false",
+                "OCREngine": "2",
+                "scale": "true",
+            },
+            files={
+                "filename": (filename, file_bytes),
+            },
+            timeout=60,
+        )
+        data = res.json()
+    except Exception:
+        return ""
+
+    try:
+        parsed = data.get("ParsedResults", []) or []
+        texts = []
+        for item in parsed:
+            txt = str(item.get("ParsedText", "")).strip()
+            if txt:
+                texts.append(txt)
+        return "\n".join(texts).strip()
+    except Exception:
+        return ""
+
+
+def extract_apr_candidates_from_text(text: str) -> List[float]:
+    if not text:
+        return []
+
+    candidates: List[float] = []
+
+    # 67%
+    # 67.00 %
+    # APR 12.3456%
+    pattern_percent = r"(\d+(?:\.\d+)?)\s*%"
+
+    for m in re.findall(pattern_percent, text):
+        try:
+            v = float(m)
+            if 0.0 <= v <= 1000.0:
+                candidates.append(v)
+        except Exception:
+            pass
+
+    # APR / 利回り / rate / yield 周辺の数値も拾う
+    keyword_patterns = [
+        r"(?:apr|ＡＰＲ|最終apr|最終APR|利回り|年利|rate|yield)\D{0,10}(\d+(?:\.\d+)?)",
+    ]
+    lower_text = text.lower()
+    for pat in keyword_patterns:
+        for m in re.findall(pat, lower_text, flags=re.IGNORECASE):
+            try:
+                v = float(m)
+                if 0.0 <= v <= 1000.0:
+                    candidates.append(v)
+            except Exception:
+                pass
+
+    out: List[float] = []
+    seen = set()
+    for x in candidates:
+        key = round(float(x), 6)
+        if key not in seen:
+            seen.add(key)
+            out.append(float(x))
+
+    return out
+
+
+def detect_apr_from_image(file_bytes: bytes, filename: str = "evidence.jpg") -> Tuple[Optional[float], List[float], str]:
+    text = ocr_apr_text_from_image(file_bytes=file_bytes, filename=filename)
+    candidates = extract_apr_candidates_from_text(text)
+
+    if not candidates:
+        return None, [], text
+
+    picked = candidates[0]
+    return picked, candidates, text
 
 
 # -----------------------------
@@ -751,23 +880,68 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
     project_net_factor = float(row.get("Net_Factor", 0.67))
     compound_timing = normalize_compound_timing(row.get("Compound_Timing", "none"))
 
-    st.markdown("#### 本日のAPR要素（単純合算）")
-    c1, c2 = st.columns(2)
-    with c1:
-        apr1 = st.number_input("APR要素1（%）", value=0.0, step=0.1, key="apr1")
-        apr2 = st.number_input("APR要素2（%）", value=0.0, step=0.1, key="apr2")
-        apr3 = st.number_input("APR要素3（%）", value=0.0, step=0.1, key="apr3")
-    with c2:
-        apr4 = st.number_input("APR要素4（%）", value=0.0, step=0.1, key="apr4")
-        apr5 = st.number_input("APR要素5（%）", value=0.0, step=0.1, key="apr5")
-
-    apr = float(apr1 + apr2 + apr3 + apr4 + apr5)
-
-    st.info(
-        f"最終APR = {apr1:.4f} + {apr2:.4f} + {apr3:.4f} + {apr4:.4f} + {apr5:.4f} = {apr:.4f}%"
+    st.markdown("#### APR入力方法")
+    apr_mode = st.radio(
+        "最終APRの設定方法",
+        ["手入力（APR要素1〜5）", "エビデンス画像から読取"],
+        horizontal=True,
     )
 
     uploaded = st.file_uploader("エビデンス画像（任意）", type=["png", "jpg", "jpeg"])
+
+    apr1 = apr2 = apr3 = apr4 = apr5 = 0.0
+    apr = 0.0
+    ocr_text = ""
+    ocr_candidates: List[float] = []
+    detected_apr: Optional[float] = None
+
+    if apr_mode == "手入力（APR要素1〜5）":
+        st.markdown("#### 本日のAPR要素（単純合算）")
+        c1, c2 = st.columns(2)
+        with c1:
+            apr1 = st.number_input("APR要素1（%）", value=0.0, step=0.1, key="apr1")
+            apr2 = st.number_input("APR要素2（%）", value=0.0, step=0.1, key="apr2")
+            apr3 = st.number_input("APR要素3（%）", value=0.0, step=0.1, key="apr3")
+        with c2:
+            apr4 = st.number_input("APR要素4（%）", value=0.0, step=0.1, key="apr4")
+            apr5 = st.number_input("APR要素5（%）", value=0.0, step=0.1, key="apr5")
+
+        apr = float(apr1 + apr2 + apr3 + apr4 + apr5)
+
+        st.info(
+            f"最終APR = {apr1:.4f} + {apr2:.4f} + {apr3:.4f} + {apr4:.4f} + {apr5:.4f} = {apr:.4f}%"
+        )
+
+    else:
+        st.markdown("#### エビデンス画像から最終APRを読取")
+
+        if not get_ocr_api_key():
+            st.warning("OCR APIキーが未設定です。secrets.toml に [ocr].api_key を設定してください。")
+
+        if uploaded:
+            detected_apr, ocr_candidates, ocr_text = detect_apr_from_image(
+                file_bytes=uploaded.getvalue(),
+                filename=uploaded.name or "evidence.jpg",
+            )
+
+            if ocr_candidates:
+                picked_apr = st.selectbox(
+                    "OCRで検出したAPR候補",
+                    options=ocr_candidates,
+                    format_func=lambda x: f"{x:.4f}%",
+                )
+                apr = float(picked_apr)
+                st.success(f"画像から最終APRをセット: {apr:.4f}%")
+            else:
+                st.warning("画像からAPR候補を検出できませんでした。手入力モードを使ってください。")
+
+            with st.expander("OCR読み取りテキスト確認", expanded=False):
+                st.text(ocr_text if ocr_text else "OCR結果なし")
+        else:
+            st.info("画像をアップロードするとAPR候補を読み取ります。")
+
+    if apr <= 0:
+        st.info("最終APRが 0.0000% の状態です。必要なら入力または画像読取を行ってください。")
 
     mem = project_members_active(members_df, project)
     if mem.empty:
@@ -819,6 +993,10 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
             st.info("このプロジェクトは none 設定です。単利のため元本には加算されません。")
 
     if st.button("APRを確定して全員にLINE送信"):
+        if apr <= 0:
+            st.error("最終APRが 0 以下です。APRを設定してください。")
+            return
+
         evidence_url = None
         if uploaded:
             evidence_url = upload_imgbb(uploaded.getvalue())
@@ -829,11 +1007,21 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
         ts = fmt_dt(now_jst())
 
         for _, r in mem.iterrows():
-            note = (
-                f"APR:{apr}%, "
-                f"APR1:{apr1}%, APR2:{apr2}%, APR3:{apr3}%, APR4:{apr4}%, APR5:{apr5}%, "
-                f"Mode:{r['CalcMode']}, Rank:{r['Rank']}, Factor:{r['Factor']}, CompoundTiming:{compound_timing}"
-            )
+            if apr_mode == "手入力（APR要素1〜5）":
+                note = (
+                    f"APR:{apr}%, "
+                    f"APR1:{apr1}%, APR2:{apr2}%, APR3:{apr3}%, APR4:{apr4}%, APR5:{apr5}%, "
+                    f"APRMode:MANUAL, "
+                    f"Mode:{r['CalcMode']}, Rank:{r['Rank']}, Factor:{r['Factor']}, CompoundTiming:{compound_timing}"
+                )
+            else:
+                note = (
+                    f"APR:{apr}%, "
+                    f"APRMode:OCR_IMAGE, "
+                    f"OCRCandidates:{' / '.join([f'{x:.4f}%' for x in ocr_candidates]) if ocr_candidates else ''}, "
+                    f"Mode:{r['CalcMode']}, Rank:{r['Rank']}, Factor:{r['Factor']}, CompoundTiming:{compound_timing}"
+                )
+
             gs.append_row(gs.cfg.ledger_sheet, [
                 ts,
                 project,
@@ -861,14 +1049,13 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
         ns = str(st.session_state.get("admin_namespace", "")).strip() or "default"
         token = get_line_token(ns)
 
-        msg = "🏦【APR収益報告】\n"
-        msg += f"プロジェクト: {project}\n"
-        msg += f"報告日時: {now_jst().strftime('%Y/%m/%d %H:%M')}\n"
-        msg += f"APR要素: {apr1:.4f}% / {apr2:.4f}% / {apr3:.4f}% / {apr4:.4f}% / {apr5:.4f}%\n"
-        msg += f"最終APR: {apr:.4f}%\n"
-        msg += f"人数: {n_total}\n"
-        msg += f"本日総配当: {fmt_usd(total_reward)}\n"
-        msg += f"Compound_Timing: {compound_timing}\n"
+        msg = build_smart_vault_report(
+            project_name=project,
+            final_apr=apr,
+            total_reward=total_reward,
+            compound_timing=compound_timing,
+            report_dt=now_jst(),
+        )
 
         success, fail = 0, 0
         for uid in dedup_line_ids(mem):
@@ -1318,9 +1505,13 @@ def ui_help(gs: GSheets) -> None:
         st.markdown(
             """
 ### APRの決め方
-本日の最終APRは、APR要素1〜5を単純合算して決めます。
+本日の最終APRは、手入力またはエビデンス画像OCRのどちらかで決めます。
 
+#### 手入力モード
 `最終APR = APR1 + APR2 + APR3 + APR4 + APR5`
+
+#### 画像読取モード
+画像OCRで `%` を含む数値候補を抽出し、候補から選んだ値を最終APRとして使います。
 
 ### PERSONAL
 個人ごとの元本で計算します。
@@ -1388,9 +1579,10 @@ LINEユーザー情報を `LineUsers` シートへ自動登録し、管理画面
 - 列名は完全一致が必要
 - 余分なスペースや似た名前に注意
 
-### 最終APRが想定と違う
-- この版では `APR要素1〜5` を単純合算します
-- 平均や加重平均ではありません
+### 画像からAPRが拾えない
+- OCR APIキーが未設定だと動きません
+- 装飾文字、小さい文字、複雑な背景画像は誤読しやすいです
+- OCR結果テキストを確認して候補が妥当かチェックしてください
 """
         )
 
@@ -1399,9 +1591,18 @@ LINEユーザー情報を `LineUsers` シートへ自動登録し、管理画面
             """
 - `PERSONAL` → `daily` または `none`
 - グループ案件 → `monthly`
+- 画像読取APRは候補を確認してから確定
 
 この設定にすると、個人案件は日次で追いやすく、グループ案件は月次締めで管理しやすくなります。
 """
+        )
+
+    with st.expander("7. OCR設定", expanded=False):
+        st.code(
+            """
+[ocr]
+api_key = "YOUR_OCR_SPACE_API_KEY"
+""".strip()
         )
 
 
