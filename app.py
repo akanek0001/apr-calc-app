@@ -911,7 +911,10 @@ def ui_dashboard(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFram
 
     with c3:
         st.markdown("#### グループ別残高")
-        group_df = active_mem[active_mem["Project_Name"].astype(str).str.upper() != PERSONAL_PROJECT].copy() if not active_mem.empty else pd.DataFrame()
+        group_df = active_mem[
+            active_mem["Project_Name"].astype(str).str.upper() != PERSONAL_PROJECT
+        ].copy() if not active_mem.empty else pd.DataFrame()
+
         if group_df.empty:
             st.info("グループデータがありません。")
         else:
@@ -925,12 +928,26 @@ def ui_dashboard(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFram
 
     with c4:
         st.markdown("#### 個人残高")
-        personal_df = active_mem[active_mem["Project_Name"].astype(str).str.upper() == PERSONAL_PROJECT].copy() if not active_mem.empty else pd.DataFrame()
+        personal_df = active_mem[
+            active_mem["Project_Name"].astype(str).str.upper() == PERSONAL_PROJECT
+        ].copy() if not active_mem.empty else pd.DataFrame()
+
         if personal_df.empty:
             st.info("PERSONAL データがありません。")
         else:
-            p = personal_df[["PersonName", "Principal", "Rank", "LINE_DisplayName"]].copy()
+            p = personal_df[["PersonName", "Principal", "LINE_DisplayName"]].copy()
+
+            if total_assets > 0:
+                p["資産割合"] = p["Principal"].apply(lambda x: f"{(float(x) / total_assets) * 100:.2f}%")
+            else:
+                p["資産割合"] = "0.00%"
+
+            p["Principal_num"] = p["Principal"].astype(float)
             p["Principal"] = p["Principal"].apply(fmt_usd)
+
+            p = p.sort_values("Principal_num", ascending=False).copy()
+            p = p[["PersonName", "Principal", "資産割合", "LINE_DisplayName"]]
+
             st.dataframe(p, use_container_width=True, hide_index=True)
 
     st.divider()
