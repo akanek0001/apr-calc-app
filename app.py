@@ -27,6 +27,9 @@ BASE_LINEUSERS = "LineUsers"
 PERSONAL_PROJECT = "PERSONAL"
 
 
+# -----------------------------
+# Utils
+# -----------------------------
 def now_jst() -> datetime:
     return datetime.now(JST)
 
@@ -111,6 +114,13 @@ def is_line_uid(v: Any) -> bool:
     return s.startswith("U") and len(s) >= 10
 
 
+def normalize_compound_timing(v: Any) -> str:
+    s = str(v).strip().lower()
+    if s in ("daily", "monthly", "none"):
+        return s
+    return "none"
+
+
 def dedup_line_ids(df: pd.DataFrame) -> List[str]:
     if df.empty or "Line_User_ID" not in df.columns:
         return []
@@ -147,13 +157,6 @@ def sheet_name(base: str, ns: str) -> str:
     return f"{base}__{ns}"
 
 
-def normalize_compound_timing(v: Any) -> str:
-    s = str(v).strip().lower()
-    if s in ("daily", "monthly", "none"):
-        return s
-    return "none"
-
-
 def get_line_token(ns: str) -> str:
     ns = str(ns or "").strip()
     line = st.secrets.get("line", {}) or {}
@@ -168,10 +171,13 @@ def get_line_token(ns: str) -> str:
     if legacy:
         return legacy
 
-    st.error("LINEトークンが未設定です。")
+    st.error("LINEトークンが未設定です。secretsの [line].tokens または channel_access_token を確認してください。")
     st.stop()
 
 
+# -----------------------------
+# LINE / ImgBB
+# -----------------------------
 def send_line_push(token: str, user_id: str, text: str, image_url: Optional[str] = None) -> int:
     if not user_id:
         return 400
@@ -219,6 +225,9 @@ def upload_imgbb(file_bytes: bytes) -> Optional[str]:
         return None
 
 
+# -----------------------------
+# Sheet headers
+# -----------------------------
 SETTINGS_HEADERS = ["Project_Name", "Net_Factor", "IsCompound", "Compound_Timing", "UpdatedAt_JST", "Active"]
 
 MEMBERS_HEADERS = [
@@ -249,6 +258,9 @@ LEDGER_HEADERS = [
 LINEUSERS_HEADERS = ["Date", "Time", "Type", "Line_User_ID", "Line_User"]
 
 
+# -----------------------------
+# Admin
+# -----------------------------
 @dataclass
 class AdminUser:
     name: str
@@ -282,7 +294,7 @@ def load_admin_users() -> List[AdminUser]:
 def require_admin_login_multi() -> None:
     admins = load_admin_users()
     if not admins:
-        st.error("Secrets に [admin].users または [admin].pin が未設定です。")
+        st.error("Secrets に [admin].users（推奨）または [admin].pin が未設定です。")
         st.stop()
 
     if st.session_state.get("admin_ok", False) and st.session_state.get("admin_namespace"):
@@ -320,6 +332,9 @@ def current_admin_label() -> str:
     return f"{name}（namespace: {ns}）"
 
 
+# -----------------------------
+# GSheets
+# -----------------------------
 @dataclass
 class GSheetsConfig:
     spreadsheet_id: str
@@ -415,6 +430,9 @@ class GSheets:
         st.cache_data.clear()
 
 
+# -----------------------------
+# Loaders / writers
+# -----------------------------
 def load_settings(gs: GSheets) -> pd.DataFrame:
     df = gs.read_df(gs.cfg.settings_sheet)
     if df.empty:
@@ -505,6 +523,12 @@ def active_projects(settings_df: pd.DataFrame) -> List[str]:
     return df["Project_Name"].dropna().astype(str).unique().tolist()
 
 
+def project_members_all(members_df: pd.DataFrame, project: str) -> pd.DataFrame:
+    if members_df.empty:
+        return members_df.copy()
+    return members_df[members_df["Project_Name"] == str(project)].copy().reset_index(drop=True)
+
+
 def project_members_active(members_df: pd.DataFrame, project: str) -> pd.DataFrame:
     if members_df.empty:
         return members_df.copy()
@@ -535,6 +559,9 @@ def validate_no_dup_lineid_within_project(members_df: pd.DataFrame, project: str
     return f"同一プロジェクト内で Line_User_ID が重複しています: {ids}"
 
 
+# -----------------------------
+# APR logic
+# -----------------------------
 def calc_project_apr(mem: pd.DataFrame, apr_percent: float, project_net_factor: float, project_name: str) -> pd.DataFrame:
     mem = mem.copy()
 
@@ -592,6 +619,7 @@ def apply_monthly_compound(gs: GSheets, members_df: pd.DataFrame, project: str) 
         ) & (
             members_df["PersonName"].astype(str).str.strip() == person
         )
+
         idxs = members_df[mask].index.tolist()
         if not idxs:
             continue
@@ -629,6 +657,9 @@ def apply_monthly_compound(gs: GSheets, members_df: pd.DataFrame, project: str) 
     return updated_count, total_added
 
 
+# -----------------------------
+# Dashboard
+# -----------------------------
 def ui_dashboard(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> None:
     st.subheader("📊 管理画面ダッシュボード")
 
@@ -652,7 +683,51 @@ def ui_dashboard(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFram
     with c2:
         st.metric("本日APR", fmt_usd(today_apr))
 
+    st.divider()
 
+    c3, c4 = st.columns(2)
+
+    with c3:
+        st.markdown("#### グループ別残高")
+        group_df = active_mem[active_mem["Project_Name"].astype(str).str.upper() != PERSONAL_PROJECT].copy() if not active_mem.empty else pd.DataFrame()
+        if group_df.empty:
+            st.info("グループデータがありません。")
+        else:
+            group_summary = (
+                group_df.groupby("Project_Name", as_index=False)
+                .agg(人数=("PersonName", "count"), 総残高=("Principal", "sum"))
+                .sort_values("総残高", ascending=False)
+            )
+            group_summary["総残高"] = group_summary["総残高"].apply(fmt_usd)
+            st.dataframe(group_summary, use_container_width=True, hide_index=True)
+
+    with c4:
+        st.markdown("#### 個人残高")
+        personal_df = active_mem[active_mem["Project_Name"].astype(str).str.upper() == PERSONAL_PROJECT].copy() if not active_mem.empty else pd.DataFrame()
+        if personal_df.empty:
+            st.info("PERSONAL データがありません。")
+        else:
+            p = personal_df[["PersonName", "Principal", "Rank", "LINE_DisplayName"]].copy()
+            p["Principal"] = p["Principal"].apply(fmt_usd)
+            st.dataframe(p, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    st.markdown("#### LINE通知履歴")
+    if ledger_df.empty:
+        st.info("通知履歴がありません。")
+    else:
+        hist = ledger_df.sort_values("Datetime_JST", ascending=False).copy()
+        show_cols = [c for c in ["Datetime_JST", "Project_Name", "PersonName", "Type", "Amount", "LINE_DisplayName", "Source", "Note"] if c in hist.columns]
+        hist = hist[show_cols].copy()
+        if "Amount" in hist.columns:
+            hist["Amount"] = hist["Amount"].apply(fmt_usd)
+        st.dataframe(hist.head(50), use_container_width=True, hide_index=True)
+
+
+# -----------------------------
+# APR
+# -----------------------------
 def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> None:
     st.subheader("📈 APR 確定")
     st.caption(f"{RANK_LABEL} / PERSONAL=個別計算 / GROUP=総額均等割 / 管理者: {current_admin_label()}")
@@ -763,17 +838,273 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
             st.rerun()
 
 
+# -----------------------------
+# Cash
+# -----------------------------
+def ui_cash(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> None:
+    st.subheader("💸 入金 / 出金（個別LINE通知）")
+
+    projects = active_projects(settings_df)
+    if not projects:
+        st.warning("有効なプロジェクトがありません。")
+        return
+
+    project = st.selectbox("プロジェクト", projects, key="cash_project")
+
+    mem = project_members_active(members_df, project)
+    if mem.empty:
+        st.warning("このプロジェクトに 🟢運用中 のメンバーがいません。")
+        return
+
+    person = st.selectbox("メンバー", mem["PersonName"].tolist())
+    row = mem[mem["PersonName"] == person].iloc[0]
+    current = float(row["Principal"])
+
+    typ = st.selectbox("種別", ["Deposit", "Withdraw"])
+    amt = st.number_input("金額", min_value=0.0, value=0.0, step=100.0)
+    note = st.text_input("メモ（任意）", value="")
+    uploaded = st.file_uploader("エビデンス画像（任意）", type=["png", "jpg", "jpeg"], key="cash_img")
+
+    if st.button("確定して保存＆個別にLINE通知"):
+        if amt <= 0:
+            st.warning("金額が0です。")
+            return
+        if typ == "Withdraw" and float(amt) > current:
+            st.error("出金額が現在残高を超えています。")
+            return
+
+        evidence_url = None
+        if uploaded:
+            evidence_url = upload_imgbb(uploaded.getvalue())
+            if not evidence_url:
+                st.error("画像アップロードに失敗しました。")
+                return
+
+        new_balance = current + float(amt) if typ == "Deposit" else current - float(amt)
+        ts = fmt_dt(now_jst())
+
+        for i in range(len(members_df)):
+            if members_df.loc[i, "Project_Name"] == str(project) and str(members_df.loc[i, "PersonName"]).strip() == str(person).strip():
+                members_df.loc[i, "Principal"] = float(new_balance)
+                members_df.loc[i, "UpdatedAt_JST"] = ts
+
+        gs.append_row(gs.cfg.ledger_sheet, [
+            ts, project, person, typ, float(amt), note, evidence_url or "",
+            row["Line_User_ID"], row["LINE_DisplayName"], "app"
+        ])
+        write_members(gs, members_df)
+
+        ns = str(st.session_state.get("admin_namespace", "")).strip() or "default"
+        token = get_line_token(ns)
+
+        msg = "💸【入出金通知】\n"
+        msg += f"プロジェクト: {project}\n"
+        msg += f"日時: {now_jst().strftime('%Y/%m/%d %H:%M')}\n"
+        msg += f"種別: {typ}\n"
+        msg += f"金額: {fmt_usd(float(amt))}\n"
+        msg += f"更新後残高: {fmt_usd(float(new_balance))}\n"
+
+        code = send_line_push(token, str(row["Line_User_ID"]).strip(), msg, evidence_url)
+
+        gs.clear_cache()
+        if code == 200:
+            st.success("保存＆送信完了")
+        else:
+            st.warning(f"保存は完了。LINE送信失敗（HTTP {code}）")
+        st.rerun()
+
+
+# -----------------------------
+# Admin
+# -----------------------------
+def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> pd.DataFrame:
+    st.subheader("⚙️ 管理")
+
+    projects = active_projects(settings_df)
+    if not projects:
+        st.warning("有効なプロジェクトがありません。")
+        return members_df
+
+    project = st.selectbox("対象プロジェクト", projects, key="admin_project")
+
+    line_users_df = load_line_users(gs)
+    line_users: List[Tuple[str, str, str]] = []
+    if not line_users_df.empty:
+        tmp = line_users_df.copy()
+        tmp = tmp[tmp["Line_User_ID"].astype(str).str.startswith("U")]
+        tmp = tmp.drop_duplicates(subset=["Line_User_ID"], keep="last")
+        for _, r in tmp.iterrows():
+            uid = str(r["Line_User_ID"]).strip()
+            name = str(r.get("Line_User", "")).strip()
+            label = f"{name} ({uid})" if name else uid
+            line_users.append((label, uid, name))
+
+    view_all = members_df[members_df["Project_Name"] == str(project)].copy()
+    view_all["_row_id"] = view_all.index
+
+    if not view_all.empty:
+        st.markdown("#### 現在のメンバー一覧")
+        show = view_all.copy()
+        show["Principal"] = show["Principal"].apply(fmt_usd)
+        show["状態"] = show["IsActive"].apply(bool_to_status)
+        show = show.drop(columns=["_row_id"], errors="ignore")
+        st.dataframe(show, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    if not view_all.empty:
+        st.markdown("#### 一括編集（保存ボタンで確定）")
+        edit_src = view_all.copy()
+        edit_src["状態"] = edit_src["IsActive"].apply(bool_to_status)
+
+        edit_show = edit_src[
+            ["PersonName", "Principal", "Rank", "状態", "Line_User_ID", "LINE_DisplayName"]
+        ].copy()
+
+        row_ids = edit_src["_row_id"].tolist()
+
+        edited = st.data_editor(
+            edit_show,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            column_config={
+                "Principal": st.column_config.NumberColumn("Principal", min_value=0.0, step=100.0),
+                "Rank": st.column_config.SelectboxColumn("Rank", options=["Master", "Elite"]),
+                "状態": st.column_config.SelectboxColumn("状態", options=[STATUS_ON, STATUS_OFF]),
+            },
+            key=f"members_editor_{project}",
+        )
+
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            save = st.button("編集内容を保存", use_container_width=True, key=f"save_members_{project}")
+        with c2:
+            cancel = st.button("編集を破棄（再読み込み）", use_container_width=True, key=f"cancel_members_{project}")
+
+        if cancel:
+            gs.clear_cache()
+            st.rerun()
+
+        if save:
+            ts = fmt_dt(now_jst())
+            edited = edited.copy()
+            edited["_row_id"] = row_ids
+
+            for _, r in edited.iterrows():
+                row_id = int(r["_row_id"])
+                members_df.loc[row_id, "Principal"] = float(to_f(r["Principal"]))
+                members_df.loc[row_id, "Rank"] = normalize_rank(r["Rank"])
+                members_df.loc[row_id, "IsActive"] = status_to_bool(r["状態"])
+                members_df.loc[row_id, "Line_User_ID"] = str(r["Line_User_ID"]).strip()
+                members_df.loc[row_id, "LINE_DisplayName"] = str(r["LINE_DisplayName"]).strip()
+                members_df.loc[row_id, "UpdatedAt_JST"] = ts
+
+            msg3 = validate_no_dup_lineid_within_project(members_df, project)
+            if msg3:
+                st.error(msg3)
+                return members_df
+
+            write_members(gs, members_df)
+            gs.clear_cache()
+            st.success("保存しました。")
+            st.rerun()
+
+    st.divider()
+
+    st.markdown("#### 追加（同一プロジェクト内で Line_User_ID が一致したら追加しない）")
+
+    add_mode = st.selectbox("追加先", ["個人(PERSONAL)", "プロジェクト"], key="member_add_mode")
+
+    all_projects = active_projects(settings_df)
+    if add_mode == "個人(PERSONAL)":
+        selected_project = PERSONAL_PROJECT
+        st.info("登録先: PERSONAL")
+    else:
+        project_candidates = [p for p in all_projects if str(p).strip().upper() != PERSONAL_PROJECT]
+        if not project_candidates:
+            st.warning("PERSONAL以外のプロジェクトがありません。")
+            return members_df
+        selected_project = st.selectbox("登録するプロジェクト", project_candidates, key="member_add_target_project")
+
+    if line_users:
+        labels = ["（選択しない）"] + [x[0] for x in line_users]
+        picked = st.selectbox("登録済みLINEユーザーから選択", labels, index=0)
+        if picked != "（選択しない）":
+            idx = labels.index(picked) - 1
+            _, uid, name = line_users[idx]
+            st.session_state["prefill_line_uid"] = uid
+            st.session_state["prefill_line_name"] = name
+
+    pre_uid = st.session_state.get("prefill_line_uid", "")
+    pre_name = st.session_state.get("prefill_line_name", "")
+
+    with st.form("member_add", clear_on_submit=False):
+        person = st.text_input("PersonName（個人名）")
+        principal = st.number_input("Principal（残高）", min_value=0.0, value=0.0, step=100.0)
+        line_uid = st.text_input("Line_User_ID（Uから始まる）", value=pre_uid)
+        line_disp = st.text_input("LINE_DisplayName（任意）", value=pre_name)
+        rank = st.selectbox("Rank", ["Master", "Elite"], index=0)
+        status = st.selectbox("ステータス", [STATUS_ON, STATUS_OFF], index=0)
+        submit = st.form_submit_button("保存（追加）")
+
+    if submit:
+        if not person or not line_uid:
+            st.error("PersonName と Line_User_ID は必須です。")
+            return members_df
+
+        exists = members_df[
+            (members_df["Project_Name"] == str(selected_project)) &
+            (members_df["Line_User_ID"].astype(str).str.strip() == str(line_uid).strip())
+        ]
+        if not exists.empty:
+            st.warning("このプロジェクト内に同じ Line_User_ID が既に存在します。")
+            return members_df
+
+        ts = fmt_dt(now_jst())
+        new_row = {
+            "Project_Name": str(selected_project).strip(),
+            "PersonName": str(person).strip(),
+            "Principal": float(principal),
+            "Line_User_ID": str(line_uid).strip(),
+            "LINE_DisplayName": str(line_disp).strip(),
+            "Rank": normalize_rank(rank),
+            "IsActive": status_to_bool(status),
+            "CreatedAt_JST": ts,
+            "UpdatedAt_JST": ts,
+        }
+        members_df = pd.concat([members_df, pd.DataFrame([new_row])], ignore_index=True)
+
+        msg4 = validate_no_dup_lineid_within_project(members_df, selected_project)
+        if msg4:
+            st.error(msg4)
+            return members_df
+
+        write_members(gs, members_df)
+        gs.clear_cache()
+        st.success(f"追加しました。登録先: {selected_project}")
+        st.rerun()
+
+    return members_df
+
+
+# -----------------------------
+# Help
+# -----------------------------
 def ui_help() -> None:
     st.subheader("❓ ヘルプ")
     st.markdown(
         """
 - `daily` → APR確定時に元本へ即時加算
 - `monthly` → Ledgerに記録のみ、ボタンで月次反映
-- `none` → 単利、元本は固定
+- `none` → 単利
 """
     )
 
 
+# -----------------------------
+# Main
+# -----------------------------
 def main():
     st.set_page_config(page_title="APR資産運用管理", layout="wide", page_icon="🏦")
     st.title("🏦 APR資産運用管理システム")
@@ -804,7 +1135,7 @@ def main():
     settings_df = load_settings(gs)
     members_df = load_members(gs)
 
-    menu = ["📊 ダッシュボード", "📈 APR", "❓ ヘルプ"]
+    menu = ["📊 ダッシュボード", "📈 APR", "💸 入金/出金", "⚙️ 管理", "❓ ヘルプ"]
     page = st.sidebar.radio(
         "メニュー",
         options=menu,
@@ -816,6 +1147,10 @@ def main():
         ui_dashboard(gs, settings_df, members_df)
     elif page == "📈 APR":
         ui_apr(gs, settings_df, members_df)
+    elif page == "💸 入金/出金":
+        ui_cash(gs, settings_df, members_df)
+    elif page == "⚙️ 管理":
+        ui_admin(gs, settings_df, members_df)
     else:
         ui_help()
 
