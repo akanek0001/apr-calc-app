@@ -122,6 +122,17 @@ def normalize_compound_timing(v: Any) -> str:
     return "none"
 
 
+def compound_label(v: str) -> str:
+    v = str(v).strip().lower()
+    if v == "daily":
+        return "日次複利"
+    if v == "monthly":
+        return "月次複利"
+    if v == "none":
+        return "単利"
+    return v
+
+
 def dedup_line_ids(df: pd.DataFrame) -> List[str]:
     if df.empty or "Line_User_ID" not in df.columns:
         return []
@@ -276,7 +287,7 @@ def build_apr_personal_message(
     msg += f"APR要素: {apr1:.4f}% / {apr2:.4f}% / {apr3:.4f}% / {apr4:.4f}% / {apr5:.4f}%\n"
     msg += f"最終APR: {apr:.4f}%\n"
     msg += f"本日配当: {fmt_usd(float(daily_apr))}\n"
-    msg += f"Compound_Timing: {compound_timing}\n"
+    msg += f"複利タイプ: {compound_label(compound_timing)}\n"
     return msg
 
 
@@ -883,7 +894,7 @@ def apply_monthly_compound(gs: GSheets, members_df: pd.DataFrame, project: str) 
 # -----------------------------
 def ui_dashboard(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> None:
     st.subheader("📊 管理画面ダッシュボード")
-    st.caption("総資産 / 本日APR / グループ別残高 / 個人残高 / LINE通知履歴")
+    st.caption("総資産 / 本日APR / グループ別残高 / 個人残高 / 個人別累計APR / LINE通知履歴")
 
     ledger_df = load_ledger(gs)
 
@@ -897,7 +908,7 @@ def ui_dashboard(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFram
     today_apr = 0.0
     if not ledger_df.empty and "Datetime_JST" in ledger_df.columns:
         today_rows = ledger_df[ledger_df["Datetime_JST"].astype(str).str.startswith(today_prefix)].copy()
-        today_apr = float(today_rows[today_rows["Type"] == "APR"]["Amount"].sum())
+        today_apr = float(today_rows[today_rows["Type"].astype(str).str.strip() == "APR"]["Amount"].sum())
 
     c1, c2 = st.columns(2)
     with c1:
@@ -949,6 +960,51 @@ def ui_dashboard(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFram
             p = p[["PersonName", "Principal", "資産割合", "LINE_DisplayName"]]
 
             st.dataframe(p, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    st.markdown("#### 個人別 累計APR")
+    if ledger_df.empty:
+        st.info("APR履歴がありません。")
+    else:
+        apr_hist = ledger_df[ledger_df["Type"].astype(str).str.strip() == "APR"].copy()
+
+        if apr_hist.empty:
+            st.info("APR履歴がありません。")
+        else:
+            apr_hist["PersonName"] = apr_hist["PersonName"].astype(str).str.strip()
+            apr_hist["LINE_DisplayName"] = apr_hist["LINE_DisplayName"].astype(str).str.strip()
+            apr_hist["Amount"] = apr_hist["Amount"].apply(to_f)
+
+            apr_summary = (
+                apr_hist.groupby("PersonName", as_index=False)
+                .agg(
+                    累計APR=("Amount", "sum"),
+                    件数=("Amount", "count")
+                )
+            )
+
+            disp_map = (
+                apr_hist.sort_values("Datetime_JST", ascending=False)
+                .drop_duplicates(subset=["PersonName"])
+                [["PersonName", "LINE_DisplayName"]]
+                .copy()
+            )
+
+            apr_summary = apr_summary.merge(disp_map, on="PersonName", how="left")
+
+            if total_assets > 0:
+                apr_summary["総資産比"] = apr_summary["累計APR"].apply(lambda x: f"{(float(x) / total_assets) * 100:.2f}%")
+            else:
+                apr_summary["総資産比"] = "0.00%"
+
+            apr_summary["累計APR_num"] = apr_summary["累計APR"].astype(float)
+            apr_summary["累計APR"] = apr_summary["累計APR"].apply(fmt_usd)
+
+            apr_summary = apr_summary.sort_values("累計APR_num", ascending=False).copy()
+            apr_summary = apr_summary[["PersonName", "累計APR", "件数", "総資産比", "LINE_DisplayName"]]
+
+            st.dataframe(apr_summary, use_container_width=True, hide_index=True)
 
     st.divider()
 
@@ -1042,7 +1098,7 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
     st.write(f"- 総元本: {fmt_usd(total_principal)}")
     st.write(f"- 人数: {n_total}")
     st.write(f"- 本日総配当: {fmt_usd(total_reward)}")
-    st.write(f"- Compound_Timing: {compound_timing}")
+    st.write(f"- 複利タイプ: {compound_label(compound_timing)}")
 
     with st.expander("個人別の本日配当（確認）", expanded=False):
         show = mem[[
@@ -1054,7 +1110,7 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
             "LINE_DisplayName",
         ]].copy()
 
-        show["Compound_Timing"] = compound_timing
+        show["Compound_Timing"] = compound_label(compound_timing)
         show["Principal"] = show["Principal"].apply(fmt_usd)
         show["DailyAPR"] = show["DailyAPR"].apply(fmt_usd)
 
@@ -1071,11 +1127,11 @@ def ui_apr(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> 
         st.dataframe(show, use_container_width=True, hide_index=True)
 
         if compound_timing == "monthly":
-            st.info("このプロジェクトは monthly 設定です。APR確定時は Ledger に記録のみ行い、元本反映は下の「未反映APRを元本へ反映」で実行します。")
+            st.info("このプロジェクトは月次複利です。APR確定時は Ledger に記録のみ行い、元本反映は下の「未反映APRを元本へ反映」で実行します。")
         elif compound_timing == "daily":
-            st.info("このプロジェクトは daily 設定です。APR確定時に本日配当が元本へ即時加算されます。")
+            st.info("このプロジェクトは日次複利です。APR確定時に本日配当が元本へ即時加算されます。")
         else:
-            st.info("このプロジェクトは none 設定です。単利のため元本には加算されません。")
+            st.info("このプロジェクトは単利です。元本には加算されません。")
 
     if st.button("APRを確定して全員にLINE送信"):
         try:
