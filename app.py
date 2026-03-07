@@ -557,34 +557,140 @@ class GSheets:
 def load_settings(gs: GSheets) -> pd.DataFrame:
     df = gs.read_df(gs.cfg.settings_sheet)
     if df.empty:
-        return df
+        return pd.DataFrame(columns=SETTINGS_HEADERS)
 
-    if "Project_Name" not in df.columns:
-        st.error(f"Settingsシート({gs.cfg.settings_sheet})に Project_Name 列がありません。")
-        st.stop()
+    df = clean_cols(df)
+
+    for c in SETTINGS_HEADERS:
+        if c not in df.columns:
+            df[c] = ""
+
+    df = df[SETTINGS_HEADERS].copy()
 
     df["Project_Name"] = df["Project_Name"].astype(str).str.strip()
+    df = df[df["Project_Name"] != ""].copy()
 
-    if "Net_Factor" not in df.columns:
-        df["Net_Factor"] = 0.67
     df["Net_Factor"] = df["Net_Factor"].apply(lambda x: to_f(x) if str(x).strip() else 0.67)
+    df.loc[df["Net_Factor"] <= 0, "Net_Factor"] = 0.67
 
-    if "IsCompound" not in df.columns:
-        df["IsCompound"] = "FALSE"
     df["IsCompound"] = df["IsCompound"].apply(truthy)
-
-    if "Compound_Timing" not in df.columns:
-        df["Compound_Timing"] = "none"
     df["Compound_Timing"] = df["Compound_Timing"].apply(normalize_compound_timing)
+    df["Active"] = df["Active"].apply(lambda x: truthy(x) if str(x).strip() else True)
+    df["UpdatedAt_JST"] = df["UpdatedAt_JST"].astype(str).str.strip()
 
-    if "Active" not in df.columns:
-        df["Active"] = "TRUE"
-    df["Active"] = df["Active"].apply(truthy)
+    personal_df = df[df["Project_Name"].str.upper() == PERSONAL_PROJECT].copy()
+    other_df = df[df["Project_Name"].str.upper() != PERSONAL_PROJECT].copy()
 
-    if "UpdatedAt_JST" not in df.columns:
-        df["UpdatedAt_JST"] = ""
+    if not personal_df.empty:
+        personal_df = personal_df.tail(1).copy()
+
+    if not other_df.empty:
+        other_df = other_df.drop_duplicates(subset=["Project_Name"], keep="last")
+
+    df = pd.concat([personal_df, other_df], ignore_index=True)
+
+    if PERSONAL_PROJECT not in df["Project_Name"].astype(str).tolist():
+        df = pd.concat([
+            pd.DataFrame([{
+                "Project_Name": PERSONAL_PROJECT,
+                "Net_Factor": 0.67,
+                "IsCompound": True,
+                "Compound_Timing": "daily",
+                "UpdatedAt_JST": fmt_dt(now_jst()),
+                "Active": True,
+            }]),
+            df
+        ], ignore_index=True)
 
     return df
+
+
+def write_settings(gs: GSheets, settings_df: pd.DataFrame) -> None:
+    out = settings_df.copy()
+
+    for c in SETTINGS_HEADERS:
+        if c not in out.columns:
+            out[c] = ""
+
+    out = out[SETTINGS_HEADERS].copy()
+
+    out["Project_Name"] = out["Project_Name"].astype(str).str.strip()
+    out = out[out["Project_Name"] != ""].copy()
+
+    out["Net_Factor"] = out["Net_Factor"].apply(lambda x: f"{float(to_f(x)):.2f}")
+    out["IsCompound"] = out["IsCompound"].apply(lambda x: "TRUE" if truthy(x) else "FALSE")
+    out["Compound_Timing"] = out["Compound_Timing"].apply(normalize_compound_timing)
+    out["Active"] = out["Active"].apply(lambda x: "TRUE" if truthy(x) else "FALSE")
+    out["UpdatedAt_JST"] = out["UpdatedAt_JST"].astype(str)
+
+    gs.write_df(gs.cfg.settings_sheet, out)
+
+
+def repair_settings_if_needed(gs: GSheets, settings_df: pd.DataFrame) -> pd.DataFrame:
+    repaired = settings_df.copy()
+
+    before_count = len(repaired)
+
+    repaired["Project_Name"] = repaired["Project_Name"].astype(str).str.strip()
+    repaired = repaired[repaired["Project_Name"] != ""].copy()
+
+    personal_df = repaired[repaired["Project_Name"].str.upper() == PERSONAL_PROJECT].copy()
+    other_df = repaired[repaired["Project_Name"].str.upper() != PERSONAL_PROJECT].copy()
+
+    if not personal_df.empty:
+        personal_df = personal_df.tail(1).copy()
+
+    if not other_df.empty:
+        other_df = other_df.drop_duplicates(subset=["Project_Name"], keep="last")
+
+    repaired = pd.concat([personal_df, other_df], ignore_index=True)
+
+    repaired["Net_Factor"] = repaired["Net_Factor"].apply(lambda x: to_f(x) if str(x).strip() else 0.67)
+    repaired.loc[repaired["Net_Factor"] <= 0, "Net_Factor"] = 0.67
+
+    repaired["IsCompound"] = repaired["IsCompound"].apply(truthy)
+    repaired["Compound_Timing"] = repaired["Compound_Timing"].apply(normalize_compound_timing)
+    repaired["Active"] = repaired["Active"].apply(lambda x: truthy(x) if str(x).strip() else True)
+
+    if "UpdatedAt_JST" not in repaired.columns:
+        repaired["UpdatedAt_JST"] = ""
+    repaired["UpdatedAt_JST"] = repaired["UpdatedAt_JST"].astype(str)
+
+    if PERSONAL_PROJECT not in repaired["Project_Name"].astype(str).tolist():
+        repaired = pd.concat([
+            pd.DataFrame([{
+                "Project_Name": PERSONAL_PROJECT,
+                "Net_Factor": 0.67,
+                "IsCompound": True,
+                "Compound_Timing": "daily",
+                "UpdatedAt_JST": fmt_dt(now_jst()),
+                "Active": True,
+            }]),
+            repaired
+        ], ignore_index=True)
+
+    need_write = False
+
+    if len(repaired) != before_count:
+        need_write = True
+
+    if settings_df.empty and not repaired.empty:
+        need_write = True
+
+    try:
+        a = repaired[SETTINGS_HEADERS].astype(str).reset_index(drop=True)
+        b = settings_df[SETTINGS_HEADERS].astype(str).reset_index(drop=True)
+        if not a.equals(b):
+            need_write = True
+    except Exception:
+        need_write = True
+
+    if need_write:
+        write_settings(gs, repaired)
+        gs.clear_cache()
+        repaired = load_settings(gs)
+
+    return repaired
 
 
 def load_members(gs: GSheets) -> pd.DataFrame:
@@ -1205,6 +1311,17 @@ def ui_cash(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) ->
 def ui_admin(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> pd.DataFrame:
     st.subheader("⚙️ 管理")
 
+    cfix1, cfix2 = st.columns([1, 2])
+    with cfix1:
+        if st.button("Settingsを自動修復", use_container_width=True):
+            try:
+                fixed = load_settings(gs)
+                fixed = repair_settings_if_needed(gs, fixed)
+                st.success(f"{gs.cfg.settings_sheet} を修復しました。")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Settings修復でエラー: {e}")
+
     projects = active_projects(settings_df)
     if not projects:
         st.warning("有効なプロジェクトがありません。")
@@ -1643,50 +1760,33 @@ LINEユーザー情報を `LineUsers` シートへ自動登録し、管理画面
             """
 ### APR画面にプロジェクトが出ない
 - `Settings__A` など対象シートの `Active` が `TRUE` になっているか確認
-- `TREU` / `TERU` は `FALSE` 扱いになるため不可
 - `Project_Name` が空欄でないか確認
+- Settingsが壊れている場合は管理画面の `Settingsを自動修復` を押してください
 
 ### LINEが送れない
 - `Members` の `Line_User_ID` が本物のIDか確認
 - `U` だけ、`Uxxxxxxxx` のような仮値では送れません
 - namespaceに対応する LINE token が secrets に入っているか確認
 
-### 一括編集が反映されない
-- 編集後に「編集内容を保存」を押しているか確認
-- `Members__A` など対象シートに編集権限があるか確認
-
 ### monthly なのに元本が増えない
 - monthly は APR確定だけでは元本へ反映しません
 - APR画面の「未反映APRを元本へ反映」を実行してください
-
-### シートの列名が読まれない
-- 列名は完全一致が必要
-- 余分なスペースや似た名前に注意
-
-### 最終APRが想定と違う
-- この版では `APR要素1〜5` を単純合算します
-- 平均や加重平均ではありません
 
 ### Ledger / LINE通知履歴に出ない
 - APR確定時は `Type=APR` が先に Ledger に記録されます
 - その後、LINE送信結果が `Type=LINE` で Ledger に記録されます
 - ダッシュボードの「LINE通知履歴」は Ledger の `Type=LINE` を表示しています
-- まず現在の管理者namespaceに対応する `Ledger__A` など正しいシートを見ているか確認してください
+- 現在の管理者namespaceに対応する `Ledger__A` など正しいシートを確認してください
+
+### Settingsが壊れている
+- `PERSONAL` が複数行ある
+- `Net_Factor` が空
+- `Compound_Timing` の列ズレ
+- これらは管理画面の `Settingsを自動修復` で補正されます
 
 ### 429 Quota exceeded が出る
 - 1〜2分待ってから再読み込みしてください
 - 連続リロードはさらに悪化します
-- このコードでは読取キャッシュを長くし、見出し確認を同一セッション中1回だけにしています
-"""
-        )
-
-    with st.expander("6. 運用のおすすめ", expanded=False):
-        st.markdown(
-            """
-- `PERSONAL` → `daily` または `none`
-- グループ案件 → `monthly`
-
-この設定にすると、個人案件は日次で追いやすく、グループ案件は月次締めで管理しやすくなります。
 """
         )
 
@@ -1746,6 +1846,7 @@ def main():
         st.stop()
 
     settings_df = load_settings(gs)
+    settings_df = repair_settings_if_needed(gs, settings_df)
     members_df = load_members(gs)
 
     menu = ["📊 ダッシュボード", "📈 APR", "💸 入金/出金", "⚙️ 管理", "❓ ヘルプ"]
