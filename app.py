@@ -1,3 +1,6 @@
+#ヘルプページ変更前
+
+
 from __future__ import annotations
 
 from dataclasses import dataclass
