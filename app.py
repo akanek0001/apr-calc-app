@@ -7,7 +7,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Set, Tuple
-import json, re
+import json
+import re
 
 import pandas as pd
 import requests
@@ -38,7 +39,13 @@ class AppConfig:
     TYPE = {"APR": "APR", "LINE": "LINE", "DEPOSIT": "Deposit", "WITHDRAW": "Withdraw"}
     SOURCE = {"APP": "app"}
 
-    SHEET = {"SETTINGS": "Settings", "MEMBERS": "Members", "LEDGER": "Ledger", "LINEUSERS": "LineUsers", "APR_SUMMARY": "APR_Summary"}
+    SHEET = {
+        "SETTINGS": "Settings",
+        "MEMBERS": "Members",
+        "LEDGER": "Ledger",
+        "LINEUSERS": "LineUsers",
+        "APR_SUMMARY": "APR_Summary",
+    }
 
     HEADERS = {
         "SETTINGS": ["Project_Name", "Net_Factor", "IsCompound", "Compound_Timing", "UpdatedAt_JST", "Active"],
@@ -48,8 +55,22 @@ class AppConfig:
         "APR_SUMMARY": ["Date_JST", "PersonName", "Total_APR", "APR_Count", "Asset_Ratio", "LINE_DisplayName"],
     }
 
-    PAGE = {"DASHBOARD": "📊 ダッシュボード", "APR": "📈 APR", "CASH": "💸 入金/出金", "ADMIN": "⚙️ 管理", "HELP": "❓ ヘルプ"}
-    SESSION_KEYS = {"SETTINGS": "settings_df", "MEMBERS": "members_df", "LEDGER": "ledger_df", "LINEUSERS": "line_users_df", "APR_SUMMARY": "apr_summary_df"}
+    PAGE = {
+        "DASHBOARD": "📊 ダッシュボード",
+        "APR": "📈 APR",
+        "CASH": "💸 入金/出金",
+        "ADMIN": "⚙️ 管理",
+        "HELP": "❓ ヘルプ",
+    }
+
+    SESSION_KEYS = {
+        "SETTINGS": "settings_df",
+        "MEMBERS": "members_df",
+        "LEDGER": "ledger_df",
+        "LINEUSERS": "line_users_df",
+        "APR_SUMMARY": "apr_summary_df",
+    }
+
     APR_LINE_NOTE_KEYWORD = "APR:"
 
 
@@ -84,7 +105,11 @@ class U:
     @staticmethod
     def to_num_series(s: pd.Series, default: float = 0.0) -> pd.Series:
         out = pd.to_numeric(
-            s.astype(str).str.replace(",", "", regex=False).str.replace("$", "", regex=False).str.replace("%", "", regex=False).str.strip(),
+            s.astype(str)
+            .str.replace(",", "", regex=False)
+            .str.replace("$", "", regex=False)
+            .str.replace("%", "", regex=False)
+            .str.strip(),
             errors="coerce",
         )
         return out.fillna(default)
@@ -171,46 +196,101 @@ class U:
             return 0.0
 
     @staticmethod
-    def preprocess_ocr_image(file_bytes: bytes) -> bytes:
+    def preprocess_ocr_image(file_bytes: bytes) -> List[bytes]:
+        outputs: List[bytes] = []
         try:
-            img = Image.open(BytesIO(file_bytes)).convert("L")
-            img = ImageOps.autocontrast(img)
-            img = ImageEnhance.Contrast(img).enhance(2.2)
-            w, h = img.size
-            img = img.resize((max(1, w * 2), max(1, h * 2)))
-            img = img.filter(ImageFilter.SHARPEN)
-            img = img.point(lambda x: 255 if x > 160 else 0)
-            buf = BytesIO()
-            img.save(buf, format="PNG")
-            return buf.getvalue()
+            base = Image.open(BytesIO(file_bytes)).convert("L")
+            variants: List[Image.Image] = []
+
+            img1 = ImageOps.autocontrast(base)
+            img1 = ImageEnhance.Contrast(img1).enhance(2.5)
+            img1 = ImageEnhance.Sharpness(img1).enhance(2.0)
+            img1 = img1.resize((base.width * 2, base.height * 2))
+            variants.append(img1)
+
+            img2 = ImageOps.autocontrast(base)
+            img2 = ImageEnhance.Contrast(img2).enhance(3.0)
+            img2 = img2.resize((base.width * 3, base.height * 3))
+            img2 = img2.point(lambda x: 255 if x > 170 else 0)
+            variants.append(img2)
+
+            img3 = ImageOps.autocontrast(base)
+            img3 = ImageEnhance.Contrast(img3).enhance(2.8)
+            img3 = img3.resize((base.width * 3, base.height * 3))
+            img3 = img3.point(lambda x: 255 if x > 145 else 0)
+            variants.append(img3)
+
+            img4 = ImageOps.autocontrast(base)
+            img4 = img4.filter(ImageFilter.MedianFilter(size=3))
+            img4 = ImageEnhance.Contrast(img4).enhance(2.2)
+            img4 = ImageEnhance.Sharpness(img4).enhance(3.0)
+            img4 = img4.resize((base.width * 2, base.height * 2))
+            variants.append(img4)
+
+            for img in variants:
+                buf = BytesIO()
+                img.save(buf, format="PNG")
+                outputs.append(buf.getvalue())
         except Exception:
-            return file_bytes
+            return [file_bytes]
+
+        return outputs if outputs else [file_bytes]
 
     @staticmethod
     def extract_percent_candidates(text: str) -> List[float]:
         if not text:
             return []
-        norm = str(text).replace("％", "%").replace("O", "0").replace("o", "0").replace("I", "1").replace("l", "1")
-        norm = re.sub(r"[,\u3000]+", " ", norm)
+
+        norm = str(text)
+        replace_map = {
+            "％": "%",
+            "O": "0",
+            "o": "0",
+            "Q": "0",
+            "I": "1",
+            "l": "1",
+            "|": "1",
+            "S": "5",
+            "s": "5",
+            ",": ".",
+        }
+        for k, v in replace_map.items():
+            norm = norm.replace(k, v)
+
+        norm = re.sub(r"[ \t\u3000]+", " ", norm)
+
         patterns = [
             r"(?i)apr\s*[:：]?\s*(\d+(?:\.\d+)?)\s*%",
             r"(?i)apr\s*[:：]?\s*(\d+(?:\.\d+)?)",
+            r"(?i)apy\s*[:：]?\s*(\d+(?:\.\d+)?)\s*%",
+            r"(?i)rate\s*[:：]?\s*(\d+(?:\.\d+)?)\s*%",
             r"(\d+(?:\.\d+)?)\s*%",
-            r"(\d+(?:\.\d+)?)\s*[\r\n]+\s*%",
+            r"(\d{1,3}\.\d{1,4})",
         ]
-        vals, seen = [], set()
+
+        vals: List[float] = []
+        seen = set()
+
         for pat in patterns:
             for v in re.findall(pat, norm):
                 try:
                     f = float(v)
-                    if 0 <= f <= 500:
+                    if 0 <= f <= 300:
                         key = round(f, 6)
                         if key not in seen:
                             seen.add(key)
                             vals.append(f)
                 except Exception:
                     pass
-        vals.sort(reverse=True)
+
+        def score(x: float) -> tuple:
+            if 1 <= x <= 50:
+                return (0, abs(x - 10))
+            if 50 < x <= 120:
+                return (1, abs(x - 60))
+            return (2, x)
+
+        vals = sorted(vals, key=score)
         return vals
 
 
@@ -239,6 +319,7 @@ class AdminAuth:
                     out.append(AdminUser(name=name, pin=pin, namespace=ns))
             if out:
                 return out
+
         pin = str(admin.get("pin", "")).strip() or str(admin.get("password", "")).strip()
         return [AdminUser(name="Admin", pin=pin, namespace="default")] if pin else []
 
@@ -312,11 +393,13 @@ class ExternalService:
     def send_line_push(token: str, user_id: str, text: str, image_url: Optional[str] = None) -> int:
         if not user_id:
             return 400
+
         url = "https://api.line.me/v2/bot/message/push"
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
         messages = [{"type": "text", "text": text}]
         if image_url:
             messages.append({"type": "image", "originalContentUrl": image_url, "previewImageUrl": image_url})
+
         try:
             r = requests.post(url, headers=headers, data=json.dumps({"to": str(user_id), "messages": messages}), timeout=25)
             return r.status_code
@@ -329,6 +412,7 @@ class ExternalService:
             key = st.secrets["imgbb"]["api_key"]
         except Exception:
             return None
+
         try:
             res = requests.post("https://api.imgbb.com/1/upload", params={"key": key}, files={"image": file_bytes}, timeout=30)
             return res.json()["data"]["url"]
@@ -341,28 +425,46 @@ class ExternalService:
             api_key = st.secrets["ocrspace"]["api_key"]
         except Exception:
             return ""
+
+        texts: List[str] = []
+
         try:
-            processed = U.preprocess_ocr_image(file_bytes)
-            texts: List[str] = []
-            for target_name, target_bytes in [("processed.png", processed), ("original.png", file_bytes)]:
-                res = requests.post(
-                    "https://api.ocr.space/parse/image",
-                    files={"filename": (target_name, target_bytes)},
-                    data={"apikey": api_key, "language": "eng", "isOverlayRequired": False, "OCREngine": 2, "scale": True, "detectOrientation": True},
-                    timeout=60,
-                )
-                data = res.json()
-                for p in data.get("ParsedResults", []):
-                    txt = str(p.get("ParsedText", "")).strip()
-                    if txt:
-                        texts.append(txt)
+            processed_list = U.preprocess_ocr_image(file_bytes)
+            targets = [("original.png", file_bytes)] + [(f"processed_{i}.png", b) for i, b in enumerate(processed_list, start=1)]
+
+            for target_name, target_bytes in targets:
+                for engine in (2, 1):
+                    try:
+                        res = requests.post(
+                            "https://api.ocr.space/parse/image",
+                            files={"filename": (target_name, target_bytes)},
+                            data={
+                                "apikey": api_key,
+                                "language": "eng",
+                                "isOverlayRequired": False,
+                                "OCREngine": engine,
+                                "scale": True,
+                                "detectOrientation": True,
+                                "isTable": False,
+                            },
+                            timeout=60,
+                        )
+                        data = res.json()
+                        for p in data.get("ParsedResults", []):
+                            txt = str(p.get("ParsedText", "")).strip()
+                            if txt:
+                                texts.append(txt)
+                    except Exception:
+                        continue
+
             uniq, seen = [], set()
             for t in texts:
                 key = t.strip()
                 if key and key not in seen:
                     seen.add(key)
                     uniq.append(key)
-            return "\n".join(uniq)
+
+            return "\n\n".join(uniq)
         except Exception:
             return ""
 
@@ -427,13 +529,16 @@ class GSheetService:
             ws = self.book.add_worksheet(title=name, rows=3000, cols=max(30, len(headers) + 10))
             ws.append_row(headers, value_input_option="USER_ENTERED")
             return
+
         try:
             first = ws.row_values(1)
         except APIError:
             return
+
         if not first:
             ws.append_row(headers, value_input_option="USER_ENTERED")
             return
+
         colset = [str(c).strip() for c in first if str(c).strip()]
         missing = [h for h in headers if h not in colset]
         if missing:
@@ -447,8 +552,10 @@ class GSheetService:
             raise RuntimeError(f"Google Sheets 読み取りエラー: {_self.actual_name(key)} を取得できません。") from e
         except Exception as e:
             raise RuntimeError(f"{_self.actual_name(key)} の読み取り中にエラーが発生しました: {e}") from e
+
         if not values:
             return pd.DataFrame()
+
         return U.clean_cols(pd.DataFrame(values[1:], columns=values[0]))
 
     def write_df(self, key: str, df: pd.DataFrame) -> None:
@@ -485,6 +592,7 @@ class Repository:
         except Exception as e:
             st.error(str(e))
             return pd.DataFrame(columns=AppConfig.HEADERS["SETTINGS"])
+
         if df.empty:
             return pd.DataFrame(columns=AppConfig.HEADERS["SETTINGS"])
 
@@ -507,14 +615,24 @@ class Repository:
         out = pd.concat([personal_df, other_df], ignore_index=True)
 
         if AppConfig.PROJECT["PERSONAL"] not in out["Project_Name"].astype(str).tolist():
-            out = pd.concat([pd.DataFrame([{
-                "Project_Name": AppConfig.PROJECT["PERSONAL"],
-                "Net_Factor": AppConfig.FACTOR["MASTER"],
-                "IsCompound": True,
-                "Compound_Timing": AppConfig.COMPOUND["DAILY"],
-                "UpdatedAt_JST": U.fmt_dt(U.now_jst()),
-                "Active": True,
-            }]), out], ignore_index=True)
+            out = pd.concat(
+                [
+                    pd.DataFrame(
+                        [
+                            {
+                                "Project_Name": AppConfig.PROJECT["PERSONAL"],
+                                "Net_Factor": AppConfig.FACTOR["MASTER"],
+                                "IsCompound": True,
+                                "Compound_Timing": AppConfig.COMPOUND["DAILY"],
+                                "UpdatedAt_JST": U.fmt_dt(U.now_jst()),
+                                "Active": True,
+                            }
+                        ]
+                    ),
+                    out,
+                ],
+                ignore_index=True,
+            )
 
         return out
 
@@ -559,14 +677,24 @@ class Repository:
         repaired["UpdatedAt_JST"] = repaired["UpdatedAt_JST"].astype(str) if "UpdatedAt_JST" in repaired.columns else ""
 
         if AppConfig.PROJECT["PERSONAL"] not in repaired["Project_Name"].astype(str).tolist():
-            repaired = pd.concat([pd.DataFrame([{
-                "Project_Name": AppConfig.PROJECT["PERSONAL"],
-                "Net_Factor": AppConfig.FACTOR["MASTER"],
-                "IsCompound": True,
-                "Compound_Timing": AppConfig.COMPOUND["DAILY"],
-                "UpdatedAt_JST": U.fmt_dt(U.now_jst()),
-                "Active": True,
-            }]), repaired], ignore_index=True)
+            repaired = pd.concat(
+                [
+                    pd.DataFrame(
+                        [
+                            {
+                                "Project_Name": AppConfig.PROJECT["PERSONAL"],
+                                "Net_Factor": AppConfig.FACTOR["MASTER"],
+                                "IsCompound": True,
+                                "Compound_Timing": AppConfig.COMPOUND["DAILY"],
+                                "UpdatedAt_JST": U.fmt_dt(U.now_jst()),
+                                "Active": True,
+                            }
+                        ]
+                    ),
+                    repaired,
+                ],
+                ignore_index=True,
+            )
 
         need_write = len(repaired) != before_count or settings_df.empty
         try:
@@ -590,6 +718,7 @@ class Repository:
         except Exception as e:
             st.error(str(e))
             return pd.DataFrame(columns=AppConfig.HEADERS["MEMBERS"])
+
         if df.empty:
             return pd.DataFrame(columns=AppConfig.HEADERS["MEMBERS"])
 
@@ -619,8 +748,10 @@ class Repository:
         except Exception as e:
             st.error(str(e))
             return pd.DataFrame(columns=AppConfig.HEADERS["LEDGER"])
+
         if df.empty:
             return pd.DataFrame(columns=AppConfig.HEADERS["LEDGER"])
+
         for c in AppConfig.HEADERS["LEDGER"]:
             if c not in df.columns:
                 df[c] = ""
@@ -633,6 +764,7 @@ class Repository:
         except Exception as e:
             st.error(str(e))
             return pd.DataFrame(columns=AppConfig.HEADERS["LINEUSERS"])
+
         if df.empty:
             return pd.DataFrame(columns=AppConfig.HEADERS["LINEUSERS"])
 
@@ -640,6 +772,7 @@ class Repository:
             df = df.rename(columns={"LineID": "Line_User_ID"})
         if "Line_User" not in df.columns and "LINE_DisplayName" in df.columns:
             df = df.rename(columns={"LINE_DisplayName": "Line_User"})
+
         if "Line_User_ID" not in df.columns:
             df["Line_User_ID"] = ""
         if "Line_User" not in df.columns:
@@ -661,14 +794,29 @@ class Repository:
         out["LINE_DisplayName"] = out["LINE_DisplayName"].astype(str)
         self.gs.write_df("APR_SUMMARY", out)
 
-    def append_ledger(self, dt_jst: str, project: str, person_name: str, typ: str, amount: float, note: str, evidence_url: str = "", line_user_id: str = "", line_display_name: str = "", source: str = AppConfig.SOURCE["APP"]) -> None:
+    def append_ledger(
+        self,
+        dt_jst: str,
+        project: str,
+        person_name: str,
+        typ: str,
+        amount: float,
+        note: str,
+        evidence_url: str = "",
+        line_user_id: str = "",
+        line_display_name: str = "",
+        source: str = AppConfig.SOURCE["APP"],
+    ) -> None:
         if not str(project).strip():
             raise ValueError("project が空です")
         if not str(person_name).strip():
             raise ValueError("person_name が空です")
         if not str(typ).strip():
             raise ValueError("typ が空です")
-        self.gs.append_row("LEDGER", [dt_jst, project, person_name, typ, float(amount), note, evidence_url or "", line_user_id or "", line_display_name or "", source])
+        self.gs.append_row(
+            "LEDGER",
+            [dt_jst, project, person_name, typ, float(amount), note, evidence_url or "", line_user_id or "", line_display_name or "", source],
+        )
 
     def active_projects(self, settings_df: pd.DataFrame) -> List[str]:
         if settings_df.empty:
@@ -694,8 +842,8 @@ class Repository:
         if ledger_df.empty:
             return set()
         df = ledger_df[
-            (ledger_df["Type"].astype(str).str.strip() == AppConfig.TYPE["APR"]) &
-            (ledger_df["Datetime_JST"].astype(str).str.startswith(date_jst))
+            (ledger_df["Type"].astype(str).str.strip() == AppConfig.TYPE["APR"])
+            & (ledger_df["Datetime_JST"].astype(str).str.startswith(date_jst))
         ].copy()
         if df.empty:
             return set()
@@ -715,12 +863,22 @@ class Repository:
         if any(c not in headers for c in need_cols):
             return 0, 0
 
-        idx_dt, idx_project, idx_type, idx_note = headers.index("Datetime_JST"), headers.index("Project_Name"), headers.index("Type"), headers.index("Note")
+        idx_dt, idx_project, idx_type, idx_note = (
+            headers.index("Datetime_JST"),
+            headers.index("Project_Name"),
+            headers.index("Type"),
+            headers.index("Note"),
+        )
         kept_rows, deleted_apr, deleted_line = [headers], 0, 0
 
         for row in values[1:]:
             row = row + [""] * (len(headers) - len(row))
-            dt_v, project_v, type_v, note_v = str(row[idx_dt]).strip(), str(row[idx_project]).strip(), str(row[idx_type]).strip(), str(row[idx_note]).strip()
+            dt_v, project_v, type_v, note_v = (
+                str(row[idx_dt]).strip(),
+                str(row[idx_project]).strip(),
+                str(row[idx_type]).strip(),
+                str(row[idx_note]).strip(),
+            )
             is_today, is_project = dt_v.startswith(date_jst), project_v == str(project).strip()
             delete_apr = is_today and is_project and type_v == AppConfig.TYPE["APR"]
             delete_line = is_today and is_project and type_v == AppConfig.TYPE["LINE"] and AppConfig.APR_LINE_NOTE_KEYWORD in note_v
@@ -731,7 +889,7 @@ class Repository:
             if delete_line:
                 deleted_line += 1
                 continue
-            kept_rows.append(row[:len(headers)])
+            kept_rows.append(row[: len(headers)])
 
         if deleted_apr > 0 or deleted_line > 0:
             self.gs.overwrite_rows("LEDGER", kept_rows)
@@ -786,9 +944,9 @@ class FinanceEngine:
             return 0, 0.0
 
         target = ledger_df[
-            (ledger_df["Project_Name"].astype(str).str.strip() == str(project).strip()) &
-            (ledger_df["Type"].astype(str).str.strip() == AppConfig.TYPE["APR"]) &
-            (~ledger_df["Note"].astype(str).str.contains("COMPOUNDED", na=False))
+            (ledger_df["Project_Name"].astype(str).str.strip() == str(project).strip())
+            & (ledger_df["Type"].astype(str).str.strip() == AppConfig.TYPE["APR"])
+            & (~ledger_df["Note"].astype(str).str.contains("COMPOUNDED", na=False))
         ].copy()
         if target.empty:
             return 0, 0.0
@@ -799,7 +957,9 @@ class FinanceEngine:
 
         ts, updated_count, total_added = U.fmt_dt(U.now_jst()), 0, 0.0
         add_map = dict(zip(sums["PersonName"].astype(str).str.strip(), U.to_num_series(sums["Amount"])))
-        mask = (members_df["Project_Name"].astype(str).str.strip() == str(project).strip()) & (members_df["PersonName"].astype(str).str.strip().isin(add_map.keys()))
+        mask = (members_df["Project_Name"].astype(str).str.strip() == str(project).strip()) & (
+            members_df["PersonName"].astype(str).str.strip().isin(add_map.keys())
+        )
 
         if mask.any():
             for idx in members_df[mask].index.tolist():
@@ -824,7 +984,11 @@ class FinanceEngine:
                         row = values[row_no - 1]
                         if len(row) < len(headers):
                             row = row + [""] * (len(headers) - len(row))
-                        r_project, r_type, r_note = str(row[headers.index("Project_Name")]).strip(), str(row[headers.index("Type")]).strip(), str(row[headers.index("Note")]).strip()
+                        r_project, r_type, r_note = (
+                            str(row[headers.index("Project_Name")]).strip(),
+                            str(row[headers.index("Type")]).strip(),
+                            str(row[headers.index("Note")]).strip(),
+                        )
                         if r_project == str(project).strip() and r_type == AppConfig.TYPE["APR"] and "COMPOUNDED" not in r_note:
                             ws.update_cell(row_no, note_idx, (r_note + " | " if r_note else "") + f"COMPOUNDED:{ts}")
             repo.gs.clear_cache()
@@ -981,12 +1145,12 @@ class AppUI:
         st.markdown("#### 本日のAPR要素（単純合算）")
         c1, c2 = st.columns(2)
         with c1:
-            apr1_raw = st.text_input("APR要素1（%）", value="", key="apr1")
-            apr2_raw = st.text_input("APR要素2（%）", value="", key="apr2")
-            apr3_raw = st.text_input("APR要素3（%）", value="", key="apr3")
+            apr1_raw = st.text_input("APR要素1（%）", value=st.session_state.get("apr1", ""), key="apr1")
+            apr2_raw = st.text_input("APR要素2（%）", value=st.session_state.get("apr2", ""), key="apr2")
+            apr3_raw = st.text_input("APR要素3（%）", value=st.session_state.get("apr3", ""), key="apr3")
         with c2:
-            apr4_raw = st.text_input("APR要素4（%）", value="", key="apr4")
-            apr5_raw = st.text_input("APR要素5（%）", value="", key="apr5")
+            apr4_raw = st.text_input("APR要素4（%）", value=st.session_state.get("apr4", ""), key="apr4")
+            apr5_raw = st.text_input("APR要素5（%）", value=st.session_state.get("apr5", ""), key="apr5")
 
         apr1, apr2, apr3, apr4, apr5 = U.apr_val(apr1_raw), U.apr_val(apr2_raw), U.apr_val(apr3_raw), U.apr_val(apr4_raw), U.apr_val(apr5_raw)
         apr = float(apr1 + apr2 + apr3 + apr4 + apr5)
@@ -996,12 +1160,18 @@ class AppUI:
         if uploaded is not None and st.button("OCRで%候補を抽出"):
             raw_text = ExternalService.ocr_space_extract_text(uploaded.getvalue())
             candidates = U.extract_percent_candidates(raw_text)
+
             if raw_text:
                 with st.expander("OCR生テキスト", expanded=False):
                     st.text(raw_text)
+
             if candidates:
                 st.success("OCRで%候補を抽出しました。")
                 st.write("候補:", candidates)
+                best = candidates[0]
+                st.info(f"最有力候補: {best}%")
+                if not str(st.session_state.get("apr1", "")).strip():
+                    st.session_state["apr1"] = str(best)
             else:
                 st.warning("％付きの数値候補は見つかりませんでした。")
 
@@ -1031,17 +1201,19 @@ class AppUI:
                     total_principal += float(r["Principal"])
                     total_reward += float(r["DailyAPR"])
 
-                preview_rows.append({
-                    "Project_Name": p,
-                    "PersonName": person,
-                    "Rank": str(r["Rank"]).strip(),
-                    "Compound_Timing": U.compound_label(compound_timing),
-                    "Principal": U.fmt_usd(float(r["Principal"])),
-                    "DailyAPR": U.fmt_usd(float(r["DailyAPR"])),
-                    "Line_User_ID": str(r["Line_User_ID"]).strip(),
-                    "LINE_DisplayName": str(r["LINE_DisplayName"]).strip(),
-                    "本日APR状態": "本日記録済み" if is_done else "未記録",
-                })
+                preview_rows.append(
+                    {
+                        "Project_Name": p,
+                        "PersonName": person,
+                        "Rank": str(r["Rank"]).strip(),
+                        "Compound_Timing": U.compound_label(compound_timing),
+                        "Principal": U.fmt_usd(float(r["Principal"])),
+                        "DailyAPR": U.fmt_usd(float(r["DailyAPR"])),
+                        "Line_User_ID": str(r["Line_User_ID"]).strip(),
+                        "LINE_DisplayName": str(r["LINE_DisplayName"]).strip(),
+                        "本日APR状態": "本日記録済み" if is_done else "未記録",
+                    }
+                )
 
         if total_members == 0 and skipped_members == 0:
             st.warning("送信対象に 🟢運用中 のメンバーがいません。")
@@ -1147,7 +1319,10 @@ class AppUI:
                     self.repo.write_members(members_df)
 
                 self.store.persist_and_refresh()
-                st.success(f"APR記録:{apr_ledger_count}件 / LINE履歴記録:{line_log_count}件 / 送信成功:{success} / 送信失敗:{fail} / 重複スキップ:{skip_count}件")
+                st.success(
+                    f"APR記録:{apr_ledger_count}件 / LINE履歴記録:{line_log_count}件 / "
+                    f"送信成功:{success} / 送信失敗:{fail} / 重複スキップ:{skip_count}件"
+                )
                 st.rerun()
 
             except Exception as e:
@@ -1217,7 +1392,17 @@ class AppUI:
                         members_df.loc[i, "Principal"] = float(new_balance)
                         members_df.loc[i, "UpdatedAt_JST"] = ts
 
-                self.repo.append_ledger(ts, project, person, typ, float(amt), note, evidence_url or "", str(row["Line_User_ID"]).strip(), str(row["LINE_DisplayName"]).strip())
+                self.repo.append_ledger(
+                    ts,
+                    project,
+                    person,
+                    typ,
+                    float(amt),
+                    note,
+                    evidence_url or "",
+                    str(row["Line_User_ID"]).strip(),
+                    str(row["LINE_DisplayName"]).strip(),
+                )
                 self.repo.write_members(members_df)
 
                 token = ExternalService.get_line_token(AdminAuth.current_namespace())
@@ -1306,7 +1491,11 @@ class AppUI:
             selected = st.multiselect("送信先（複数可）", options=options)
 
             default_msg = f"【ご連絡】\nプロジェクト: {project}\n日時: {U.now_jst().strftime('%Y/%m/%d %H:%M')}\n\n"
-            msg_common = st.text_area("メッセージ本文（共通）※送信時に「〇〇 様」を自動挿入します", value=st.session_state.get("direct_line_msg", default_msg), height=180)
+            msg_common = st.text_area(
+                "メッセージ本文（共通）※送信時に「〇〇 様」を自動挿入します",
+                value=st.session_state.get("direct_line_msg", default_msg),
+                height=180,
+            )
             st.session_state["direct_line_msg"] = msg_common
             img = st.file_uploader("添付画像（任意・ImgBB）", type=["png", "jpg", "jpeg"], key="direct_line_img")
 
@@ -1498,8 +1687,8 @@ class AppUI:
                 return
 
             exists = members_df[
-                (members_df["Project_Name"] == str(selected_project)) &
-                (members_df["Line_User_ID"].astype(str).str.strip() == str(line_uid).strip())
+                (members_df["Project_Name"] == str(selected_project))
+                & (members_df["Line_User_ID"].astype(str).str.strip() == str(line_uid).strip())
             ]
             if not exists.empty:
                 st.warning("このプロジェクト内に同じ Line_User_ID が既に存在します。")
@@ -1700,7 +1889,13 @@ class AppController:
         self.setup_services()
 
         data = self.store.load(force=False)
-        menu = [AppConfig.PAGE["DASHBOARD"], AppConfig.PAGE["APR"], AppConfig.PAGE["CASH"], AppConfig.PAGE["ADMIN"], AppConfig.PAGE["HELP"]]
+        menu = [
+            AppConfig.PAGE["DASHBOARD"],
+            AppConfig.PAGE["APR"],
+            AppConfig.PAGE["CASH"],
+            AppConfig.PAGE["ADMIN"],
+            AppConfig.PAGE["HELP"],
+        ]
         page = st.sidebar.radio("メニュー", options=menu, index=menu.index(st.session_state["page"]) if st.session_state["page"] in menu else 0)
         st.session_state["page"] = page
 
