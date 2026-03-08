@@ -24,7 +24,9 @@ from gspread.exceptions import APIError
 # CONFIG
 # =========================================================
 class AppConfig:
-    APP_TITLE, APP_ICON, PAGE_LAYOUT = "APR資産運用管理システム", "🏦", "wide"
+    APP_TITLE = "APR資産運用管理システム"
+    APP_ICON = "🏦"
+    PAGE_LAYOUT = "wide"
     JST = timezone(timedelta(hours=9), "JST")
 
     STATUS = {"ON": "🟢運用中", "OFF": "🔴停止"}
@@ -48,9 +50,45 @@ class AppConfig:
     }
 
     HEADERS = {
-        "SETTINGS": ["Project_Name", "Net_Factor", "IsCompound", "Compound_Timing", "UpdatedAt_JST", "Active"],
-        "MEMBERS": ["Project_Name", "PersonName", "Principal", "Line_User_ID", "LINE_DisplayName", "Rank", "IsActive", "CreatedAt_JST", "UpdatedAt_JST"],
-        "LEDGER": ["Datetime_JST", "Project_Name", "PersonName", "Type", "Amount", "Note", "Evidence_URL", "Line_User_ID", "LINE_DisplayName", "Source"],
+        "SETTINGS": [
+            "Project_Name",
+            "Net_Factor",
+            "IsCompound",
+            "Compound_Timing",
+            "Crop_Left_Ratio_PC",
+            "Crop_Top_Ratio_PC",
+            "Crop_Right_Ratio_PC",
+            "Crop_Bottom_Ratio_PC",
+            "Crop_Left_Ratio_Mobile",
+            "Crop_Top_Ratio_Mobile",
+            "Crop_Right_Ratio_Mobile",
+            "Crop_Bottom_Ratio_Mobile",
+            "UpdatedAt_JST",
+            "Active",
+        ],
+        "MEMBERS": [
+            "Project_Name",
+            "PersonName",
+            "Principal",
+            "Line_User_ID",
+            "LINE_DisplayName",
+            "Rank",
+            "IsActive",
+            "CreatedAt_JST",
+            "UpdatedAt_JST",
+        ],
+        "LEDGER": [
+            "Datetime_JST",
+            "Project_Name",
+            "PersonName",
+            "Type",
+            "Amount",
+            "Note",
+            "Evidence_URL",
+            "Line_User_ID",
+            "LINE_DisplayName",
+            "Source",
+        ],
         "LINEUSERS": ["Date", "Time", "Type", "Line_User_ID", "Line_User"],
         "APR_SUMMARY": ["Date_JST", "PersonName", "Total_APR", "APR_Count", "Asset_Ratio", "LINE_DisplayName"],
     }
@@ -72,6 +110,20 @@ class AppConfig:
     }
 
     APR_LINE_NOTE_KEYWORD = "APR:"
+
+    OCR_DEFAULTS_PC = {
+        "Crop_Left_Ratio_PC": 0.70,
+        "Crop_Top_Ratio_PC": 0.20,
+        "Crop_Right_Ratio_PC": 0.90,
+        "Crop_Bottom_Ratio_PC": 0.285,
+    }
+
+    OCR_DEFAULTS_MOBILE = {
+        "Crop_Left_Ratio_Mobile": 0.68,
+        "Crop_Top_Ratio_Mobile": 0.23,
+        "Crop_Right_Ratio_Mobile": 0.92,
+        "Crop_Bottom_Ratio_Mobile": 0.355,
+    }
 
 
 # =========================================================
@@ -196,41 +248,86 @@ class U:
             return 0.0
 
     @staticmethod
+    def to_ratio(v: Any, default: float) -> float:
+        try:
+            x = float(str(v).strip())
+            if 0.0 <= x <= 1.0:
+                return x
+            return default
+        except Exception:
+            return default
+
+    @staticmethod
+    def crop_image_by_ratio(
+        file_bytes: bytes,
+        left_ratio: float,
+        top_ratio: float,
+        right_ratio: float,
+        bottom_ratio: float,
+    ) -> bytes:
+        try:
+            img = Image.open(BytesIO(file_bytes)).convert("RGB")
+            w, h = img.size
+
+            left = max(0, min(int(w * left_ratio), w - 1))
+            top = max(0, min(int(h * top_ratio), h - 1))
+            right = max(left + 1, min(int(w * right_ratio), w))
+            bottom = max(top + 1, min(int(h * bottom_ratio), h))
+
+            cropped = img.crop((left, top, right, bottom))
+            buf = BytesIO()
+            cropped.save(buf, format="PNG")
+            return buf.getvalue()
+        except Exception:
+            return file_bytes
+
+    @staticmethod
+    def is_mobile_tall_image(file_bytes: bytes) -> bool:
+        try:
+            img = Image.open(BytesIO(file_bytes))
+            w, h = img.size
+            return h / max(w, 1) > 1.45
+        except Exception:
+            return False
+
+    @staticmethod
     def preprocess_ocr_image(file_bytes: bytes) -> List[bytes]:
         outputs: List[bytes] = []
+
         try:
             base = Image.open(BytesIO(file_bytes)).convert("L")
             variants: List[Image.Image] = []
 
             img1 = ImageOps.autocontrast(base)
-            img1 = ImageEnhance.Contrast(img1).enhance(2.5)
-            img1 = ImageEnhance.Sharpness(img1).enhance(2.0)
-            img1 = img1.resize((base.width * 2, base.height * 2))
+            img1 = ImageEnhance.Contrast(img1).enhance(3.0)
+            img1 = ImageEnhance.Sharpness(img1).enhance(2.5)
+            img1 = img1.resize((base.width * 4, base.height * 4))
             variants.append(img1)
 
             img2 = ImageOps.autocontrast(base)
-            img2 = ImageEnhance.Contrast(img2).enhance(3.0)
-            img2 = img2.resize((base.width * 3, base.height * 3))
-            img2 = img2.point(lambda x: 255 if x > 170 else 0)
+            img2 = ImageEnhance.Contrast(img2).enhance(3.5)
+            img2 = img2.resize((base.width * 5, base.height * 5))
+            img2 = img2.point(lambda x: 255 if x > 165 else 0)
             variants.append(img2)
 
             img3 = ImageOps.autocontrast(base)
-            img3 = ImageEnhance.Contrast(img3).enhance(2.8)
-            img3 = img3.resize((base.width * 3, base.height * 3))
+            img3 = ImageEnhance.Contrast(img3).enhance(3.2)
+            img3 = img3.resize((base.width * 5, base.height * 5))
             img3 = img3.point(lambda x: 255 if x > 145 else 0)
             variants.append(img3)
 
             img4 = ImageOps.autocontrast(base)
             img4 = img4.filter(ImageFilter.MedianFilter(size=3))
-            img4 = ImageEnhance.Contrast(img4).enhance(2.2)
-            img4 = ImageEnhance.Sharpness(img4).enhance(3.0)
-            img4 = img4.resize((base.width * 2, base.height * 2))
+            img4 = ImageEnhance.Contrast(img4).enhance(2.8)
+            img4 = ImageEnhance.Sharpness(img4).enhance(3.2)
+            img4 = img4.resize((base.width * 4, base.height * 4))
             variants.append(img4)
 
             for img in variants:
                 buf = BytesIO()
                 img.save(buf, format="PNG")
                 outputs.append(buf.getvalue())
+
         except Exception:
             return [file_bytes]
 
@@ -242,11 +339,13 @@ class U:
             return []
 
         norm = str(text)
+
         replace_map = {
             "％": "%",
             "O": "0",
             "o": "0",
             "Q": "0",
+            "D": "0",
             "I": "1",
             "l": "1",
             "|": "1",
@@ -284,14 +383,13 @@ class U:
                     pass
 
         def score(x: float) -> tuple:
-            if 1 <= x <= 50:
-                return (0, abs(x - 10))
-            if 50 < x <= 120:
-                return (1, abs(x - 60))
+            if 1 <= x <= 80:
+                return (0, abs(x - 40))
+            if 80 < x <= 150:
+                return (1, abs(x - 100))
             return (2, x)
 
-        vals = sorted(vals, key=score)
-        return vals
+        return sorted(vals, key=score)
 
 
 # =========================================================
@@ -420,7 +518,13 @@ class ExternalService:
             return None
 
     @staticmethod
-    def ocr_space_extract_text(file_bytes: bytes) -> str:
+    def ocr_space_extract_text_with_crop(
+        file_bytes: bytes,
+        crop_left_ratio: float,
+        crop_top_ratio: float,
+        crop_right_ratio: float,
+        crop_bottom_ratio: float,
+    ) -> str:
         try:
             api_key = st.secrets["ocrspace"]["api_key"]
         except Exception:
@@ -429,8 +533,16 @@ class ExternalService:
         texts: List[str] = []
 
         try:
-            processed_list = U.preprocess_ocr_image(file_bytes)
-            targets = [("original.png", file_bytes)] + [(f"processed_{i}.png", b) for i, b in enumerate(processed_list, start=1)]
+            cropped_bytes = U.crop_image_by_ratio(
+                file_bytes=file_bytes,
+                left_ratio=crop_left_ratio,
+                top_ratio=crop_top_ratio,
+                right_ratio=crop_right_ratio,
+                bottom_ratio=crop_bottom_ratio,
+            )
+
+            processed_list = U.preprocess_ocr_image(cropped_bytes)
+            targets = [("cropped.png", cropped_bytes)] + [(f"processed_{i}.png", b) for i, b in enumerate(processed_list, start=1)]
 
             for target_name, target_bytes in targets:
                 for engine in (2, 1):
@@ -465,6 +577,7 @@ class ExternalService:
                     uniq.append(key)
 
             return "\n\n".join(uniq)
+
         except Exception:
             return ""
 
@@ -483,7 +596,8 @@ class SheetNames:
 
 class GSheetService:
     def __init__(self, spreadsheet_id: str, namespace: str):
-        self.spreadsheet_id, self.namespace = spreadsheet_id, namespace
+        self.spreadsheet_id = spreadsheet_id
+        self.namespace = namespace
         self.names = SheetNames(
             SETTINGS=U.sheet_name(AppConfig.SHEET["SETTINGS"], namespace),
             MEMBERS=U.sheet_name(AppConfig.SHEET["MEMBERS"], namespace),
@@ -522,7 +636,8 @@ class GSheetService:
         return f"https://docs.google.com/spreadsheets/d/{self.spreadsheet_id}"
 
     def ensure_sheet(self, key: str) -> None:
-        name, headers = self.actual_name(key), AppConfig.HEADERS[key]
+        name = self.actual_name(key)
+        headers = AppConfig.HEADERS[key]
         try:
             ws = self.ws(key)
         except Exception:
@@ -586,6 +701,20 @@ class Repository:
     def __init__(self, gs: GSheetService):
         self.gs = gs
 
+    def _ensure_setting_defaults(self, df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        for k, v in AppConfig.OCR_DEFAULTS_PC.items():
+            if k not in out.columns:
+                out[k] = v
+            else:
+                out[k] = out[k].replace("", v)
+        for k, v in AppConfig.OCR_DEFAULTS_MOBILE.items():
+            if k not in out.columns:
+                out[k] = v
+            else:
+                out[k] = out[k].replace("", v)
+        return out
+
     def load_settings(self) -> pd.DataFrame:
         try:
             df = self.gs.load_df("SETTINGS")
@@ -610,6 +739,11 @@ class Repository:
         df["Active"] = df["Active"].apply(lambda x: U.truthy(x) if str(x).strip() else True)
         df["UpdatedAt_JST"] = df["UpdatedAt_JST"].astype(str).str.strip()
 
+        for k, v in AppConfig.OCR_DEFAULTS_PC.items():
+            df[k] = df[k].apply(lambda x, default=v: U.to_ratio(x, default))
+        for k, v in AppConfig.OCR_DEFAULTS_MOBILE.items():
+            df[k] = df[k].apply(lambda x, default=v: U.to_ratio(x, default))
+
         personal_df = df[df["Project_Name"].str.upper() == AppConfig.PROJECT["PERSONAL"]].tail(1).copy()
         other_df = df[df["Project_Name"].str.upper() != AppConfig.PROJECT["PERSONAL"]].drop_duplicates(subset=["Project_Name"], keep="last")
         out = pd.concat([personal_df, other_df], ignore_index=True)
@@ -624,6 +758,14 @@ class Repository:
                                 "Net_Factor": AppConfig.FACTOR["MASTER"],
                                 "IsCompound": True,
                                 "Compound_Timing": AppConfig.COMPOUND["DAILY"],
+                                "Crop_Left_Ratio_PC": AppConfig.OCR_DEFAULTS_PC["Crop_Left_Ratio_PC"],
+                                "Crop_Top_Ratio_PC": AppConfig.OCR_DEFAULTS_PC["Crop_Top_Ratio_PC"],
+                                "Crop_Right_Ratio_PC": AppConfig.OCR_DEFAULTS_PC["Crop_Right_Ratio_PC"],
+                                "Crop_Bottom_Ratio_PC": AppConfig.OCR_DEFAULTS_PC["Crop_Bottom_Ratio_PC"],
+                                "Crop_Left_Ratio_Mobile": AppConfig.OCR_DEFAULTS_MOBILE["Crop_Left_Ratio_Mobile"],
+                                "Crop_Top_Ratio_Mobile": AppConfig.OCR_DEFAULTS_MOBILE["Crop_Top_Ratio_Mobile"],
+                                "Crop_Right_Ratio_Mobile": AppConfig.OCR_DEFAULTS_MOBILE["Crop_Right_Ratio_Mobile"],
+                                "Crop_Bottom_Ratio_Mobile": AppConfig.OCR_DEFAULTS_MOBILE["Crop_Bottom_Ratio_Mobile"],
                                 "UpdatedAt_JST": U.fmt_dt(U.now_jst()),
                                 "Active": True,
                             }
@@ -634,7 +776,7 @@ class Repository:
                 ignore_index=True,
             )
 
-        return out
+        return self._ensure_setting_defaults(out)
 
     def write_settings(self, df: pd.DataFrame) -> None:
         out = df.copy()
@@ -647,6 +789,12 @@ class Repository:
         out["Net_Factor"] = U.to_num_series(out["Net_Factor"], AppConfig.FACTOR["MASTER"]).map(lambda x: f"{float(x):.2f}")
         out["IsCompound"] = out["IsCompound"].apply(lambda x: "TRUE" if U.truthy(x) else "FALSE")
         out["Compound_Timing"] = out["Compound_Timing"].apply(U.normalize_compound)
+
+        for k, v in AppConfig.OCR_DEFAULTS_PC.items():
+            out[k] = out[k].apply(lambda x, default=v: f"{U.to_ratio(x, default):.3f}")
+        for k, v in AppConfig.OCR_DEFAULTS_MOBILE.items():
+            out[k] = out[k].apply(lambda x, default=v: f"{U.to_ratio(x, default):.3f}")
+
         out["Active"] = out["Active"].apply(lambda x: "TRUE" if U.truthy(x) else "FALSE")
         out["UpdatedAt_JST"] = out["UpdatedAt_JST"].astype(str)
         self.gs.write_df("SETTINGS", out)
@@ -662,6 +810,7 @@ class Repository:
             if c not in repaired.columns:
                 repaired[c] = ""
 
+        repaired = self._ensure_setting_defaults(repaired)
         repaired["Project_Name"] = repaired["Project_Name"].astype(str).str.strip()
         repaired = repaired[repaired["Project_Name"] != ""].copy()
 
@@ -676,6 +825,11 @@ class Repository:
         repaired["Active"] = repaired["Active"].apply(lambda x: U.truthy(x) if str(x).strip() else True)
         repaired["UpdatedAt_JST"] = repaired["UpdatedAt_JST"].astype(str) if "UpdatedAt_JST" in repaired.columns else ""
 
+        for k, v in AppConfig.OCR_DEFAULTS_PC.items():
+            repaired[k] = repaired[k].apply(lambda x, default=v: U.to_ratio(x, default))
+        for k, v in AppConfig.OCR_DEFAULTS_MOBILE.items():
+            repaired[k] = repaired[k].apply(lambda x, default=v: U.to_ratio(x, default))
+
         if AppConfig.PROJECT["PERSONAL"] not in repaired["Project_Name"].astype(str).tolist():
             repaired = pd.concat(
                 [
@@ -686,6 +840,14 @@ class Repository:
                                 "Net_Factor": AppConfig.FACTOR["MASTER"],
                                 "IsCompound": True,
                                 "Compound_Timing": AppConfig.COMPOUND["DAILY"],
+                                "Crop_Left_Ratio_PC": AppConfig.OCR_DEFAULTS_PC["Crop_Left_Ratio_PC"],
+                                "Crop_Top_Ratio_PC": AppConfig.OCR_DEFAULTS_PC["Crop_Top_Ratio_PC"],
+                                "Crop_Right_Ratio_PC": AppConfig.OCR_DEFAULTS_PC["Crop_Right_Ratio_PC"],
+                                "Crop_Bottom_Ratio_PC": AppConfig.OCR_DEFAULTS_PC["Crop_Bottom_Ratio_PC"],
+                                "Crop_Left_Ratio_Mobile": AppConfig.OCR_DEFAULTS_MOBILE["Crop_Left_Ratio_Mobile"],
+                                "Crop_Top_Ratio_Mobile": AppConfig.OCR_DEFAULTS_MOBILE["Crop_Top_Ratio_Mobile"],
+                                "Crop_Right_Ratio_Mobile": AppConfig.OCR_DEFAULTS_MOBILE["Crop_Right_Ratio_Mobile"],
+                                "Crop_Bottom_Ratio_Mobile": AppConfig.OCR_DEFAULTS_MOBILE["Crop_Bottom_Ratio_Mobile"],
                                 "UpdatedAt_JST": U.fmt_dt(U.now_jst()),
                                 "Active": True,
                             }
@@ -863,23 +1025,21 @@ class Repository:
         if any(c not in headers for c in need_cols):
             return 0, 0
 
-        idx_dt, idx_project, idx_type, idx_note = (
-            headers.index("Datetime_JST"),
-            headers.index("Project_Name"),
-            headers.index("Type"),
-            headers.index("Note"),
-        )
+        idx_dt = headers.index("Datetime_JST")
+        idx_project = headers.index("Project_Name")
+        idx_type = headers.index("Type")
+        idx_note = headers.index("Note")
         kept_rows, deleted_apr, deleted_line = [headers], 0, 0
 
         for row in values[1:]:
             row = row + [""] * (len(headers) - len(row))
-            dt_v, project_v, type_v, note_v = (
-                str(row[idx_dt]).strip(),
-                str(row[idx_project]).strip(),
-                str(row[idx_type]).strip(),
-                str(row[idx_note]).strip(),
-            )
-            is_today, is_project = dt_v.startswith(date_jst), project_v == str(project).strip()
+            dt_v = str(row[idx_dt]).strip()
+            project_v = str(row[idx_project]).strip()
+            type_v = str(row[idx_type]).strip()
+            note_v = str(row[idx_note]).strip()
+
+            is_today = dt_v.startswith(date_jst)
+            is_project = project_v == str(project).strip()
             delete_apr = is_today and is_project and type_v == AppConfig.TYPE["APR"]
             delete_line = is_today and is_project and type_v == AppConfig.TYPE["LINE"] and AppConfig.APR_LINE_NOTE_KEYWORD in note_v
 
@@ -910,10 +1070,13 @@ class FinanceEngine:
             out["CalcMode"] = "PERSONAL"
             return out
 
-        total_principal, count = float(out["Principal"].sum()), len(out)
+        total_principal = float(out["Principal"].sum())
+        count = len(out)
         factor = float(project_net_factor if project_net_factor > 0 else AppConfig.FACTOR["MASTER"])
         total_group_reward = (total_principal * (apr_percent / 100.0) * factor) / 365.0
-        out["Factor"], out["DailyAPR"], out["CalcMode"] = factor, ((total_group_reward / count) if count > 0 else 0.0), "GROUP_EQUAL"
+        out["Factor"] = factor
+        out["DailyAPR"] = (total_group_reward / count) if count > 0 else 0.0
+        out["CalcMode"] = "GROUP_EQUAL"
         return out
 
     def build_apr_summary(self, ledger_df: pd.DataFrame, members_df: pd.DataFrame) -> pd.DataFrame:
@@ -955,7 +1118,8 @@ class FinanceEngine:
         if sums.empty:
             return 0, 0.0
 
-        ts, updated_count, total_added = U.fmt_dt(U.now_jst()), 0, 0.0
+        ts = U.fmt_dt(U.now_jst())
+        updated_count, total_added = 0, 0.0
         add_map = dict(zip(sums["PersonName"].astype(str).str.strip(), U.to_num_series(sums["Amount"])))
         mask = (members_df["Project_Name"].astype(str).str.strip() == str(project).strip()) & (
             members_df["PersonName"].astype(str).str.strip().isin(add_map.keys())
@@ -984,11 +1148,9 @@ class FinanceEngine:
                         row = values[row_no - 1]
                         if len(row) < len(headers):
                             row = row + [""] * (len(headers) - len(row))
-                        r_project, r_type, r_note = (
-                            str(row[headers.index("Project_Name")]).strip(),
-                            str(row[headers.index("Type")]).strip(),
-                            str(row[headers.index("Note")]).strip(),
-                        )
+                        r_project = str(row[headers.index("Project_Name")]).strip()
+                        r_type = str(row[headers.index("Type")]).strip()
+                        r_note = str(row[headers.index("Note")]).strip()
                         if r_project == str(project).strip() and r_type == AppConfig.TYPE["APR"] and "COMPOUNDED" not in r_note:
                             ws.update_cell(row_no, note_idx, (r_note + " | " if r_note else "") + f"COMPOUNDED:{ts}")
             repo.gs.clear_cache()
@@ -1001,7 +1163,8 @@ class FinanceEngine:
 # =========================================================
 class DataStore:
     def __init__(self, repo: Repository, engine: FinanceEngine):
-        self.repo, self.engine = repo, engine
+        self.repo = repo
+        self.engine = engine
 
     def clear(self) -> None:
         for key in AppConfig.SESSION_KEYS.values():
@@ -1049,7 +1212,9 @@ class DataStore:
 # =========================================================
 class AppUI:
     def __init__(self, repo: Repository, engine: FinanceEngine, store: DataStore):
-        self.repo, self.engine, self.store = repo, engine, store
+        self.repo = repo
+        self.engine = engine
+        self.store = store
 
     def render_dashboard(self, members_df: pd.DataFrame, ledger_df: pd.DataFrame, apr_summary_df: pd.DataFrame) -> None:
         st.subheader("📊 管理画面ダッシュボード")
@@ -1152,26 +1317,62 @@ class AppUI:
             apr4_raw = st.text_input("APR要素4（%）", value=st.session_state.get("apr4", ""), key="apr4")
             apr5_raw = st.text_input("APR要素5（%）", value=st.session_state.get("apr5", ""), key="apr5")
 
-        apr1, apr2, apr3, apr4, apr5 = U.apr_val(apr1_raw), U.apr_val(apr2_raw), U.apr_val(apr3_raw), U.apr_val(apr4_raw), U.apr_val(apr5_raw)
+        apr1 = U.apr_val(apr1_raw)
+        apr2 = U.apr_val(apr2_raw)
+        apr3 = U.apr_val(apr3_raw)
+        apr4 = U.apr_val(apr4_raw)
+        apr5 = U.apr_val(apr5_raw)
         apr = float(apr1 + apr2 + apr3 + apr4 + apr5)
         st.info(f"最終APR = {apr1:.4f} + {apr2:.4f} + {apr3:.4f} + {apr4:.4f} + {apr5:.4f} = {apr:.4f}%")
 
         uploaded = st.file_uploader("エビデンス画像（任意）", type=["png", "jpg", "jpeg"], key="apr_img")
+
         if uploaded is not None and st.button("OCRで%候補を抽出"):
-            raw_text = ExternalService.ocr_space_extract_text(uploaded.getvalue())
+            crop_left_ratio = AppConfig.OCR_DEFAULTS_PC["Crop_Left_Ratio_PC"]
+            crop_top_ratio = AppConfig.OCR_DEFAULTS_PC["Crop_Top_Ratio_PC"]
+            crop_right_ratio = AppConfig.OCR_DEFAULTS_PC["Crop_Right_Ratio_PC"]
+            crop_bottom_ratio = AppConfig.OCR_DEFAULTS_PC["Crop_Bottom_Ratio_PC"]
+
+            try:
+                srow = settings_df[settings_df["Project_Name"] == str(project)].iloc[0]
+
+                if U.is_mobile_tall_image(uploaded.getvalue()):
+                    crop_left_ratio = U.to_ratio(srow.get("Crop_Left_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Left_Ratio_Mobile"]), AppConfig.OCR_DEFAULTS_MOBILE["Crop_Left_Ratio_Mobile"])
+                    crop_top_ratio = U.to_ratio(srow.get("Crop_Top_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Top_Ratio_Mobile"]), AppConfig.OCR_DEFAULTS_MOBILE["Crop_Top_Ratio_Mobile"])
+                    crop_right_ratio = U.to_ratio(srow.get("Crop_Right_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Right_Ratio_Mobile"]), AppConfig.OCR_DEFAULTS_MOBILE["Crop_Right_Ratio_Mobile"])
+                    crop_bottom_ratio = U.to_ratio(srow.get("Crop_Bottom_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Bottom_Ratio_Mobile"]), AppConfig.OCR_DEFAULTS_MOBILE["Crop_Bottom_Ratio_Mobile"])
+                else:
+                    crop_left_ratio = U.to_ratio(srow.get("Crop_Left_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Left_Ratio_PC"]), AppConfig.OCR_DEFAULTS_PC["Crop_Left_Ratio_PC"])
+                    crop_top_ratio = U.to_ratio(srow.get("Crop_Top_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Top_Ratio_PC"]), AppConfig.OCR_DEFAULTS_PC["Crop_Top_Ratio_PC"])
+                    crop_right_ratio = U.to_ratio(srow.get("Crop_Right_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Right_Ratio_PC"]), AppConfig.OCR_DEFAULTS_PC["Crop_Right_Ratio_PC"])
+                    crop_bottom_ratio = U.to_ratio(srow.get("Crop_Bottom_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Bottom_Ratio_PC"]), AppConfig.OCR_DEFAULTS_PC["Crop_Bottom_Ratio_PC"])
+            except Exception:
+                pass
+
+            raw_text = ExternalService.ocr_space_extract_text_with_crop(
+                uploaded.getvalue(),
+                crop_left_ratio=crop_left_ratio,
+                crop_top_ratio=crop_top_ratio,
+                crop_right_ratio=crop_right_ratio,
+                crop_bottom_ratio=crop_bottom_ratio,
+            )
             candidates = U.extract_percent_candidates(raw_text)
 
             if raw_text:
                 with st.expander("OCR生テキスト", expanded=False):
                     st.text(raw_text)
 
+            st.info(
+                f"OCR切り抜き範囲: left={crop_left_ratio:.3f}, top={crop_top_ratio:.3f}, right={crop_right_ratio:.3f}, bottom={crop_bottom_ratio:.3f}"
+            )
+
             if candidates:
                 st.success("OCRで%候補を抽出しました。")
                 st.write("候補:", candidates)
                 best = candidates[0]
                 st.info(f"最有力候補: {best}%")
-                if not str(st.session_state.get("apr1", "")).strip():
-                    st.session_state["apr1"] = str(best)
+                st.session_state["apr1"] = str(best)
+                st.rerun()
             else:
                 st.warning("％付きの数値候補は見つかりませんでした。")
 
@@ -1220,26 +1421,35 @@ class AppUI:
             return
 
         st.markdown(f"送信対象プロジェクト数: {len(target_projects)} / 本日未記録の対象人数: {total_members} / 本日記録済み人数: {skipped_members}")
-        st.markdown(f"本日新規記録対象の総元本: {U.fmt_usd(total_principal)} / 本日新規記録対象の総配当: {U.fmt_usd(total_reward)}")
+
+        apr_percent_display = (total_reward / total_principal * 100.0) if total_principal > 0 else 0.0
+
+        csum1, csum2 = st.columns([1.2, 2.8])
+        with csum1:
+            if send_scope == "選択中プロジェクトのみ":
+                if st.button("本日のAPR記録をリセット", key="reset_today_apr_top", use_container_width=True):
+                    try:
+                        deleted_apr, deleted_line = self.repo.reset_today_apr_records(today_key, project)
+                        self.store.persist_and_refresh()
+                        if deleted_apr == 0 and deleted_line == 0:
+                            st.info("削除対象はありません。")
+                        else:
+                            st.success(f"本日分をリセットしました。APR削除:{deleted_apr}件 / LINE削除:{deleted_line}件")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"APRリセットでエラー: {e}")
+                        st.stop()
+
+        with csum2:
+            st.markdown(
+                f"""
+**本日対象サマリー**  
+総投資額: **{U.fmt_usd(total_principal)}**　/　APR合計: **{U.fmt_usd(total_reward)}**　/　実効APR: **{apr_percent_display:.4f}%**
+"""
+            )
 
         with st.expander("個人別の本日配当（確認）", expanded=False):
             st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
-
-        if send_scope == "選択中プロジェクトのみ":
-            st.divider()
-            st.markdown("#### 本日APRリセット")
-            if st.button("本日のAPR記録をリセット"):
-                try:
-                    deleted_apr, deleted_line = self.repo.reset_today_apr_records(today_key, project)
-                    self.store.persist_and_refresh()
-                    if deleted_apr == 0 and deleted_line == 0:
-                        st.info("削除対象はありません。")
-                    else:
-                        st.success(f"本日分をリセットしました。APR削除:{deleted_apr}件 / LINE削除:{deleted_line}件")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"APRリセットでエラー: {e}")
-                    st.stop()
 
         if st.button("APRを確定して対象全員にLINE送信"):
             try:
@@ -1270,6 +1480,7 @@ class AppUI:
                         uid = str(r["Line_User_ID"]).strip()
                         disp = str(r["LINE_DisplayName"]).strip()
                         daily_apr = float(r["DailyAPR"])
+                        current_principal = float(r["Principal"])
                         apr_key = (str(p).strip(), person)
 
                         if apr_key in existing_apr_keys:
@@ -1283,16 +1494,22 @@ class AppUI:
 
                         if compound_timing == AppConfig.COMPOUND["DAILY"]:
                             daily_add_map[(str(p).strip(), person)] = daily_add_map.get((str(p).strip(), person), 0.0) + daily_apr
+                            person_after_amount = current_principal + daily_apr
+                        else:
+                            person_after_amount = current_principal
 
                         personalized_msg = (
                             "🏦【APR収益報告】\n"
                             f"{person} 様\n"
-                            f"プロジェクト: {p}\n"
                             f"報告日時: {U.now_jst().strftime('%Y/%m/%d %H:%M')}\n"
-                            f"総APR: {apr:.1f}%\n"
-                            f"本日配当: {U.fmt_usd(float(daily_apr))}\n"
+                            f"APR: {apr:.1f}%\n"
+                            f"本日配当: {U.fmt_usd(daily_apr)}\n"
+                            f"現在運用額: {U.fmt_usd(current_principal)}\n"
                             f"複利タイプ: {U.compound_label(compound_timing)}\n"
                         )
+
+                        if compound_timing == AppConfig.COMPOUND["DAILY"]:
+                            personalized_msg += f"複利反映後運用額: {U.fmt_usd(person_after_amount)}\n"
 
                         if not uid:
                             code, line_note = 0, "LINE未送信: Line_User_IDなし"
@@ -1410,7 +1627,6 @@ class AppUI:
                 msg = (
                     "💸【入出金通知】\n"
                     f"{person} 様\n"
-                    f"プロジェクト: {project}\n"
                     f"日時: {U.now_jst().strftime('%Y/%m/%d %H:%M')}\n"
                     f"種別: {typ}\n"
                     f"金額: {U.fmt_usd(float(amt))}\n"
@@ -1437,6 +1653,7 @@ class AppUI:
 
     def render_admin(self, settings_df: pd.DataFrame, members_df: pd.DataFrame, line_users_df: pd.DataFrame) -> None:
         st.subheader("⚙️ 管理")
+
         cfix1, _ = st.columns([1, 2])
         with cfix1:
             if st.button("Settingsを自動修復", use_container_width=True):
@@ -1455,11 +1672,46 @@ class AppUI:
 
         project = st.selectbox("対象プロジェクト", projects, key="admin_project")
 
+        row_setting = settings_df[settings_df["Project_Name"] == project].iloc[0]
+        st.markdown("#### OCR設定")
+        ocr_edit = pd.DataFrame(
+            [
+                {
+                    "Crop_Left_Ratio_PC": row_setting.get("Crop_Left_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Left_Ratio_PC"]),
+                    "Crop_Top_Ratio_PC": row_setting.get("Crop_Top_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Top_Ratio_PC"]),
+                    "Crop_Right_Ratio_PC": row_setting.get("Crop_Right_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Right_Ratio_PC"]),
+                    "Crop_Bottom_Ratio_PC": row_setting.get("Crop_Bottom_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Bottom_Ratio_PC"]),
+                    "Crop_Left_Ratio_Mobile": row_setting.get("Crop_Left_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Left_Ratio_Mobile"]),
+                    "Crop_Top_Ratio_Mobile": row_setting.get("Crop_Top_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Top_Ratio_Mobile"]),
+                    "Crop_Right_Ratio_Mobile": row_setting.get("Crop_Right_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Right_Ratio_Mobile"]),
+                    "Crop_Bottom_Ratio_Mobile": row_setting.get("Crop_Bottom_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Bottom_Ratio_Mobile"]),
+                }
+            ]
+        )
+
+        edited_ocr = st.data_editor(
+            ocr_edit,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            key=f"ocr_editor_{project}",
+        )
+        if st.button("OCR設定を保存", key=f"save_ocr_{project}", use_container_width=True):
+            idx = settings_df[settings_df["Project_Name"] == project].index[0]
+            for col, default in {**AppConfig.OCR_DEFAULTS_PC, **AppConfig.OCR_DEFAULTS_MOBILE}.items():
+                settings_df.loc[idx, col] = U.to_ratio(edited_ocr.iloc[0][col], default)
+            settings_df.loc[idx, "UpdatedAt_JST"] = U.fmt_dt(U.now_jst())
+            self.repo.write_settings(settings_df)
+            self.store.persist_and_refresh()
+            st.success("OCR設定を保存しました。")
+            st.rerun()
+
         line_users: List[Tuple[str, str, str]] = []
         if not line_users_df.empty:
             tmp = line_users_df[line_users_df["Line_User_ID"].astype(str).str.startswith("U")].drop_duplicates(subset=["Line_User_ID"], keep="last")
             for _, r in tmp.iterrows():
-                uid, name = str(r["Line_User_ID"]).strip(), str(r.get("Line_User", "")).strip()
+                uid = str(r["Line_User_ID"]).strip()
+                name = str(r.get("Line_User", "")).strip()
                 line_users.append((f"{name} ({uid})" if name else uid, uid, name))
 
         view_all = members_df[members_df["Project_Name"] == str(project)].copy()
@@ -1671,7 +1923,8 @@ class AppUI:
                 st.session_state["prefill_line_uid"] = uid
                 st.session_state["prefill_line_name"] = name
 
-        pre_uid, pre_name = st.session_state.get("prefill_line_uid", ""), st.session_state.get("prefill_line_name", "")
+        pre_uid = st.session_state.get("prefill_line_uid", "")
+        pre_name = st.session_state.get("prefill_line_name", "")
         with st.form("member_add", clear_on_submit=False):
             person = st.text_input("PersonName（個人名）")
             principal = st.number_input("Principal（残高）", min_value=0.0, value=0.0, step=100.0)
@@ -1781,7 +2034,7 @@ Spreadsheet URL
 `最終APR = APR1 + APR2 + APR3 + APR4 + APR5`
 
 ### OCR
-OCRでは `%` の数字候補だけを抽出します。
+Smart Vault画面は PC / Mobile 別の比率座標で APR領域を切り抜いて OCR.space に送っています。
 
 ### PERSONAL
 個人ごとの元本で計算します。
