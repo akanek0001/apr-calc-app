@@ -385,9 +385,7 @@ class GSheetService:
 
     def last_rows(self, key: str, n: int = 5) -> List[List[str]]:
         values = self.ws(key).get_all_values()
-        if not values:
-            return []
-        return values[-n:]
+        return values[-n:] if values else []
 
     def ensure_sheet(self, key: str) -> None:
         name, headers = self.actual_name(key), AppConfig.HEADERS[key]
@@ -640,15 +638,30 @@ class Repository:
         out["LINE_DisplayName"] = out["LINE_DisplayName"].astype(str)
         self.gs.write_df("APR_SUMMARY", out)
 
-    def append_ledger(self, dt_jst: str, project: str, person_name: str, typ: str, amount: float, note: str,
-                      evidence_url: str = "", line_user_id: str = "", line_display_name: str = "", source: str = AppConfig.SOURCE["APP"]) -> None:
+    def append_ledger(
+        self,
+        dt_jst: str,
+        project: str,
+        person_name: str,
+        typ: str,
+        amount: float,
+        note: str,
+        evidence_url: str = "",
+        line_user_id: str = "",
+        line_display_name: str = "",
+        source: str = AppConfig.SOURCE["APP"],
+    ) -> None:
         if not str(project).strip():
             raise ValueError("project が空です")
         if not str(person_name).strip():
             raise ValueError("person_name が空です")
         if not str(typ).strip():
             raise ValueError("typ が空です")
-        self.gs.append_row("LEDGER", [dt_jst, project, person_name, typ, float(amount), note, evidence_url or "", line_user_id or "", line_display_name or "", source])
+
+        self.gs.append_row(
+            "LEDGER",
+            [dt_jst, project, person_name, typ, float(amount), note, evidence_url or "", line_user_id or "", line_display_name or "", source],
+        )
 
     def active_projects(self, settings_df: pd.DataFrame) -> List[str]:
         if settings_df.empty:
@@ -863,10 +876,8 @@ class AppUI:
             st.info(f"参照中シート: {self.repo.gs.names.SETTINGS}")
             return
 
-        project = st.selectbox("プロジェクト", projects)
-        row = settings_df[settings_df["Project_Name"] == str(project)].iloc[0]
-        project_net_factor = float(row.get("Net_Factor", AppConfig.FACTOR["MASTER"]))
-        compound_timing = U.normalize_compound(row.get("Compound_Timing", AppConfig.COMPOUND["NONE"]))
+        project = st.selectbox("基準プロジェクト", projects)
+        send_scope = st.radio("送信対象", ["選択中プロジェクトのみ", "全有効プロジェクト"], horizontal=True)
 
         st.markdown("#### 本日のAPR要素（単純合算）")
         c1, c2 = st.columns(2)
@@ -895,18 +906,45 @@ class AppUI:
             else:
                 st.warning("％付きの数値候補は見つかりませんでした。")
 
-        mem = self.repo.project_members_active(members_df, project)
-        if mem.empty:
-            st.warning("このプロジェクトに 🟢運用中 のメンバーがいません。")
+        target_projects = projects if send_scope == "全有効プロジェクト" else [project]
+
+        preview_rows: List[dict] = []
+        total_members, total_principal, total_reward = 0, 0.0, 0.0
+
+        for p in target_projects:
+            row = settings_df[settings_df["Project_Name"] == str(p)].iloc[0]
+            project_net_factor = float(row.get("Net_Factor", AppConfig.FACTOR["MASTER"]))
+            compound_timing = U.normalize_compound(row.get("Compound_Timing", AppConfig.COMPOUND["NONE"]))
+
+            mem = self.repo.project_members_active(members_df, p)
+            if mem.empty:
+                continue
+
+            mem_calc = self.engine.calc_project_apr(mem, float(apr), project_net_factor, p)
+            total_members += len(mem_calc)
+            total_principal += float(mem_calc["Principal"].sum())
+            total_reward += float(mem_calc["DailyAPR"].sum())
+
+            for _, r in mem_calc.iterrows():
+                preview_rows.append({
+                    "Project_Name": p,
+                    "PersonName": str(r["PersonName"]).strip(),
+                    "Rank": str(r["Rank"]).strip(),
+                    "Compound_Timing": U.compound_label(compound_timing),
+                    "Principal": U.fmt_usd(float(r["Principal"])),
+                    "DailyAPR": U.fmt_usd(float(r["DailyAPR"])),
+                    "Line_User_ID": str(r["Line_User_ID"]).strip(),
+                    "LINE_DisplayName": str(r["LINE_DisplayName"]).strip(),
+                })
+
+        if total_members == 0:
+            st.warning("送信対象に 🟢運用中 のメンバーがいません。")
             return
 
-        mem = self.engine.calc_project_apr(mem, float(apr), project_net_factor, project)
-        total_principal, total_reward, n_total = float(mem["Principal"].sum()), float(mem["DailyAPR"].sum()), len(mem)
-
+        st.write(f"- 送信対象プロジェクト数: {len(target_projects)}")
+        st.write(f"- 対象人数: {total_members}")
         st.write(f"- 総元本: {U.fmt_usd(total_principal)}")
-        st.write(f"- 人数: {n_total}")
         st.write(f"- 本日総配当: {U.fmt_usd(total_reward)}")
-        st.write(f"- 複利タイプ: {U.compound_label(compound_timing)}")
         st.write(f"- Ledger保存先: {self.repo.gs.names.LEDGER}")
         st.write(f"- サマリー保存先: {self.repo.gs.names.APR_SUMMARY}")
 
@@ -915,17 +953,7 @@ class AppUI:
                 ts = U.fmt_dt(U.now_jst())
                 test_note = f"TEST_WRITE_{ts}"
 
-                self.repo.append_ledger(
-                    ts,
-                    "TEST",
-                    "TEST_USER",
-                    AppConfig.TYPE["APR"],
-                    1.2345,
-                    test_note,
-                    "",
-                    "",
-                    "",
-                )
+                self.repo.append_ledger(ts, "TEST", "TEST_USER", AppConfig.TYPE["APR"], 1.2345, test_note)
 
                 self.repo.gs.clear_cache()
                 last_ledger_rows = self.repo.gs.last_rows("LEDGER", 5)
@@ -944,26 +972,13 @@ class AppUI:
                 with st.expander("Ledger 最終5行", expanded=True):
                     for row_ in last_ledger_rows:
                         st.write(row_)
-
             except Exception as e:
                 st.error(f"テスト書き込み失敗: {e}")
 
         with st.expander("個人別の本日配当（確認）", expanded=False):
-            show = mem[["PersonName", "Rank", "Principal", "DailyAPR", "Line_User_ID", "LINE_DisplayName"]].copy()
-            show["Compound_Timing"] = U.compound_label(compound_timing)
-            show["Principal"] = show["Principal"].apply(U.fmt_usd)
-            show["DailyAPR"] = show["DailyAPR"].apply(U.fmt_usd)
-            show = show[["PersonName", "Rank", "Compound_Timing", "Principal", "DailyAPR", "Line_User_ID", "LINE_DisplayName"]]
-            st.dataframe(show, use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
 
-            if compound_timing == AppConfig.COMPOUND["MONTHLY"]:
-                st.info("このプロジェクトは月次複利です。APR確定時は Ledger に記録のみ行い、元本反映は下の「未反映APRを元本へ反映」で実行します。")
-            elif compound_timing == AppConfig.COMPOUND["DAILY"]:
-                st.info("このプロジェクトは日次複利です。APR確定時に本日配当が元本へ即時加算されます。")
-            else:
-                st.info("このプロジェクトは単利です。元本には加算されません。")
-
-        if st.button("APRを確定して全員にLINE送信"):
+        if st.button("APRを確定して対象全員にLINE送信"):
             try:
                 evidence_url = None
                 if uploaded:
@@ -972,59 +987,86 @@ class AppUI:
                         st.error("画像アップロードに失敗しました。")
                         return
 
-                ts, apr_ledger_count = U.fmt_dt(U.now_jst()), 0
+                ts = U.fmt_dt(U.now_jst())
+                apr_ledger_count, line_log_count, success, fail = 0, 0, 0, 0
 
-                for _, r in mem.iterrows():
-                    person = str(r["PersonName"]).strip()
-                    uid = str(r["Line_User_ID"]).strip()
-                    disp = str(r["LINE_DisplayName"]).strip()
-                    daily_apr = float(r["DailyAPR"])
-                    note = f"APR:{apr}%, Mode:{r['CalcMode']}, Rank:{r['Rank']}, Factor:{r['Factor']}, CompoundTiming:{compound_timing}"
-                    self.repo.append_ledger(ts, project, person, AppConfig.TYPE["APR"], daily_apr, note, evidence_url or "", uid, disp)
-                    apr_ledger_count += 1
+                # APR記録 + daily元本反映
+                for p in target_projects:
+                    row = settings_df[settings_df["Project_Name"] == str(p)].iloc[0]
+                    project_net_factor = float(row.get("Net_Factor", AppConfig.FACTOR["MASTER"]))
+                    compound_timing = U.normalize_compound(row.get("Compound_Timing", AppConfig.COMPOUND["NONE"]))
 
-                if compound_timing == AppConfig.COMPOUND["DAILY"]:
-                    mem_map = {str(r["PersonName"]).strip(): float(r["DailyAPR"]) for _, r in mem.iterrows()}
-                    for i in range(len(members_df)):
-                        if str(members_df.loc[i, "Project_Name"]).strip() == str(project).strip() and U.truthy(members_df.loc[i, "IsActive"]):
-                            pn = str(members_df.loc[i, "PersonName"]).strip()
-                            addv = float(mem_map.get(pn, 0.0))
-                            if addv != 0.0:
-                                members_df.loc[i, "Principal"] = float(members_df.loc[i, "Principal"]) + addv
-                                members_df.loc[i, "UpdatedAt_JST"] = ts
-                    self.repo.write_members(members_df)
+                    mem = self.repo.project_members_active(members_df, p)
+                    if mem.empty:
+                        continue
 
+                    mem_calc = self.engine.calc_project_apr(mem, float(apr), project_net_factor, p)
+
+                    for _, r in mem_calc.iterrows():
+                        person = str(r["PersonName"]).strip()
+                        uid = str(r["Line_User_ID"]).strip()
+                        disp = str(r["LINE_DisplayName"]).strip()
+                        daily_apr = float(r["DailyAPR"])
+
+                        note = f"APR:{apr}%, Mode:{r['CalcMode']}, Rank:{r['Rank']}, Factor:{r['Factor']}, CompoundTiming:{compound_timing}"
+                        self.repo.append_ledger(ts, p, person, AppConfig.TYPE["APR"], daily_apr, note, evidence_url or "", uid, disp)
+                        apr_ledger_count += 1
+
+                    if compound_timing == AppConfig.COMPOUND["DAILY"]:
+                        mem_map = {str(r["PersonName"]).strip(): float(r["DailyAPR"]) for _, r in mem_calc.iterrows()}
+                        for i in range(len(members_df)):
+                            if str(members_df.loc[i, "Project_Name"]).strip() == str(p).strip() and U.truthy(members_df.loc[i, "IsActive"]):
+                                pn = str(members_df.loc[i, "PersonName"]).strip()
+                                addv = float(mem_map.get(pn, 0.0))
+                                if addv != 0.0:
+                                    members_df.loc[i, "Principal"] = float(members_df.loc[i, "Principal"]) + addv
+                                    members_df.loc[i, "UpdatedAt_JST"] = ts
+
+                self.repo.write_members(members_df)
+
+                # LINE送信
                 token = ExternalService.get_line_token(AdminAuth.current_namespace())
-                line_log_count, success, fail = 0, 0, 0
 
-                for _, r in mem.iterrows():
-                    person = str(r["PersonName"]).strip()
-                    uid = str(r["Line_User_ID"]).strip()
-                    disp = str(r["LINE_DisplayName"]).strip()
-                    daily_reward = float(r["DailyAPR"])
+                for p in target_projects:
+                    row = settings_df[settings_df["Project_Name"] == str(p)].iloc[0]
+                    project_net_factor = float(row.get("Net_Factor", AppConfig.FACTOR["MASTER"]))
+                    compound_timing = U.normalize_compound(row.get("Compound_Timing", AppConfig.COMPOUND["NONE"]))
 
-                    personalized_msg = (
-                        "🏦【APR収益報告】\n"
-                        f"{person} 様\n"
-                        f"プロジェクト: {project}\n"
-                        f"報告日時: {U.now_jst().strftime('%Y/%m/%d %H:%M')}\n"
-                        f"総APR: {apr:.4f}%\n"
-                        f"本日配当: {U.fmt_usd(float(daily_reward))}\n"
-                        f"複利タイプ: {U.compound_label(compound_timing)}\n"
-                    )
+                    mem = self.repo.project_members_active(members_df, p)
+                    if mem.empty:
+                        continue
 
-                    if not uid:
-                        code, line_note = 0, "LINE未送信: Line_User_IDなし"
-                    else:
-                        code = ExternalService.send_line_push(token, uid, personalized_msg, evidence_url)
-                        line_note = f"HTTP:{code}, APR:{apr}%, CompoundTiming:{compound_timing}"
+                    mem_calc = self.engine.calc_project_apr(mem, float(apr), project_net_factor, p)
 
-                    self.repo.append_ledger(ts, project, person, AppConfig.TYPE["LINE"], 0, line_note, evidence_url or "", uid, disp)
-                    line_log_count += 1
-                    if code == 200:
-                        success += 1
-                    else:
-                        fail += 1
+                    for _, r in mem_calc.iterrows():
+                        person = str(r["PersonName"]).strip()
+                        uid = str(r["Line_User_ID"]).strip()
+                        disp = str(r["LINE_DisplayName"]).strip()
+                        daily_reward = float(r["DailyAPR"])
+
+                        personalized_msg = (
+                            "🏦【APR収益報告】\n"
+                            f"{person} 様\n"
+                            f"プロジェクト: {p}\n"
+                            f"報告日時: {U.now_jst().strftime('%Y/%m/%d %H:%M')}\n"
+                            f"総APR: {apr:.4f}%\n"
+                            f"本日配当: {U.fmt_usd(float(daily_reward))}\n"
+                            f"複利タイプ: {U.compound_label(compound_timing)}\n"
+                        )
+
+                        if not uid:
+                            code, line_note = 0, "LINE未送信: Line_User_IDなし"
+                        else:
+                            code = ExternalService.send_line_push(token, uid, personalized_msg, evidence_url)
+                            line_note = f"HTTP:{code}, APR:{apr}%, CompoundTiming:{compound_timing}"
+
+                        self.repo.append_ledger(ts, p, person, AppConfig.TYPE["LINE"], 0, line_note, evidence_url or "", uid, disp)
+                        line_log_count += 1
+
+                        if code == 200:
+                            success += 1
+                        else:
+                            fail += 1
 
                 self.repo.gs.clear_cache()
                 ledger_df_after = self.repo.load_ledger()
@@ -1038,24 +1080,29 @@ class AppUI:
                     f"Ledger:{self.repo.gs.names.LEDGER} / Summary:{self.repo.gs.names.APR_SUMMARY}"
                 )
                 st.rerun()
+
             except Exception as e:
                 st.error(f"APR確定処理でエラー: {e}")
                 st.stop()
 
-        if compound_timing == AppConfig.COMPOUND["MONTHLY"]:
-            st.divider()
-            st.markdown("#### 月次複利反映")
-            if st.button("未反映APRを元本へ反映"):
-                try:
-                    count, total_added = self.engine.apply_monthly_compound(self.repo, members_df, project)
-                    if count == 0:
-                        st.info("未反映のAPRはありません。")
-                    else:
-                        st.success(f"{count}名に反映しました。合計反映額: {U.fmt_usd(total_added)}")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"月次複利反映でエラー: {e}")
-                    st.stop()
+        if send_scope == "選択中プロジェクトのみ":
+            row = settings_df[settings_df["Project_Name"] == str(project)].iloc[0]
+            compound_timing = U.normalize_compound(row.get("Compound_Timing", AppConfig.COMPOUND["NONE"]))
+
+            if compound_timing == AppConfig.COMPOUND["MONTHLY"]:
+                st.divider()
+                st.markdown("#### 月次複利反映")
+                if st.button("未反映APRを元本へ反映"):
+                    try:
+                        count, total_added = self.engine.apply_monthly_compound(self.repo, members_df, project)
+                        if count == 0:
+                            st.info("未反映のAPRはありません。")
+                        else:
+                            st.success(f"{count}名に反映しました。合計反映額: {U.fmt_usd(total_added)}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"月次複利反映でエラー: {e}")
+                        st.stop()
 
     def render_cash(self, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> None:
         st.subheader("💸 入金 / 出金（個別LINE通知）")
