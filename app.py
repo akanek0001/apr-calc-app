@@ -986,34 +986,15 @@ class AppUI:
 
         st.divider()
         st.markdown("#### LINE通知履歴")
-
-        c_hist1, c_hist2 = st.columns([1, 1])
-        with c_hist1:
-            if st.button("LINE送信履歴をリセット表示", use_container_width=True):
-                st.session_state["hide_line_history"] = True
-                st.rerun()
-
-        with c_hist2:
-            if st.button("LINE送信履歴を再表示", use_container_width=True):
-                st.session_state["hide_line_history"] = False
-                st.rerun()
-
-        if st.session_state.get("hide_line_history", False):
-            st.info("LINE通知履歴はリセット表示中です。シートの記録は削除していません。")
+        if ledger_df.empty:
+            st.info("通知履歴がありません。")
         else:
-            if ledger_df.empty:
-                st.info("通知履歴がありません。")
+            line_hist = ledger_df[ledger_df["Type"].astype(str).str.strip() == AppConfig.TYPE["LINE"]].copy()
+            if line_hist.empty:
+                st.info("LINE通知履歴はまだありません。")
             else:
-                line_hist = ledger_df[ledger_df["Type"].astype(str).str.strip() == AppConfig.TYPE["LINE"]].copy()
-                if line_hist.empty:
-                    st.info("LINE通知履歴はまだありません。")
-                else:
-                    cols = [c for c in ["Datetime_JST", "Project_Name", "PersonName", "Type", "Line_User_ID", "LINE_DisplayName", "Note", "Source"] if c in line_hist.columns]
-                    st.dataframe(
-                        line_hist.sort_values("Datetime_JST", ascending=False)[cols].head(100),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
+                cols = [c for c in ["Datetime_JST", "Project_Name", "PersonName", "Type", "Line_User_ID", "LINE_DisplayName", "Note", "Source"] if c in line_hist.columns]
+                st.dataframe(line_hist.sort_values("Datetime_JST", ascending=False)[cols].head(100), use_container_width=True, hide_index=True)
 
     def render_apr(self, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> None:
         st.subheader("📈 APR 確定")
@@ -1708,10 +1689,6 @@ LINEユーザー情報を `LineUsers` シートへ自動登録し、管理画面
 - APR確定時は `Type=APR` が Ledger に記録されます
 - LINE送信結果は `Type=LINE` が Ledger に記録されます
 - サマリーは Ledger の `Type=APR` を集計します
-
-### LINE送信履歴を消したい
-- ダッシュボードの「LINE送信履歴をリセット表示」は画面表示だけを消します
-- シートのLedger記録は削除しません
 """
             )
 
@@ -1745,8 +1722,6 @@ def main() -> None:
 
     if "page" not in st.session_state:
         st.session_state["page"] = AppConfig.PAGE["DASHBOARD"]
-    if "hide_line_history" not in st.session_state:
-        st.session_state["hide_line_history"] = False
 
     con = st.secrets.get("connections", {}).get("gsheets", {})
     sid = U.extract_sheet_id(str(con.get("spreadsheet", "")).strip())
