@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from io import BytesIO
-from typing import Any, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import json, re
 
 import pandas as pd
@@ -63,6 +63,7 @@ class AppConfig:
     }
 
     APR_LINE_NOTE_KEYWORD = "APR:"
+    SESSION_DATA_KEYS = ("settings_df", "members_df", "ledger_df", "apr_summary_df", "line_users_df")
 
 
 # =========================================================
@@ -94,10 +95,22 @@ class U:
             return 0.0
 
     @staticmethod
+    def to_num_series(s: pd.Series, default: float = 0.0) -> pd.Series:
+        out = pd.to_numeric(
+            s.astype(str).str.replace(",", "", regex=False).str.replace("$", "", regex=False).str.replace("%", "", regex=False).str.strip(),
+            errors="coerce",
+        )
+        return out.fillna(default)
+
+    @staticmethod
     def truthy(v: Any) -> bool:
         if isinstance(v, bool):
             return v
         return str(v).strip().lower() in ("1", "true", "yes", "y", "on", "はい", "t")
+
+    @staticmethod
+    def truthy_series(s: pd.Series) -> pd.Series:
+        return s.astype(str).str.strip().str.lower().isin(["1", "true", "yes", "y", "on", "はい", "t"])
 
     @staticmethod
     def clean_cols(df: pd.DataFrame) -> pd.DataFrame:
@@ -528,9 +541,9 @@ class Repository:
         df = df[AppConfig.HEADERS["SETTINGS"]].copy()
         df["Project_Name"] = df["Project_Name"].astype(str).str.strip()
         df = df[df["Project_Name"] != ""].copy()
-        df["Net_Factor"] = df["Net_Factor"].apply(lambda x: U.to_f(x) if str(x).strip() else AppConfig.FACTOR["MASTER"])
+        df["Net_Factor"] = U.to_num_series(df["Net_Factor"], AppConfig.FACTOR["MASTER"])
         df.loc[df["Net_Factor"] <= 0, "Net_Factor"] = AppConfig.FACTOR["MASTER"]
-        df["IsCompound"] = df["IsCompound"].apply(U.truthy)
+        df["IsCompound"] = U.truthy_series(df["IsCompound"])
         df["Compound_Timing"] = df["Compound_Timing"].apply(U.normalize_compound)
         df["Active"] = df["Active"].apply(lambda x: U.truthy(x) if str(x).strip() else True)
         df["UpdatedAt_JST"] = df["UpdatedAt_JST"].astype(str).str.strip()
@@ -559,7 +572,7 @@ class Repository:
         out = out[AppConfig.HEADERS["SETTINGS"]].copy()
         out["Project_Name"] = out["Project_Name"].astype(str).str.strip()
         out = out[out["Project_Name"] != ""].copy()
-        out["Net_Factor"] = out["Net_Factor"].apply(lambda x: f"{float(U.to_f(x)):.2f}")
+        out["Net_Factor"] = U.to_num_series(out["Net_Factor"], AppConfig.FACTOR["MASTER"]).map(lambda x: f"{float(x):.2f}")
         out["IsCompound"] = out["IsCompound"].apply(lambda x: "TRUE" if U.truthy(x) else "FALSE")
         out["Compound_Timing"] = out["Compound_Timing"].apply(U.normalize_compound)
         out["Active"] = out["Active"].apply(lambda x: "TRUE" if U.truthy(x) else "FALSE")
@@ -584,7 +597,7 @@ class Repository:
         other_df = repaired[repaired["Project_Name"].str.upper() != AppConfig.PROJECT["PERSONAL"]].drop_duplicates(subset=["Project_Name"], keep="last")
         repaired = pd.concat([personal_df, other_df], ignore_index=True)
 
-        repaired["Net_Factor"] = repaired["Net_Factor"].apply(lambda x: U.to_f(x) if str(x).strip() else AppConfig.FACTOR["MASTER"])
+        repaired["Net_Factor"] = U.to_num_series(repaired["Net_Factor"], AppConfig.FACTOR["MASTER"])
         repaired.loc[repaired["Net_Factor"] <= 0, "Net_Factor"] = AppConfig.FACTOR["MASTER"]
         repaired["IsCompound"] = repaired["IsCompound"].apply(U.truthy)
         repaired["Compound_Timing"] = repaired["Compound_Timing"].apply(U.normalize_compound)
@@ -633,7 +646,7 @@ class Repository:
 
         df["Project_Name"] = df["Project_Name"].astype(str).str.strip()
         df["PersonName"] = df["PersonName"].astype(str).str.strip()
-        df["Principal"] = df["Principal"].apply(U.to_f)
+        df["Principal"] = U.to_num_series(df["Principal"])
         df["Line_User_ID"] = df["Line_User_ID"].astype(str).str.strip()
         df["LINE_DisplayName"] = df["LINE_DisplayName"].astype(str).str.strip()
         df["Rank"] = df["Rank"].apply(U.normalize_rank)
@@ -642,7 +655,7 @@ class Repository:
 
     def write_members(self, members_df: pd.DataFrame) -> None:
         out = members_df.copy()
-        out["Principal"] = out["Principal"].apply(lambda x: f"{float(x):.6f}")
+        out["Principal"] = U.to_num_series(out["Principal"]).map(lambda x: f"{float(x):.6f}")
         out["IsActive"] = out["IsActive"].apply(lambda x: "TRUE" if U.truthy(x) else "FALSE")
         out["Rank"] = out["Rank"].apply(U.normalize_rank)
         self.gs.write_df("MEMBERS", out)
@@ -660,7 +673,7 @@ class Repository:
         for c in AppConfig.HEADERS["LEDGER"]:
             if c not in df.columns:
                 df[c] = ""
-        df["Amount"] = df["Amount"].apply(U.to_f)
+        df["Amount"] = U.to_num_series(df["Amount"])
         return df
 
     def load_line_users(self) -> pd.DataFrame:
@@ -693,8 +706,8 @@ class Repository:
         out = summary_df.copy()
         out["Date_JST"] = out["Date_JST"].astype(str)
         out["PersonName"] = out["PersonName"].astype(str)
-        out["Total_APR"] = out["Total_APR"].apply(lambda x: f"{float(U.to_f(x)):.6f}")
-        out["APR_Count"] = out["APR_Count"].apply(lambda x: str(int(float(x))) if str(x).strip() else "0")
+        out["Total_APR"] = U.to_num_series(out["Total_APR"]).map(lambda x: f"{float(x):.6f}")
+        out["APR_Count"] = U.to_num_series(out["APR_Count"]).astype(int).astype(str)
         out["Asset_Ratio"] = out["Asset_Ratio"].astype(str)
         out["LINE_DisplayName"] = out["LINE_DisplayName"].astype(str)
         self.gs.write_df("APR_SUMMARY", out)
@@ -727,7 +740,7 @@ class Repository:
     def active_projects(self, settings_df: pd.DataFrame) -> List[str]:
         if settings_df.empty:
             return []
-        return settings_df[settings_df["Active"] == True]["Project_Name"].dropna().astype(str).unique().tolist()
+        return settings_df.loc[settings_df["Active"] == True, "Project_Name"].dropna().astype(str).unique().tolist()
 
     def project_members_active(self, members_df: pd.DataFrame, project: str) -> pd.DataFrame:
         if members_df.empty:
@@ -756,10 +769,7 @@ class Repository:
         if df.empty:
             return set()
 
-        out: Set[Tuple[str, str]] = set()
-        for _, r in df.iterrows():
-            out.add((str(r["Project_Name"]).strip(), str(r["PersonName"]).strip()))
-        return out
+        return set(zip(df["Project_Name"].astype(str).str.strip(), df["PersonName"].astype(str).str.strip()))
 
     def reset_today_apr_records(self, date_jst: str, project: str) -> Tuple[int, int]:
         ws = self.gs.ws("LEDGER")
@@ -820,8 +830,8 @@ class FinanceEngine:
         out = mem.copy()
 
         if str(project_name).strip().upper() == AppConfig.PROJECT["PERSONAL"]:
-            out["Factor"] = out["Rank"].apply(U.rank_factor)
-            out["DailyAPR"] = out.apply(lambda r: (float(r["Principal"]) * (apr_percent / 100.0) * float(r["Factor"])) / 365.0, axis=1)
+            out["Factor"] = out["Rank"].map(lambda x: U.rank_factor(x))
+            out["DailyAPR"] = (out["Principal"] * (apr_percent / 100.0) * out["Factor"]) / 365.0
             out["CalcMode"] = "PERSONAL"
             return out
 
@@ -844,7 +854,7 @@ class FinanceEngine:
 
         apr_df["PersonName"] = apr_df["PersonName"].astype(str).str.strip()
         apr_df["LINE_DisplayName"] = apr_df["LINE_DisplayName"].astype(str).str.strip()
-        apr_df["Amount"] = apr_df["Amount"].apply(U.to_f)
+        apr_df["Amount"] = U.to_num_series(apr_df["Amount"])
 
         active_mem = members_df[members_df["IsActive"] == True].copy() if not members_df.empty and "IsActive" in members_df.columns else members_df.copy()
         total_assets = float(active_mem["Principal"].sum()) if not active_mem.empty else 0.0
@@ -853,7 +863,7 @@ class FinanceEngine:
         disp_map = apr_df.sort_values("Datetime_JST", ascending=False).drop_duplicates(subset=["PersonName"])[["PersonName", "LINE_DisplayName"]].copy()
         summary = summary.merge(disp_map, on="PersonName", how="left")
         summary["Date_JST"] = U.fmt_date(U.now_jst())
-        summary["Asset_Ratio"] = summary["Total_APR"].apply(lambda x: f"{(float(x) / total_assets) * 100:.2f}%" if total_assets > 0 else "0.00%")
+        summary["Asset_Ratio"] = summary["Total_APR"].map(lambda x: f"{(float(x) / total_assets) * 100:.2f}%" if total_assets > 0 else "0.00%")
         return summary[["Date_JST", "PersonName", "Total_APR", "APR_Count", "Asset_Ratio", "LINE_DisplayName"]].copy()
 
     def apply_monthly_compound(self, repo: Repository, members_df: pd.DataFrame, project: str) -> Tuple[int, float]:
@@ -875,25 +885,23 @@ class FinanceEngine:
             return 0, 0.0
 
         ts, updated_count, total_added = U.fmt_dt(U.now_jst()), 0, 0.0
+        add_map = dict(zip(sums["PersonName"].astype(str).str.strip(), U.to_num_series(sums["Amount"])))
 
-        for _, row in sums.iterrows():
-            person, addv = str(row["PersonName"]).strip(), float(row["Amount"])
-            if addv == 0:
-                continue
+        mask_project = members_df["Project_Name"].astype(str).str.strip() == str(project).strip()
+        mask_person = members_df["PersonName"].astype(str).str.strip().isin(add_map.keys())
+        mask = mask_project & mask_person
 
-            mask = (
-                (members_df["Project_Name"].astype(str).str.strip() == str(project).strip()) &
-                (members_df["PersonName"].astype(str).str.strip() == person)
-            )
+        if mask.any():
             idxs = members_df[mask].index.tolist()
-            if not idxs:
-                continue
-
-            idx = idxs[0]
-            members_df.loc[idx, "Principal"] = float(members_df.loc[idx, "Principal"]) + addv
-            members_df.loc[idx, "UpdatedAt_JST"] = ts
-            updated_count += 1
-            total_added += addv
+            for idx in idxs:
+                person = str(members_df.loc[idx, "PersonName"]).strip()
+                addv = float(add_map.get(person, 0.0))
+                if addv == 0:
+                    continue
+                members_df.loc[idx, "Principal"] = float(members_df.loc[idx, "Principal"]) + addv
+                members_df.loc[idx, "UpdatedAt_JST"] = ts
+                updated_count += 1
+                total_added += addv
 
         if updated_count > 0:
             repo.write_members(members_df)
@@ -919,6 +927,46 @@ class FinanceEngine:
             repo.gs.clear_cache()
 
         return updated_count, total_added
+
+
+# =========================================================
+# SESSION DATA MANAGER
+# =========================================================
+class SessionData:
+    @staticmethod
+    def clear_all() -> None:
+        for k in AppConfig.SESSION_DATA_KEYS:
+            if k in st.session_state:
+                del st.session_state[k]
+
+    @staticmethod
+    def sync_all(repo: Repository, engine: FinanceEngine, force: bool = False) -> Dict[str, pd.DataFrame]:
+        if force or "settings_df" not in st.session_state:
+            st.session_state["settings_df"] = repo.repair_settings(repo.load_settings())
+        if force or "members_df" not in st.session_state:
+            st.session_state["members_df"] = repo.load_members()
+        if force or "ledger_df" not in st.session_state:
+            st.session_state["ledger_df"] = repo.load_ledger()
+        if force or "line_users_df" not in st.session_state:
+            st.session_state["line_users_df"] = repo.load_line_users()
+
+        st.session_state["apr_summary_df"] = engine.build_apr_summary(
+            st.session_state["ledger_df"], st.session_state["members_df"]
+        )
+
+        return {
+            "settings_df": st.session_state["settings_df"],
+            "members_df": st.session_state["members_df"],
+            "ledger_df": st.session_state["ledger_df"],
+            "apr_summary_df": st.session_state["apr_summary_df"],
+            "line_users_df": st.session_state["line_users_df"],
+        }
+
+    @staticmethod
+    def after_write(repo: Repository, engine: FinanceEngine) -> Dict[str, pd.DataFrame]:
+        repo.gs.clear_cache()
+        SessionData.clear_all()
+        return SessionData.sync_all(repo, engine, force=True)
 
 
 # =========================================================
@@ -964,7 +1012,7 @@ class AppUI:
                 st.info("PERSONAL データがありません。")
             else:
                 p = personal_df[["PersonName", "Principal", "LINE_DisplayName"]].copy()
-                p["資産割合"] = p["Principal"].apply(lambda x: f"{(float(x) / total_assets) * 100:.2f}%" if total_assets > 0 else "0.00%")
+                p["資産割合"] = p["Principal"].map(lambda x: f"{(float(x) / total_assets) * 100:.2f}%" if total_assets > 0 else "0.00%")
                 p["Principal_num"] = p["Principal"].astype(float)
                 p["Principal"] = p["Principal"].apply(U.fmt_usd)
                 p = p.sort_values("Principal_num", ascending=False)[["PersonName", "Principal", "資産割合", "LINE_DisplayName"]]
@@ -976,7 +1024,7 @@ class AppUI:
             st.info("APR履歴がありません。")
         else:
             view = apr_summary_df.copy()
-            view["Total_APR_num"] = view["Total_APR"].apply(U.to_f)
+            view["Total_APR_num"] = U.to_num_series(view["Total_APR"])
             view["Total_APR"] = view["Total_APR_num"].apply(U.fmt_usd)
             view = view.sort_values("Total_APR_num", ascending=False)[["PersonName", "Total_APR", "APR_Count", "Asset_Ratio", "LINE_DisplayName"]]
             view = view.rename(columns={"Total_APR": "累計APR", "APR_Count": "件数", "Asset_Ratio": "総資産比"})
@@ -1007,11 +1055,7 @@ class AppUI:
                     st.info("LINE通知履歴はまだありません。")
                 else:
                     cols = [c for c in ["Datetime_JST", "Project_Name", "PersonName", "Type", "Line_User_ID", "LINE_DisplayName", "Note", "Source"] if c in line_hist.columns]
-                    st.dataframe(
-                        line_hist.sort_values("Datetime_JST", ascending=False)[cols].head(100),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
+                    st.dataframe(line_hist.sort_values("Datetime_JST", ascending=False)[cols].head(100), use_container_width=True, hide_index=True)
 
     def render_apr(self, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> None:
         st.subheader("📈 APR 確定")
@@ -1116,11 +1160,9 @@ class AppUI:
             if st.button("本日のAPR記録をリセット"):
                 try:
                     deleted_apr, deleted_line = self.repo.reset_today_apr_records(today_key, project)
-                    self.repo.gs.clear_cache()
-                    ledger_df_after = self.repo.load_ledger()
-                    summary_df = self.engine.build_apr_summary(ledger_df_after, members_df)
-                    self.repo.write_apr_summary(summary_df)
-                    self.repo.gs.clear_cache()
+                    data = SessionData.after_write(self.repo, self.engine)
+                    self.repo.write_apr_summary(data["apr_summary_df"])
+                    data = SessionData.after_write(self.repo, self.engine)
 
                     if deleted_apr == 0 and deleted_line == 0:
                         st.info("削除対象はありません。")
@@ -1144,7 +1186,7 @@ class AppUI:
                 apr_ledger_count, line_log_count, success, fail, skip_count = 0, 0, 0, 0, 0
                 existing_apr_keys = self.repo.existing_apr_keys_for_date(today_key)
                 token = ExternalService.get_line_token(AdminAuth.current_namespace())
-                daily_add_map: dict[Tuple[str, str], float] = {}
+                daily_add_map: Dict[Tuple[str, str], float] = {}
 
                 for p in target_projects:
                     row = settings_df[settings_df["Project_Name"] == str(p)].iloc[0]
@@ -1210,11 +1252,9 @@ class AppUI:
                             members_df.loc[i, "UpdatedAt_JST"] = ts
                     self.repo.write_members(members_df)
 
-                self.repo.gs.clear_cache()
-                ledger_df_after = self.repo.load_ledger()
-                summary_df = self.engine.build_apr_summary(ledger_df_after, members_df)
-                self.repo.write_apr_summary(summary_df)
-                self.repo.gs.clear_cache()
+                data = SessionData.after_write(self.repo, self.engine)
+                self.repo.write_apr_summary(data["apr_summary_df"])
+                SessionData.after_write(self.repo, self.engine)
 
                 st.success(
                     f"APR記録:{apr_ledger_count}件 / LINE履歴記録:{line_log_count}件 / "
@@ -1236,6 +1276,7 @@ class AppUI:
                 if st.button("未反映APRを元本へ反映"):
                     try:
                         count, total_added = self.engine.apply_monthly_compound(self.repo, members_df, project)
+                        SessionData.after_write(self.repo, self.engine)
                         if count == 0:
                             st.info("未反映のAPRはありません。")
                         else:
@@ -1312,8 +1353,8 @@ class AppUI:
                     code, line_note = 0, "LINE未送信: Line_User_IDなし"
 
                 self.repo.append_ledger(ts, project, person, AppConfig.TYPE["LINE"], 0, line_note, evidence_url or "", uid, str(row["LINE_DisplayName"]).strip())
+                SessionData.after_write(self.repo, self.engine)
 
-                self.repo.gs.clear_cache()
                 if code == 200:
                     st.success("入出金保存＆LINE送信記録完了")
                 else:
@@ -1323,7 +1364,7 @@ class AppUI:
                 st.error(f"入出金処理でエラー: {e}")
                 st.stop()
 
-    def render_admin(self, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> pd.DataFrame:
+    def render_admin(self, settings_df: pd.DataFrame, members_df: pd.DataFrame, line_users_df: pd.DataFrame) -> pd.DataFrame:
         st.subheader("⚙️ 管理")
 
         cfix1, _ = st.columns([1, 2])
@@ -1331,6 +1372,7 @@ class AppUI:
             if st.button("Settingsを自動修復", use_container_width=True):
                 try:
                     self.repo.repair_settings(self.repo.load_settings())
+                    SessionData.after_write(self.repo, self.engine)
                     st.success(f"{self.repo.gs.names.SETTINGS} を修復しました。")
                     st.rerun()
                 except Exception as e:
@@ -1343,7 +1385,6 @@ class AppUI:
 
         project = st.selectbox("対象プロジェクト", projects, key="admin_project")
 
-        line_users_df = self.repo.load_line_users()
         line_users: List[Tuple[str, str, str]] = []
         if not line_users_df.empty:
             tmp = line_users_df[line_users_df["Line_User_ID"].astype(str).str.startswith("U")].drop_duplicates(subset=["Line_User_ID"], keep="last")
@@ -1437,7 +1478,7 @@ class AppUI:
                             fail += 1
                             failed_list.append(f"{lab}（HTTP {code}）")
 
-                    self.repo.gs.clear_cache()
+                    SessionData.after_write(self.repo, self.engine)
                     if fail == 0:
                         st.success(f"送信完了（成功:{success} / 失敗:{fail} / Ledger記録:{line_log_count}）")
                     else:
@@ -1448,42 +1489,29 @@ class AppUI:
         st.divider()
         if not view_all.empty:
             st.markdown("#### 状態切替")
-
-            toggle_src = view_all.copy()
-            toggle_src["状態"] = toggle_src["IsActive"].apply(U.bool_to_status)
-            toggle_show = toggle_src[["PersonName", "状態"]].copy()
-            toggle_row_ids = toggle_src["_row_id"].tolist()
-
-            toggle_edited = st.data_editor(
-                toggle_show,
-                use_container_width=True,
-                hide_index=True,
-                num_rows="fixed",
-                column_config={
-                    "状態": st.column_config.SelectboxColumn("状態", options=[AppConfig.STATUS["ON"], AppConfig.STATUS["OFF"]]),
-                },
-                key=f"toggle_status_editor_{project}",
-            )
-
-            if st.button("状態だけ保存", use_container_width=True, key=f"save_status_only_{project}"):
-                ts = U.fmt_dt(U.now_jst())
-                toggle_edited = toggle_edited.copy()
-                toggle_edited["_row_id"] = toggle_row_ids
-
-                for _, r in toggle_edited.iterrows():
-                    row_id = int(r["_row_id"])
-                    members_df.loc[row_id, "IsActive"] = U.status_to_bool(r["状態"])
+            c1, c2, c3 = st.columns([3, 2, 1])
+            with c1:
+                target_name = st.selectbox("対象メンバー", view_all["PersonName"].astype(str).tolist(), key=f"status_target_{project}")
+            cur_row = view_all[view_all["PersonName"].astype(str) == str(target_name)].iloc[0]
+            with c2:
+                new_status = st.selectbox("状態", [AppConfig.STATUS["ON"], AppConfig.STATUS["OFF"]], index=0 if U.truthy(cur_row["IsActive"]) else 1, key=f"status_value_{project}")
+            with c3:
+                st.write("")
+                st.write("")
+                if st.button("状態を保存", use_container_width=True, key=f"save_status_only_{project}"):
+                    row_id, ts = int(cur_row["_row_id"]), U.fmt_dt(U.now_jst())
+                    members_df.loc[row_id, "IsActive"] = U.status_to_bool(new_status)
                     members_df.loc[row_id, "UpdatedAt_JST"] = ts
 
-                msg = self.repo.validate_no_dup_lineid(members_df, project)
-                if msg:
-                    st.error(msg)
-                    return members_df
+                    msg = self.repo.validate_no_dup_lineid(members_df, project)
+                    if msg:
+                        st.error(msg)
+                        return members_df
 
-                self.repo.write_members(members_df)
-                self.repo.gs.clear_cache()
-                st.success("状態を更新しました。")
-                st.rerun()
+                    self.repo.write_members(members_df)
+                    SessionData.after_write(self.repo, self.engine)
+                    st.success(f"{target_name} の状態を更新しました。")
+                    st.rerun()
 
         st.divider()
         if not view_all.empty:
@@ -1511,7 +1539,7 @@ class AppUI:
             cancel = c2.button("編集を破棄（再読み込み）", use_container_width=True, key=f"cancel_members_{project}")
 
             if cancel:
-                self.repo.gs.clear_cache()
+                SessionData.after_write(self.repo, self.engine)
                 st.rerun()
 
             if save:
@@ -1534,7 +1562,7 @@ class AppUI:
                     return members_df
 
                 self.repo.write_members(members_df)
-                self.repo.gs.clear_cache()
+                SessionData.after_write(self.repo, self.engine)
                 st.success("保存しました。")
                 st.rerun()
 
@@ -1606,7 +1634,7 @@ class AppUI:
                 return members_df
 
             self.repo.write_members(members_df)
-            self.repo.gs.clear_cache()
+            SessionData.after_write(self.repo, self.engine)
             st.success(f"追加しました。登録先: {selected_project}")
             st.rerun()
 
@@ -1764,6 +1792,7 @@ def main() -> None:
             st.session_state["admin_ok"] = False
             st.session_state["admin_name"] = ""
             st.session_state["admin_namespace"] = ""
+            SessionData.clear_all()
             st.rerun()
 
     if "page" not in st.session_state:
@@ -1791,8 +1820,10 @@ def main() -> None:
     engine = FinanceEngine()
     ui = AppUI(repo, engine)
 
-    settings_df = repo.repair_settings(repo.load_settings())
-    members_df = repo.load_members()
+    data = SessionData.sync_all(repo, engine, force=False)
+    settings_df, members_df, ledger_df, apr_summary_df, line_users_df = (
+        data["settings_df"], data["members_df"], data["ledger_df"], data["apr_summary_df"], data["line_users_df"]
+    )
 
     menu = [
         AppConfig.PAGE["DASHBOARD"],
@@ -1805,8 +1836,6 @@ def main() -> None:
     st.session_state["page"] = page
 
     if page == AppConfig.PAGE["DASHBOARD"]:
-        ledger_df = repo.load_ledger()
-        apr_summary_df = engine.build_apr_summary(ledger_df, members_df)
         repo.write_apr_summary(apr_summary_df)
         ui.render_dashboard(members_df, ledger_df, apr_summary_df)
     elif page == AppConfig.PAGE["APR"]:
@@ -1814,7 +1843,7 @@ def main() -> None:
     elif page == AppConfig.PAGE["CASH"]:
         ui.render_cash(settings_df, members_df)
     elif page == AppConfig.PAGE["ADMIN"]:
-        ui.render_admin(settings_df, members_df)
+        ui.render_admin(settings_df, members_df, line_users_df)
     else:
         ui.render_help()
 
