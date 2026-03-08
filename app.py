@@ -1446,38 +1446,38 @@ class AppUI:
                             st.write("\n".join(failed_list))
 
         st.divider()
-if not view_all.empty:
-    st.markdown("#### ワンタップで 🟢運用中 / 🔴停止 を切替")
+        if not view_all.empty:
+            st.markdown("#### ワンタップで 🟢運用中 / 🔴停止 を切替")
 
-    head1, head2, head3 = st.columns([3, 2, 1])
-    head1.markdown("**対象メンバー**")
-    head2.markdown("**状態**")
-    head3.markdown("**操作**")
+            head1, head2, head3 = st.columns([3, 2, 1])
+            head1.markdown("**対象メンバー**")
+            head2.markdown("**状態**")
+            head3.markdown("**操作**")
 
-    for _, r in view_all.iterrows():
-        row_id = int(r["_row_id"])
-        person_name = str(r["PersonName"]).strip()
-        current_status = U.bool_to_status(r["IsActive"])
+            for _, r in view_all.iterrows():
+                row_id = int(r["_row_id"])
+                person_name = str(r["PersonName"]).strip()
+                current_status = U.bool_to_status(r["IsActive"])
 
-        c1, c2, c3 = st.columns([3, 2, 1])
-        c1.write(person_name)
-        c2.write(current_status)
+                c1, c2, c3 = st.columns([3, 2, 1])
+                c1.write(person_name)
+                c2.write(current_status)
 
-        btn_label = "停止" if U.truthy(r["IsActive"]) else "再開"
-        if c3.button(btn_label, key=f"toggle_member_{project}_{row_id}", use_container_width=True):
-            ts = U.fmt_dt(U.now_jst())
-            members_df.loc[row_id, "IsActive"] = not U.truthy(members_df.loc[row_id, "IsActive"])
-            members_df.loc[row_id, "UpdatedAt_JST"] = ts
+                btn_label = "停止" if U.truthy(r["IsActive"]) else "再開"
+                if c3.button(btn_label, key=f"toggle_member_{project}_{row_id}", use_container_width=True):
+                    ts = U.fmt_dt(U.now_jst())
+                    members_df.loc[row_id, "IsActive"] = not U.truthy(members_df.loc[row_id, "IsActive"])
+                    members_df.loc[row_id, "UpdatedAt_JST"] = ts
 
-            msg = self.repo.validate_no_dup_lineid(members_df, project)
-            if msg:
-                st.error(msg)
-                return members_df
+                    msg = self.repo.validate_no_dup_lineid(members_df, project)
+                    if msg:
+                        st.error(msg)
+                        return members_df
 
-            self.repo.write_members(members_df)
-            self.repo.gs.clear_cache()
-            st.success(f"{person_name} の状態を更新しました。")
-            st.rerun()
+                    self.repo.write_members(members_df)
+                    self.repo.gs.clear_cache()
+                    st.success(f"{person_name} の状態を更新しました。")
+                    st.rerun()
 
         st.divider()
         if not view_all.empty:
