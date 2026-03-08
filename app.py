@@ -214,23 +214,6 @@ def sheet_name(base: str, ns: str) -> str:
     return f"{base}__{ns}"
 
 
-def dedup_line_ids(df: pd.DataFrame) -> List[str]:
-    if df.empty or "Line_User_ID" not in df.columns:
-        return []
-    ids: List[str] = []
-    for v in df["Line_User_ID"].tolist():
-        s = str(v).strip()
-        if s.startswith("U"):
-            ids.append(s)
-    out: List[str] = []
-    seen = set()
-    for x in ids:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
-
-
 def insert_person_name(msg_common: str, person_name: str) -> str:
     name_line = f"{person_name} 様"
     lines = msg_common.splitlines()
@@ -449,11 +432,6 @@ def build_apr_personal_message(
     person_name: str,
     project: str,
     apr: float,
-    apr1: float,
-    apr2: float,
-    apr3: float,
-    apr4: float,
-    apr5: float,
     daily_apr: float,
     compound_timing: str,
 ) -> str:
@@ -461,8 +439,7 @@ def build_apr_personal_message(
     msg += f"{person_name} 様\n"
     msg += f"プロジェクト: {project}\n"
     msg += f"報告日時: {now_jst().strftime('%Y/%m/%d %H:%M')}\n"
-    msg += f"APR要素: {apr1:.4f}% / {apr2:.4f}% / {apr3:.4f}% / {apr4:.4f}% / {apr5:.4f}%\n"
-    msg += f"最終APR: {apr:.4f}%\n"
+    msg += f"総APR: {apr:.4f}%\n"
     msg += f"本日配当: {fmt_usd(float(daily_apr))}\n"
     msg += f"複利タイプ: {compound_label(compound_timing)}\n"
     return msg
@@ -562,9 +539,7 @@ class GSheets:
         try:
             values = ws.get_all_values()
         except APIError as e:
-            raise RuntimeError(
-                f"Google Sheets 読み取りエラー: {sheet_name} を取得できません。"
-            ) from e
+            raise RuntimeError(f"Google Sheets 読み取りエラー: {sheet_name} を取得できません。") from e
         except Exception as e:
             raise RuntimeError(f"{sheet_name} の読み取り中にエラーが発生しました: {e}") from e
 
@@ -1141,6 +1116,7 @@ def render_dashboard(gs: GSheets, members_df: pd.DataFrame, ledger_df: pd.DataFr
 def render_apr_page(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataFrame, admin_label: str) -> None:
     st.subheader("📈 APR 確定")
     st.caption(f"{RANK_LABEL} / PERSONAL=個別計算 / GROUP=総額均等割 / 管理者: {admin_label}")
+    st.info("この版は B方式です。履歴は PERSONAL シートではなく Ledger と APR_Summary に保存されます。")
 
     projects = active_projects(settings_df)
     if not projects:
@@ -1198,6 +1174,8 @@ def render_apr_page(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataF
     st.write(f"- 人数: {n_total}")
     st.write(f"- 本日総配当: {fmt_usd(total_reward)}")
     st.write(f"- 複利タイプ: {compound_label(compound_timing)}")
+    st.write(f"- Ledger保存先: {gs.cfg.ledger_sheet}")
+    st.write(f"- サマリー保存先: {gs.cfg.apr_summary_sheet}")
 
     with st.expander("個人別の本日配当（確認）", expanded=False):
         show = mem[[
@@ -1242,8 +1220,8 @@ def render_apr_page(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataF
                     return
 
             ts = fmt_dt(now_jst())
-
             apr_ledger_count = 0
+
             for _, r in mem.iterrows():
                 person = str(r["PersonName"]).strip()
                 uid = str(r["Line_User_ID"]).strip()
@@ -1251,7 +1229,6 @@ def render_apr_page(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataF
 
                 note = (
                     f"APR:{apr}%, "
-                    f"APR1:{apr1}%, APR2:{apr2}%, APR3:{apr3}%, APR4:{apr4}%, APR5:{apr5}%, "
                     f"Mode:{r['CalcMode']}, Rank:{r['Rank']}, Factor:{r['Factor']}, "
                     f"CompoundTiming:{compound_timing}"
                 )
@@ -1298,11 +1275,6 @@ def render_apr_page(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataF
                     person_name=person,
                     project=project,
                     apr=apr,
-                    apr1=apr1,
-                    apr2=apr2,
-                    apr3=apr3,
-                    apr4=apr4,
-                    apr5=apr5,
                     daily_apr=daily_reward,
                     compound_timing=compound_timing,
                 )
@@ -1312,12 +1284,7 @@ def render_apr_page(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataF
                     line_note = "LINE未送信: Line_User_IDなし"
                 else:
                     code = send_line_push(token, uid, personalized_msg, evidence_url)
-                    line_note = (
-                        f"HTTP:{code}, "
-                        f"APR:{apr}%, "
-                        f"APR1:{apr1}%, APR2:{apr2}%, APR3:{apr3}%, APR4:{apr4}%, APR5:{apr5}%, "
-                        f"PersonalMessage:yes, CompoundTiming:{compound_timing}"
-                    )
+                    line_note = f"HTTP:{code}, APR:{apr}%, CompoundTiming:{compound_timing}"
 
                 append_ledger_safe(
                     gs=gs,
@@ -1339,13 +1306,14 @@ def render_apr_page(gs: GSheets, settings_df: pd.DataFrame, members_df: pd.DataF
                 else:
                     fail += 1
 
-            summary_df = build_apr_summary(load_ledger(gs), members_df)
+            ledger_df_after = load_ledger(gs)
+            summary_df = build_apr_summary(ledger_df_after, members_df)
             save_apr_summary(gs, summary_df)
 
             gs.clear_cache()
             st.success(
                 f"APR記録:{apr_ledger_count}件 / LINE履歴記録:{line_log_count}件 / "
-                f"送信成功:{success} / 送信失敗:{fail} / Ledger:{gs.cfg.ledger_sheet}"
+                f"送信成功:{success} / 送信失敗:{fail}"
             )
             st.rerun()
 
@@ -1854,7 +1822,8 @@ def render_help_page(gs: GSheets, admin_label: str) -> None:
             f"- {gs.cfg.members_sheet}\n"
             f"- {gs.cfg.ledger_sheet}\n"
             f"- {gs.cfg.lineusers_sheet}\n"
-            f"- {gs.cfg.apr_summary_sheet}"
+            f"- {gs.cfg.apr_summary_sheet}\n"
+            f"\nB方式では PERSONAL シートには保存しません。"
         )
 
     with st.expander("2. Compound_Timing の意味", expanded=False):
@@ -1881,13 +1850,6 @@ def render_help_page(gs: GSheets, admin_label: str) -> None:
 
 ### OCR
 OCRでは `%` の数字候補だけを抽出します。
-
-例:
-- `67%`
-- `12.5%`
-- `0.8 %`
-- `APR 15.25%`
-- `APR 15.25` の次行に `%`
 
 ### PERSONAL
 個人ごとの元本で計算します。
@@ -1928,17 +1890,17 @@ LINEユーザー情報を `LineUsers` シートへ自動登録し、管理画面
 
 ### LINEが送れない
 - `Members` の `Line_User_ID` が本物のIDか確認
-- `U` だけ、`Uxxxxxxxx` のような仮値では送れません
 - namespaceに対応する LINE token が secrets に入っているか確認
 
 ### monthly なのに元本が増えない
 - monthly は APR確定だけでは元本へ反映しません
 - APR画面の「未反映APRを元本へ反映」を実行してください
 
-### Ledger / LINE通知履歴に出ない
-- APR確定時は `Type=APR` が先に Ledger に記録されます
-- その後、LINE送信結果が `Type=LINE` で Ledger に記録されます
-- ダッシュボードの「LINE通知履歴」は Ledger の `Type=LINE` を表示しています
+### Ledger / LINE通知履歴 / サマリーに出ない
+- B方式では PERSONAL シートではなく `Ledger__A` と `APR_Summary__A` を見ます
+- APR確定時は `Type=APR` が Ledger に記録されます
+- LINE送信結果は `Type=LINE` が Ledger に記録されます
+- サマリーは Ledger の `Type=APR` を集計します
 """
         )
 
