@@ -5,12 +5,14 @@ from __future__ import annotations
 # =========================================================
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import Any, Optional, List, Tuple
+from typing import Any, Optional, List, Tuple, Set
+from io import BytesIO
 import json, re
 
 import pandas as pd
 import requests
 import streamlit as st
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -174,19 +176,51 @@ class U:
     def extract_percent_candidates(text: str) -> List[float]:
         if not text:
             return []
-        vals1 = re.findall(r"(?i)(?:APR\s*)?(\d+(?:\.\d+)?)\s*%", text)
-        vals2 = re.findall(r"(?is)(?:APR\s*)?(\d+(?:\.\d+)?)\s*[\r\n]+\s*%", text)
-        out, seen = [], set()
-        for v in vals1 + vals2:
-            try:
-                f = float(v)
-                key = round(f, 6)
-                if key not in seen:
-                    seen.add(key)
-                    out.append(f)
-            except Exception:
-                pass
-        return out
+
+        norm = str(text).replace("％", "%")
+        norm = norm.replace("O", "0").replace("o", "0").replace("I", "1").replace("l", "1")
+        norm = re.sub(r"[,\u3000]+", " ", norm)
+
+        patterns = [
+            r"(?i)apr\s*[:：]?\s*(\d+(?:\.\d+)?)\s*%",
+            r"(?i)apr\s*[:：]?\s*(\d+(?:\.\d+)?)",
+            r"(\d+(?:\.\d+)?)\s*%",
+            r"(\d+(?:\.\d+)?)\s*[\r\n]+\s*%",
+        ]
+
+        vals, seen = [], set()
+        for pat in patterns:
+            for v in re.findall(pat, norm):
+                try:
+                    f = float(v)
+                    if f < 0 or f > 500:
+                        continue
+                    key = round(f, 6)
+                    if key not in seen:
+                        seen.add(key)
+                        vals.append(f)
+                except Exception:
+                    pass
+
+        vals.sort(reverse=True)
+        return vals
+
+    @staticmethod
+    def preprocess_ocr_image(file_bytes: bytes) -> bytes:
+        try:
+            img = Image.open(BytesIO(file_bytes)).convert("L")
+            img = ImageOps.autocontrast(img)
+            img = ImageEnhance.Contrast(img).enhance(2.2)
+            w, h = img.size
+            img = img.resize((max(1, w * 2), max(1, h * 2)))
+            img = img.filter(ImageFilter.SHARPEN)
+            img = img.point(lambda x: 255 if x > 160 else 0)
+
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
+        except Exception:
+            return file_bytes
 
 
 # =========================================================
@@ -320,16 +354,39 @@ class ExternalService:
             api_key = st.secrets["ocrspace"]["api_key"]
         except Exception:
             return ""
+
         try:
-            res = requests.post(
-                "https://api.ocr.space/parse/image",
-                files={"filename": ("evidence.png", file_bytes)},
-                data={"apikey": api_key, "language": "eng", "isOverlayRequired": False, "OCREngine": 2},
-                timeout=60,
-            )
-            parsed = res.json().get("ParsedResults", [])
-            texts = [str(p.get("ParsedText", "")).strip() for p in parsed if str(p.get("ParsedText", "")).strip()]
-            return "\n".join(texts)
+            processed = U.preprocess_ocr_image(file_bytes)
+            texts: List[str] = []
+
+            for target_name, target_bytes in [("processed.png", processed), ("original.png", file_bytes)]:
+                res = requests.post(
+                    "https://api.ocr.space/parse/image",
+                    files={"filename": (target_name, target_bytes)},
+                    data={
+                        "apikey": api_key,
+                        "language": "eng",
+                        "isOverlayRequired": False,
+                        "OCREngine": 2,
+                        "scale": True,
+                        "detectOrientation": True,
+                    },
+                    timeout=60,
+                )
+                data = res.json()
+                for p in data.get("ParsedResults", []):
+                    txt = str(p.get("ParsedText", "")).strip()
+                    if txt:
+                        texts.append(txt)
+
+            uniq, seen = [], set()
+            for t in texts:
+                key = t.strip()
+                if key and key not in seen:
+                    seen.add(key)
+                    uniq.append(key)
+
+            return "\n".join(uniq)
         except Exception:
             return ""
 
@@ -682,6 +739,24 @@ class Repository:
         dup = df[df.duplicated(subset=["Line_User_ID"], keep=False)]
         return None if dup.empty else f"同一プロジェクト内で Line_User_ID が重複しています: {dup['Line_User_ID'].unique().tolist()}"
 
+    def existing_apr_keys_for_date(self, date_jst: str) -> Set[Tuple[str, str]]:
+        ledger_df = self.load_ledger()
+        if ledger_df.empty:
+            return set()
+
+        df = ledger_df[
+            (ledger_df["Type"].astype(str).str.strip() == AppConfig.TYPE["APR"]) &
+            (ledger_df["Datetime_JST"].astype(str).str.startswith(date_jst))
+        ].copy()
+
+        if df.empty:
+            return set()
+
+        out: Set[Tuple[str, str]] = set()
+        for _, r in df.iterrows():
+            out.add((str(r["Project_Name"]).strip(), str(r["PersonName"]).strip()))
+        return out
+
 
 # =========================================================
 # FINANCE ENGINE
@@ -869,11 +944,11 @@ class AppUI:
         st.subheader("📈 APR 確定")
         st.caption(f"{AppConfig.RANK_LABEL} / PERSONAL=個別計算 / GROUP=総額均等割 / 管理者: {AdminAuth.current_label()}")
         st.info("B方式: 履歴は PERSONAL シートではなく Ledger と APR_Summary に保存します。")
+        st.info("同日・同一プロジェクト・同一人物の APR は1回だけ記録します。誤って再送しても重複加算しません。")
 
         projects = self.repo.active_projects(settings_df)
         if not projects:
             st.warning("有効（Active=TRUE）のプロジェクトがありません。")
-            st.info(f"参照中シート: {self.repo.gs.names.SETTINGS}")
             return
 
         project = st.selectbox("基準プロジェクト", projects)
@@ -907,9 +982,11 @@ class AppUI:
                 st.warning("％付きの数値候補は見つかりませんでした。")
 
         target_projects = projects if send_scope == "全有効プロジェクト" else [project]
+        today_key = U.fmt_date(U.now_jst())
+        existing_apr_keys = self.repo.existing_apr_keys_for_date(today_key)
 
         preview_rows: List[dict] = []
-        total_members, total_principal, total_reward = 0, 0.0, 0.0
+        total_members, total_principal, total_reward, skipped_members = 0, 0.0, 0.0, 0
 
         for p in target_projects:
             row = settings_df[settings_df["Project_Name"] == str(p)].iloc[0]
@@ -921,59 +998,39 @@ class AppUI:
                 continue
 
             mem_calc = self.engine.calc_project_apr(mem, float(apr), project_net_factor, p)
-            total_members += len(mem_calc)
-            total_principal += float(mem_calc["Principal"].sum())
-            total_reward += float(mem_calc["DailyAPR"].sum())
 
             for _, r in mem_calc.iterrows():
+                person = str(r["PersonName"]).strip()
+                is_done = (str(p).strip(), person) in existing_apr_keys
+
+                if is_done:
+                    skipped_members += 1
+                else:
+                    total_members += 1
+                    total_principal += float(r["Principal"])
+                    total_reward += float(r["DailyAPR"])
+
                 preview_rows.append({
                     "Project_Name": p,
-                    "PersonName": str(r["PersonName"]).strip(),
+                    "PersonName": person,
                     "Rank": str(r["Rank"]).strip(),
                     "Compound_Timing": U.compound_label(compound_timing),
                     "Principal": U.fmt_usd(float(r["Principal"])),
                     "DailyAPR": U.fmt_usd(float(r["DailyAPR"])),
                     "Line_User_ID": str(r["Line_User_ID"]).strip(),
                     "LINE_DisplayName": str(r["LINE_DisplayName"]).strip(),
+                    "本日APR状態": "本日記録済み" if is_done else "未記録",
                 })
 
-        if total_members == 0:
+        if total_members == 0 and skipped_members == 0:
             st.warning("送信対象に 🟢運用中 のメンバーがいません。")
             return
 
         st.write(f"- 送信対象プロジェクト数: {len(target_projects)}")
-        st.write(f"- 対象人数: {total_members}")
-        st.write(f"- 総元本: {U.fmt_usd(total_principal)}")
-        st.write(f"- 本日総配当: {U.fmt_usd(total_reward)}")
-        st.write(f"- Ledger保存先: {self.repo.gs.names.LEDGER}")
-        st.write(f"- サマリー保存先: {self.repo.gs.names.APR_SUMMARY}")
-
-        if st.button("Ledgerテスト書き込み"):
-            try:
-                ts = U.fmt_dt(U.now_jst())
-                test_note = f"TEST_WRITE_{ts}"
-
-                self.repo.append_ledger(ts, "TEST", "TEST_USER", AppConfig.TYPE["APR"], 1.2345, test_note)
-
-                self.repo.gs.clear_cache()
-                last_ledger_rows = self.repo.gs.last_rows("LEDGER", 5)
-
-                ledger_df_after = self.repo.load_ledger()
-                summary_df = self.engine.build_apr_summary(ledger_df_after, members_df)
-                self.repo.write_apr_summary(summary_df)
-                self.repo.gs.clear_cache()
-
-                st.success("テスト書き込み完了")
-                st.code(f"Spreadsheet ID: {self.repo.gs.spreadsheet_id}")
-                st.code(f"Spreadsheet URL: {self.repo.gs.spreadsheet_url()}")
-                st.code(f"Ledger sheet: {self.repo.gs.names.LEDGER}")
-                st.code(f"APR Summary sheet: {self.repo.gs.names.APR_SUMMARY}")
-
-                with st.expander("Ledger 最終5行", expanded=True):
-                    for row_ in last_ledger_rows:
-                        st.write(row_)
-            except Exception as e:
-                st.error(f"テスト書き込み失敗: {e}")
+        st.write(f"- 本日未記録の対象人数: {total_members}")
+        st.write(f"- 本日記録済み人数: {skipped_members}")
+        st.write(f"- 本日新規記録対象の総元本: {U.fmt_usd(total_principal)}")
+        st.write(f"- 本日新規記録対象の総配当: {U.fmt_usd(total_reward)}")
 
         with st.expander("個人別の本日配当（確認）", expanded=False):
             st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
@@ -988,9 +1045,12 @@ class AppUI:
                         return
 
                 ts = U.fmt_dt(U.now_jst())
-                apr_ledger_count, line_log_count, success, fail = 0, 0, 0, 0
+                apr_ledger_count, line_log_count, success, fail, skip_count = 0, 0, 0, 0, 0
+                existing_apr_keys = self.repo.existing_apr_keys_for_date(today_key)
+                token = ExternalService.get_line_token(AdminAuth.current_namespace())
 
-                # APR記録 + daily元本反映
+                daily_add_map: dict[Tuple[str, str], float] = {}
+
                 for p in target_projects:
                     row = settings_df[settings_df["Project_Name"] == str(p)].iloc[0]
                     project_net_factor = float(row.get("Net_Factor", AppConfig.FACTOR["MASTER"]))
@@ -1007,42 +1067,19 @@ class AppUI:
                         uid = str(r["Line_User_ID"]).strip()
                         disp = str(r["LINE_DisplayName"]).strip()
                         daily_apr = float(r["DailyAPR"])
+                        apr_key = (str(p).strip(), person)
+
+                        if apr_key in existing_apr_keys:
+                            skip_count += 1
+                            continue
 
                         note = f"APR:{apr}%, Mode:{r['CalcMode']}, Rank:{r['Rank']}, Factor:{r['Factor']}, CompoundTiming:{compound_timing}"
                         self.repo.append_ledger(ts, p, person, AppConfig.TYPE["APR"], daily_apr, note, evidence_url or "", uid, disp)
+                        existing_apr_keys.add(apr_key)
                         apr_ledger_count += 1
 
-                    if compound_timing == AppConfig.COMPOUND["DAILY"]:
-                        mem_map = {str(r["PersonName"]).strip(): float(r["DailyAPR"]) for _, r in mem_calc.iterrows()}
-                        for i in range(len(members_df)):
-                            if str(members_df.loc[i, "Project_Name"]).strip() == str(p).strip() and U.truthy(members_df.loc[i, "IsActive"]):
-                                pn = str(members_df.loc[i, "PersonName"]).strip()
-                                addv = float(mem_map.get(pn, 0.0))
-                                if addv != 0.0:
-                                    members_df.loc[i, "Principal"] = float(members_df.loc[i, "Principal"]) + addv
-                                    members_df.loc[i, "UpdatedAt_JST"] = ts
-
-                self.repo.write_members(members_df)
-
-                # LINE送信
-                token = ExternalService.get_line_token(AdminAuth.current_namespace())
-
-                for p in target_projects:
-                    row = settings_df[settings_df["Project_Name"] == str(p)].iloc[0]
-                    project_net_factor = float(row.get("Net_Factor", AppConfig.FACTOR["MASTER"]))
-                    compound_timing = U.normalize_compound(row.get("Compound_Timing", AppConfig.COMPOUND["NONE"]))
-
-                    mem = self.repo.project_members_active(members_df, p)
-                    if mem.empty:
-                        continue
-
-                    mem_calc = self.engine.calc_project_apr(mem, float(apr), project_net_factor, p)
-
-                    for _, r in mem_calc.iterrows():
-                        person = str(r["PersonName"]).strip()
-                        uid = str(r["Line_User_ID"]).strip()
-                        disp = str(r["LINE_DisplayName"]).strip()
-                        daily_reward = float(r["DailyAPR"])
+                        if compound_timing == AppConfig.COMPOUND["DAILY"]:
+                            daily_add_map[(str(p).strip(), person)] = daily_add_map.get((str(p).strip(), person), 0.0) + daily_apr
 
                         personalized_msg = (
                             "🏦【APR収益報告】\n"
@@ -1050,7 +1087,7 @@ class AppUI:
                             f"プロジェクト: {p}\n"
                             f"報告日時: {U.now_jst().strftime('%Y/%m/%d %H:%M')}\n"
                             f"総APR: {apr:.4f}%\n"
-                            f"本日配当: {U.fmt_usd(float(daily_reward))}\n"
+                            f"本日配当: {U.fmt_usd(float(daily_apr))}\n"
                             f"複利タイプ: {U.compound_label(compound_timing)}\n"
                         )
 
@@ -1068,6 +1105,16 @@ class AppUI:
                         else:
                             fail += 1
 
+                if daily_add_map:
+                    for i in range(len(members_df)):
+                        p = str(members_df.loc[i, "Project_Name"]).strip()
+                        pn = str(members_df.loc[i, "PersonName"]).strip()
+                        addv = float(daily_add_map.get((p, pn), 0.0))
+                        if addv != 0.0 and U.truthy(members_df.loc[i, "IsActive"]):
+                            members_df.loc[i, "Principal"] = float(members_df.loc[i, "Principal"]) + addv
+                            members_df.loc[i, "UpdatedAt_JST"] = ts
+                    self.repo.write_members(members_df)
+
                 self.repo.gs.clear_cache()
                 ledger_df_after = self.repo.load_ledger()
                 summary_df = self.engine.build_apr_summary(ledger_df_after, members_df)
@@ -1076,8 +1123,7 @@ class AppUI:
 
                 st.success(
                     f"APR記録:{apr_ledger_count}件 / LINE履歴記録:{line_log_count}件 / "
-                    f"送信成功:{success} / 送信失敗:{fail} / "
-                    f"Ledger:{self.repo.gs.names.LEDGER} / Summary:{self.repo.gs.names.APR_SUMMARY}"
+                    f"送信成功:{success} / 送信失敗:{fail} / 重複スキップ:{skip_count}件"
                 )
                 st.rerun()
 
@@ -1461,19 +1507,36 @@ class AppUI:
 """
         )
 
-        with st.expander("1. シート構成", expanded=False):
-            st.markdown("### Settings"); st.code("\t".join(AppConfig.HEADERS["SETTINGS"]))
-            st.markdown("### Members"); st.code("\t".join(AppConfig.HEADERS["MEMBERS"]))
-            st.markdown("### Ledger"); st.code("\t".join(AppConfig.HEADERS["LEDGER"]))
-            st.markdown("### LineUsers"); st.code("\t".join(AppConfig.HEADERS["LINEUSERS"]))
-            st.markdown("### APR Summary"); st.code("\t".join(AppConfig.HEADERS["APR_SUMMARY"]))
-            st.info(
-                f"現在の管理者が参照する実シート名:\n"
-                f"- {self.repo.gs.names.SETTINGS}\n- {self.repo.gs.names.MEMBERS}\n- {self.repo.gs.names.LEDGER}\n- {self.repo.gs.names.LINEUSERS}\n- {self.repo.gs.names.APR_SUMMARY}\n\n"
-                f"B方式では PERSONAL シートには保存しません。"
+        with st.expander("1. 現在の接続情報", expanded=False):
+            st.code(
+                f"""参照シート
+Settings     = {self.repo.gs.names.SETTINGS}
+Members      = {self.repo.gs.names.MEMBERS}
+Ledger       = {self.repo.gs.names.LEDGER}
+LineUsers    = {self.repo.gs.names.LINEUSERS}
+APR_Summary  = {self.repo.gs.names.APR_SUMMARY}
+
+Spreadsheet ID
+{self.repo.gs.spreadsheet_id}
+
+Spreadsheet URL
+{self.repo.gs.spreadsheet_url()}
+"""
             )
 
-        with st.expander("2. Compound_Timing の意味", expanded=False):
+        with st.expander("2. シート構成", expanded=False):
+            st.markdown("### Settings")
+            st.code("\t".join(AppConfig.HEADERS["SETTINGS"]))
+            st.markdown("### Members")
+            st.code("\t".join(AppConfig.HEADERS["MEMBERS"]))
+            st.markdown("### Ledger")
+            st.code("\t".join(AppConfig.HEADERS["LEDGER"]))
+            st.markdown("### LineUsers")
+            st.code("\t".join(AppConfig.HEADERS["LINEUSERS"]))
+            st.markdown("### APR Summary")
+            st.code("\t".join(AppConfig.HEADERS["APR_SUMMARY"]))
+
+        with st.expander("3. Compound_Timing の意味", expanded=False):
             st.markdown(
                 """
 - `daily`  
@@ -1487,7 +1550,7 @@ class AppUI:
 """
             )
 
-        with st.expander("3. APR計算ロジック", expanded=False):
+        with st.expander("4. APR計算ロジック", expanded=False):
             st.markdown(
                 """
 ### APRの決め方
@@ -1512,10 +1575,14 @@ OCRでは `%` の数字候補だけを抽出します。
 `グループ総配当 = グループ総元本 × (最終APR% / 100) × Net_Factor ÷ 365`
 
 `1人あたり配当 = グループ総配当 ÷ 人数`
+
+### 重複防止
+同日・同一プロジェクト・同一人物の APR は Ledger を見て1回だけ記録します。
+誤って APR ボタンを再実行しても重複加算しません。
 """
             )
 
-        with st.expander("4. Make連携", expanded=False):
+        with st.expander("5. Make連携", expanded=False):
             st.markdown(
                 """
 ### 目的
@@ -1527,7 +1594,7 @@ LINEユーザー情報を `LineUsers` シートへ自動登録し、管理画面
             )
             st.code("\t".join(AppConfig.HEADERS["LINEUSERS"]))
 
-        with st.expander("5. よくあるトラブル", expanded=False):
+        with st.expander("6. よくあるトラブル", expanded=False):
             st.markdown(
                 """
 ### APR画面にプロジェクトが出ない
@@ -1597,13 +1664,6 @@ def main() -> None:
         else:
             st.error(f"Spreadsheet を開けません。: {e}")
         st.stop()
-
-    st.caption(
-        f"参照シート: Settings={gs.names.SETTINGS} / Members={gs.names.MEMBERS} / "
-        f"Ledger={gs.names.LEDGER} / LineUsers={gs.names.LINEUSERS} / APR_Summary={gs.names.APR_SUMMARY}"
-    )
-    st.code(f"Spreadsheet ID: {gs.spreadsheet_id}")
-    st.caption(f"Spreadsheet URL: {gs.spreadsheet_url()}")
 
     repo = Repository(gs)
     engine = FinanceEngine()
