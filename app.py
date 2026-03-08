@@ -1447,37 +1447,43 @@ class AppUI:
 
         st.divider()
         if not view_all.empty:
-            st.markdown("#### ワンタップで 🟢運用中 / 🔴停止 を切替")
+            st.markdown("#### 状態切替")
 
-            head1, head2, head3 = st.columns([3, 2, 1])
-            head1.markdown("**対象メンバー**")
-            head2.markdown("**状態**")
-            head3.markdown("**操作**")
+            toggle_src = view_all.copy()
+            toggle_src["状態"] = toggle_src["IsActive"].apply(U.bool_to_status)
+            toggle_show = toggle_src[["PersonName", "状態"]].copy()
+            toggle_row_ids = toggle_src["_row_id"].tolist()
 
-            for _, r in view_all.iterrows():
-                row_id = int(r["_row_id"])
-                person_name = str(r["PersonName"]).strip()
-                current_status = U.bool_to_status(r["IsActive"])
+            toggle_edited = st.data_editor(
+                toggle_show,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                column_config={
+                    "状態": st.column_config.SelectboxColumn("状態", options=[AppConfig.STATUS["ON"], AppConfig.STATUS["OFF"]]),
+                },
+                key=f"toggle_status_editor_{project}",
+            )
 
-                c1, c2, c3 = st.columns([3, 2, 1])
-                c1.write(person_name)
-                c2.write(current_status)
+            if st.button("状態だけ保存", use_container_width=True, key=f"save_status_only_{project}"):
+                ts = U.fmt_dt(U.now_jst())
+                toggle_edited = toggle_edited.copy()
+                toggle_edited["_row_id"] = toggle_row_ids
 
-                btn_label = "停止" if U.truthy(r["IsActive"]) else "再開"
-                if c3.button(btn_label, key=f"toggle_member_{project}_{row_id}", use_container_width=True):
-                    ts = U.fmt_dt(U.now_jst())
-                    members_df.loc[row_id, "IsActive"] = not U.truthy(members_df.loc[row_id, "IsActive"])
+                for _, r in toggle_edited.iterrows():
+                    row_id = int(r["_row_id"])
+                    members_df.loc[row_id, "IsActive"] = U.status_to_bool(r["状態"])
                     members_df.loc[row_id, "UpdatedAt_JST"] = ts
 
-                    msg = self.repo.validate_no_dup_lineid(members_df, project)
-                    if msg:
-                        st.error(msg)
-                        return members_df
+                msg = self.repo.validate_no_dup_lineid(members_df, project)
+                if msg:
+                    st.error(msg)
+                    return members_df
 
-                    self.repo.write_members(members_df)
-                    self.repo.gs.clear_cache()
-                    st.success(f"{person_name} の状態を更新しました。")
-                    st.rerun()
+                self.repo.write_members(members_df)
+                self.repo.gs.clear_cache()
+                st.success("状態を更新しました。")
+                st.rerun()
 
         st.divider()
         if not view_all.empty:
@@ -1649,13 +1655,13 @@ Spreadsheet URL
         with st.expander("3. Compound_Timing の意味", expanded=False):
             st.markdown(
                 """
-- `daily`  
+- `daily`
   APR確定時に元本へ即時加算します。次回以降は増えた元本で計算します。
 
-- `monthly`  
+- `monthly`
   APR確定時は Ledger に記録のみ行います。元本への反映は APR画面の「未反映APRを元本へ反映」でまとめて行います。
 
-- `none`  
+- `none`
   単利です。APRは Ledger に記録しますが、元本には加算しません。
 """
             )
