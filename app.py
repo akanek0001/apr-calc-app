@@ -5,8 +5,8 @@ from __future__ import annotations
 # =========================================================
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import Any, Optional, List, Tuple, Set
 from io import BytesIO
+from typing import Any, List, Optional, Set, Tuple
 import json, re
 
 import pandas as pd
@@ -23,7 +23,7 @@ from gspread.exceptions import APIError
 # CONFIG
 # =========================================================
 class AppConfig:
-    APP_TITLE, APP_ICON = "APR資産運用管理システム", "🏦"
+    APP_TITLE, APP_ICON, PAGE_LAYOUT = "APR資産運用管理システム", "🏦", "wide"
     JST = timezone(timedelta(hours=9), "JST")
 
     STATUS = {"ON": "🟢運用中", "OFF": "🔴停止"}
@@ -33,6 +33,8 @@ class AppConfig:
 
     PROJECT = {"PERSONAL": "PERSONAL"}
     COMPOUND = {"DAILY": "daily", "MONTHLY": "monthly", "NONE": "none"}
+    COMPOUND_LABEL = {"daily": "日次複利", "monthly": "月次複利", "none": "単利"}
+
     TYPE = {"APR": "APR", "LINE": "LINE", "DEPOSIT": "Deposit", "WITHDRAW": "Withdraw"}
     SOURCE = {"APP": "app"}
 
@@ -59,6 +61,10 @@ class AppConfig:
         "ADMIN": "⚙️ 管理",
         "HELP": "❓ ヘルプ",
     }
+
+    APR_RESET_NOTE_KEYWORD = "APR:"
+    APR_LINE_NOTE_KEYWORD = "APR:"
+    APR_LINE_LABEL = "【APR収益報告】"
 
 
 # =========================================================
@@ -130,17 +136,11 @@ class U:
     @staticmethod
     def normalize_compound(v: Any) -> str:
         s = str(v).strip().lower()
-        valid = tuple(AppConfig.COMPOUND.values())
-        return s if s in valid else AppConfig.COMPOUND["NONE"]
+        return s if s in AppConfig.COMPOUND.values() else AppConfig.COMPOUND["NONE"]
 
     @staticmethod
     def compound_label(v: Any) -> str:
-        s = U.normalize_compound(v)
-        if s == AppConfig.COMPOUND["DAILY"]:
-            return "日次複利"
-        if s == AppConfig.COMPOUND["MONTHLY"]:
-            return "月次複利"
-        return "単利"
+        return AppConfig.COMPOUND_LABEL[U.normalize_compound(v)]
 
     @staticmethod
     def is_line_uid(v: Any) -> bool:
@@ -173,6 +173,23 @@ class U:
             return 0.0
 
     @staticmethod
+    def preprocess_ocr_image(file_bytes: bytes) -> bytes:
+        try:
+            img = Image.open(BytesIO(file_bytes)).convert("L")
+            img = ImageOps.autocontrast(img)
+            img = ImageEnhance.Contrast(img).enhance(2.2)
+            w, h = img.size
+            img = img.resize((max(1, w * 2), max(1, h * 2)))
+            img = img.filter(ImageFilter.SHARPEN)
+            img = img.point(lambda x: 255 if x > 160 else 0)
+
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
+        except Exception:
+            return file_bytes
+
+    @staticmethod
     def extract_percent_candidates(text: str) -> List[float]:
         if not text:
             return []
@@ -193,34 +210,16 @@ class U:
             for v in re.findall(pat, norm):
                 try:
                     f = float(v)
-                    if f < 0 or f > 500:
-                        continue
-                    key = round(f, 6)
-                    if key not in seen:
-                        seen.add(key)
-                        vals.append(f)
+                    if 0 <= f <= 500:
+                        key = round(f, 6)
+                        if key not in seen:
+                            seen.add(key)
+                            vals.append(f)
                 except Exception:
                     pass
 
         vals.sort(reverse=True)
         return vals
-
-    @staticmethod
-    def preprocess_ocr_image(file_bytes: bytes) -> bytes:
-        try:
-            img = Image.open(BytesIO(file_bytes)).convert("L")
-            img = ImageOps.autocontrast(img)
-            img = ImageEnhance.Contrast(img).enhance(2.2)
-            w, h = img.size
-            img = img.resize((max(1, w * 2), max(1, h * 2)))
-            img = img.filter(ImageFilter.SHARPEN)
-            img = img.point(lambda x: 255 if x > 160 else 0)
-
-            buf = BytesIO()
-            img.save(buf, format="PNG")
-            return buf.getvalue()
-        except Exception:
-            return file_bytes
 
 
 # =========================================================
@@ -276,6 +275,7 @@ class AdminAuth:
             if ok:
                 st.session_state["login_admin_name"] = admin_name
                 picked = next((a for a in admins if a.name == admin_name), None)
+
                 if not picked:
                     st.error("管理者が見つかりません。")
                     st.stop()
@@ -304,7 +304,7 @@ class AdminAuth:
 
 
 # =========================================================
-# SERVICES
+# EXTERNAL SERVICE
 # =========================================================
 class ExternalService:
     @staticmethod
@@ -315,9 +315,11 @@ class ExternalService:
             tok = str(tokens.get(ns, "")).strip()
             if tok:
                 return tok
+
         legacy = str(line.get("channel_access_token", "")).strip()
         if legacy:
             return legacy
+
         st.error("LINEトークンが未設定です。")
         st.stop()
 
@@ -325,11 +327,13 @@ class ExternalService:
     def send_line_push(token: str, user_id: str, text: str, image_url: Optional[str] = None) -> int:
         if not user_id:
             return 400
+
         url = "https://api.line.me/v2/bot/message/push"
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
         messages = [{"type": "text", "text": text}]
         if image_url:
             messages.append({"type": "image", "originalContentUrl": image_url, "previewImageUrl": image_url})
+
         try:
             r = requests.post(url, headers=headers, data=json.dumps({"to": str(user_id), "messages": messages}), timeout=25)
             return r.status_code
@@ -342,6 +346,7 @@ class ExternalService:
             key = st.secrets["imgbb"]["api_key"]
         except Exception:
             return None
+
         try:
             res = requests.post("https://api.imgbb.com/1/upload", params={"key": key}, files={"image": file_bytes}, timeout=30)
             return res.json()["data"]["url"]
@@ -391,6 +396,9 @@ class ExternalService:
             return ""
 
 
+# =========================================================
+# GSHEET SERVICE
+# =========================================================
 @dataclass
 class SheetNames:
     SETTINGS: str
@@ -440,10 +448,6 @@ class GSheetService:
     def spreadsheet_url(self) -> str:
         return f"https://docs.google.com/spreadsheets/d/{self.spreadsheet_id}"
 
-    def last_rows(self, key: str, n: int = 5) -> List[List[str]]:
-        values = self.ws(key).get_all_values()
-        return values[-n:] if values else []
-
     def ensure_sheet(self, key: str) -> None:
         name, headers = self.actual_name(key), AppConfig.HEADERS[key]
         try:
@@ -479,10 +483,7 @@ class GSheetService:
         if not values:
             return pd.DataFrame()
 
-        try:
-            return U.clean_cols(pd.DataFrame(values[1:], columns=values[0]))
-        except Exception as e:
-            raise RuntimeError(f"{_self.actual_name(key)} の表データ変換に失敗しました: {e}") from e
+        return U.clean_cols(pd.DataFrame(values[1:], columns=values[0]))
 
     def write_df(self, key: str, df: pd.DataFrame) -> None:
         ws = self.ws(key)
@@ -495,6 +496,11 @@ class GSheetService:
             self.ws(key).append_row([("" if x is None else x) for x in row], value_input_option="USER_ENTERED")
         except Exception as e:
             raise RuntimeError(f"{self.actual_name(key)} への追記に失敗しました: {e}")
+
+    def overwrite_rows(self, key: str, rows: List[List[Any]]) -> None:
+        ws = self.ws(key)
+        ws.clear()
+        ws.update(rows, value_input_option="USER_ENTERED")
 
     def clear_cache(self) -> None:
         st.cache_data.clear()
@@ -757,6 +763,56 @@ class Repository:
             out.add((str(r["Project_Name"]).strip(), str(r["PersonName"]).strip()))
         return out
 
+    def reset_today_apr_records(self, date_jst: str, project: str) -> Tuple[int, int]:
+        ws = self.gs.ws("LEDGER")
+        values = ws.get_all_values()
+        if not values:
+            return 0, 0
+
+        headers = values[0]
+        if len(values) == 1:
+            return 0, 0
+
+        need_cols = ["Datetime_JST", "Project_Name", "Type", "Note"]
+        if any(c not in headers for c in need_cols):
+            return 0, 0
+
+        idx_dt = headers.index("Datetime_JST")
+        idx_project = headers.index("Project_Name")
+        idx_type = headers.index("Type")
+        idx_note = headers.index("Note")
+
+        kept_rows = [headers]
+        deleted_apr, deleted_line = 0, 0
+
+        for row in values[1:]:
+            row = row + [""] * (len(headers) - len(row))
+            dt_v = str(row[idx_dt]).strip()
+            project_v = str(row[idx_project]).strip()
+            type_v = str(row[idx_type]).strip()
+            note_v = str(row[idx_note]).strip()
+
+            is_today = dt_v.startswith(date_jst)
+            is_project = project_v == str(project).strip()
+
+            delete_apr = is_today and is_project and type_v == AppConfig.TYPE["APR"]
+            delete_line = is_today and is_project and type_v == AppConfig.TYPE["LINE"] and AppConfig.APR_LINE_NOTE_KEYWORD in note_v
+
+            if delete_apr:
+                deleted_apr += 1
+                continue
+            if delete_line:
+                deleted_line += 1
+                continue
+
+            kept_rows.append(row[:len(headers)])
+
+        if deleted_apr > 0 or deleted_line > 0:
+            self.gs.overwrite_rows("LEDGER", kept_rows)
+            self.gs.clear_cache()
+
+        return deleted_apr, deleted_line
+
 
 # =========================================================
 # FINANCE ENGINE
@@ -930,21 +986,38 @@ class AppUI:
 
         st.divider()
         st.markdown("#### LINE通知履歴")
-        if ledger_df.empty:
-            st.info("通知履歴がありません。")
+
+        c_hist1, c_hist2 = st.columns([1, 1])
+        with c_hist1:
+            if st.button("LINE送信履歴をリセット表示", use_container_width=True):
+                st.session_state["hide_line_history"] = True
+                st.rerun()
+
+        with c_hist2:
+            if st.button("LINE送信履歴を再表示", use_container_width=True):
+                st.session_state["hide_line_history"] = False
+                st.rerun()
+
+        if st.session_state.get("hide_line_history", False):
+            st.info("LINE通知履歴はリセット表示中です。シートの記録は削除していません。")
         else:
-            line_hist = ledger_df[ledger_df["Type"].astype(str).str.strip() == AppConfig.TYPE["LINE"]].copy()
-            if line_hist.empty:
-                st.info("LINE通知履歴はまだありません。")
+            if ledger_df.empty:
+                st.info("通知履歴がありません。")
             else:
-                cols = [c for c in ["Datetime_JST", "Project_Name", "PersonName", "Type", "Line_User_ID", "LINE_DisplayName", "Note", "Source"] if c in line_hist.columns]
-                st.dataframe(line_hist.sort_values("Datetime_JST", ascending=False)[cols].head(100), use_container_width=True, hide_index=True)
+                line_hist = ledger_df[ledger_df["Type"].astype(str).str.strip() == AppConfig.TYPE["LINE"]].copy()
+                if line_hist.empty:
+                    st.info("LINE通知履歴はまだありません。")
+                else:
+                    cols = [c for c in ["Datetime_JST", "Project_Name", "PersonName", "Type", "Line_User_ID", "LINE_DisplayName", "Note", "Source"] if c in line_hist.columns]
+                    st.dataframe(
+                        line_hist.sort_values("Datetime_JST", ascending=False)[cols].head(100),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
     def render_apr(self, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> None:
         st.subheader("📈 APR 確定")
         st.caption(f"{AppConfig.RANK_LABEL} / PERSONAL=個別計算 / GROUP=総額均等割 / 管理者: {AdminAuth.current_label()}")
-        st.info("B方式: 履歴は PERSONAL シートではなく Ledger と APR_Summary に保存します。")
-        st.info("同日・同一プロジェクト・同一人物の APR は1回だけ記録します。誤って再送しても重複加算しません。")
 
         projects = self.repo.active_projects(settings_df)
         if not projects:
@@ -1035,6 +1108,27 @@ class AppUI:
         with st.expander("個人別の本日配当（確認）", expanded=False):
             st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
 
+        if send_scope == "選択中プロジェクトのみ":
+            st.divider()
+            st.markdown("#### 本日APRリセット")
+            if st.button("本日のAPR記録をリセット"):
+                try:
+                    deleted_apr, deleted_line = self.repo.reset_today_apr_records(today_key, project)
+                    self.repo.gs.clear_cache()
+                    ledger_df_after = self.repo.load_ledger()
+                    summary_df = self.engine.build_apr_summary(ledger_df_after, members_df)
+                    self.repo.write_apr_summary(summary_df)
+                    self.repo.gs.clear_cache()
+
+                    if deleted_apr == 0 and deleted_line == 0:
+                        st.info("削除対象はありません。")
+                    else:
+                        st.success(f"本日分をリセットしました。APR削除:{deleted_apr}件 / LINE削除:{deleted_line}件")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"APRリセットでエラー: {e}")
+                    st.stop()
+
         if st.button("APRを確定して対象全員にLINE送信"):
             try:
                 evidence_url = None
@@ -1048,7 +1142,6 @@ class AppUI:
                 apr_ledger_count, line_log_count, success, fail, skip_count = 0, 0, 0, 0, 0
                 existing_apr_keys = self.repo.existing_apr_keys_for_date(today_key)
                 token = ExternalService.get_line_token(AdminAuth.current_namespace())
-
                 daily_add_map: dict[Tuple[str, str], float] = {}
 
                 for p in target_projects:
@@ -1086,7 +1179,7 @@ class AppUI:
                             f"{person} 様\n"
                             f"プロジェクト: {p}\n"
                             f"報告日時: {U.now_jst().strftime('%Y/%m/%d %H:%M')}\n"
-                            f"総APR: {apr:.4f}%\n"
+                            f"総APR: {apr:.1f}%\n"
                             f"本日配当: {U.fmt_usd(float(daily_apr))}\n"
                             f"複利タイプ: {U.compound_label(compound_timing)}\n"
                         )
@@ -1578,7 +1671,7 @@ OCRでは `%` の数字候補だけを抽出します。
 
 ### 重複防止
 同日・同一プロジェクト・同一人物の APR は Ledger を見て1回だけ記録します。
-誤って APR ボタンを再実行しても重複加算しません。
+本日のAPRをやり直したい場合は、APR画面の「本日のAPR記録をリセット」を使います。
 """
             )
 
@@ -1615,6 +1708,10 @@ LINEユーザー情報を `LineUsers` シートへ自動登録し、管理画面
 - APR確定時は `Type=APR` が Ledger に記録されます
 - LINE送信結果は `Type=LINE` が Ledger に記録されます
 - サマリーは Ledger の `Type=APR` を集計します
+
+### LINE送信履歴を消したい
+- ダッシュボードの「LINE送信履歴をリセット表示」は画面表示だけを消します
+- シートのLedger記録は削除しません
 """
             )
 
@@ -1623,7 +1720,7 @@ LINEユーザー情報を `LineUsers` シートへ自動登録し、管理画面
 # MAIN
 # =========================================================
 def main() -> None:
-    st.set_page_config(page_title=AppConfig.APP_TITLE, layout="wide", page_icon=AppConfig.APP_ICON)
+    st.set_page_config(page_title=AppConfig.APP_TITLE, layout=AppConfig.PAGE_LAYOUT, page_icon=AppConfig.APP_ICON)
     st.title(f"{AppConfig.APP_ICON} {AppConfig.APP_TITLE}")
 
     AdminAuth.require_login()
@@ -1648,6 +1745,8 @@ def main() -> None:
 
     if "page" not in st.session_state:
         st.session_state["page"] = AppConfig.PAGE["DASHBOARD"]
+    if "hide_line_history" not in st.session_state:
+        st.session_state["hide_line_history"] = False
 
     con = st.secrets.get("connections", {}).get("gsheets", {})
     sid = U.extract_sheet_id(str(con.get("spreadsheet", "")).strip())
