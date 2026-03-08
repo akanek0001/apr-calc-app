@@ -38,13 +38,7 @@ class AppConfig:
     TYPE = {"APR": "APR", "LINE": "LINE", "DEPOSIT": "Deposit", "WITHDRAW": "Withdraw"}
     SOURCE = {"APP": "app"}
 
-    SHEET = {
-        "SETTINGS": "Settings",
-        "MEMBERS": "Members",
-        "LEDGER": "Ledger",
-        "LINEUSERS": "LineUsers",
-        "APR_SUMMARY": "APR_Summary",
-    }
+    SHEET = {"SETTINGS": "Settings", "MEMBERS": "Members", "LEDGER": "Ledger", "LINEUSERS": "LineUsers", "APR_SUMMARY": "APR_Summary"}
 
     HEADERS = {
         "SETTINGS": ["Project_Name", "Net_Factor", "IsCompound", "Compound_Timing", "UpdatedAt_JST", "Active"],
@@ -54,16 +48,9 @@ class AppConfig:
         "APR_SUMMARY": ["Date_JST", "PersonName", "Total_APR", "APR_Count", "Asset_Ratio", "LINE_DisplayName"],
     }
 
-    PAGE = {
-        "DASHBOARD": "📊 ダッシュボード",
-        "APR": "📈 APR",
-        "CASH": "💸 入金/出金",
-        "ADMIN": "⚙️ 管理",
-        "HELP": "❓ ヘルプ",
-    }
-
+    PAGE = {"DASHBOARD": "📊 ダッシュボード", "APR": "📈 APR", "CASH": "💸 入金/出金", "ADMIN": "⚙️ 管理", "HELP": "❓ ヘルプ"}
+    SESSION_KEYS = {"SETTINGS": "settings_df", "MEMBERS": "members_df", "LEDGER": "ledger_df", "LINEUSERS": "line_users_df", "APR_SUMMARY": "apr_summary_df"}
     APR_LINE_NOTE_KEYWORD = "APR:"
-    SESSION_DATA_KEYS = ("settings_df", "members_df", "ledger_df", "apr_summary_df", "line_users_df")
 
 
 # =========================================================
@@ -193,7 +180,6 @@ class U:
             img = img.resize((max(1, w * 2), max(1, h * 2)))
             img = img.filter(ImageFilter.SHARPEN)
             img = img.point(lambda x: 255 if x > 160 else 0)
-
             buf = BytesIO()
             img.save(buf, format="PNG")
             return buf.getvalue()
@@ -204,18 +190,14 @@ class U:
     def extract_percent_candidates(text: str) -> List[float]:
         if not text:
             return []
-
-        norm = str(text).replace("％", "%")
-        norm = norm.replace("O", "0").replace("o", "0").replace("I", "1").replace("l", "1")
+        norm = str(text).replace("％", "%").replace("O", "0").replace("o", "0").replace("I", "1").replace("l", "1")
         norm = re.sub(r"[,\u3000]+", " ", norm)
-
         patterns = [
             r"(?i)apr\s*[:：]?\s*(\d+(?:\.\d+)?)\s*%",
             r"(?i)apr\s*[:：]?\s*(\d+(?:\.\d+)?)",
             r"(\d+(?:\.\d+)?)\s*%",
             r"(\d+(?:\.\d+)?)\s*[\r\n]+\s*%",
         ]
-
         vals, seen = [], set()
         for pat in patterns:
             for v in re.findall(pat, norm):
@@ -228,7 +210,6 @@ class U:
                             vals.append(f)
                 except Exception:
                     pass
-
         vals.sort(reverse=True)
         return vals
 
@@ -258,7 +239,6 @@ class AdminAuth:
                     out.append(AdminUser(name=name, pin=pin, namespace=ns))
             if out:
                 return out
-
         pin = str(admin.get("pin", "")).strip() or str(admin.get("password", "")).strip()
         return [AdminUser(name="Admin", pin=pin, namespace="default")] if pin else []
 
@@ -282,21 +262,17 @@ class AdminAuth:
             admin_name = st.selectbox("管理者を選択", names, index=names.index(default_name))
             pw = st.text_input("管理者PIN", type="password")
             ok = st.form_submit_button("ログイン")
-
             if ok:
                 st.session_state["login_admin_name"] = admin_name
                 picked = next((a for a in admins if a.name == admin_name), None)
-
                 if not picked:
                     st.error("管理者が見つかりません。")
                     st.stop()
-
                 if pw == picked.pin:
                     st.session_state["admin_ok"] = True
                     st.session_state["admin_name"] = picked.name
                     st.session_state["admin_namespace"] = picked.namespace
                     st.rerun()
-
                 st.session_state["admin_ok"] = False
                 st.session_state["admin_name"] = ""
                 st.session_state["admin_namespace"] = ""
@@ -326,11 +302,9 @@ class ExternalService:
             tok = str(tokens.get(ns, "")).strip()
             if tok:
                 return tok
-
         legacy = str(line.get("channel_access_token", "")).strip()
         if legacy:
             return legacy
-
         st.error("LINEトークンが未設定です。")
         st.stop()
 
@@ -338,13 +312,11 @@ class ExternalService:
     def send_line_push(token: str, user_id: str, text: str, image_url: Optional[str] = None) -> int:
         if not user_id:
             return 400
-
         url = "https://api.line.me/v2/bot/message/push"
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
         messages = [{"type": "text", "text": text}]
         if image_url:
             messages.append({"type": "image", "originalContentUrl": image_url, "previewImageUrl": image_url})
-
         try:
             r = requests.post(url, headers=headers, data=json.dumps({"to": str(user_id), "messages": messages}), timeout=25)
             return r.status_code
@@ -357,7 +329,6 @@ class ExternalService:
             key = st.secrets["imgbb"]["api_key"]
         except Exception:
             return None
-
         try:
             res = requests.post("https://api.imgbb.com/1/upload", params={"key": key}, files={"image": file_bytes}, timeout=30)
             return res.json()["data"]["url"]
@@ -370,23 +341,14 @@ class ExternalService:
             api_key = st.secrets["ocrspace"]["api_key"]
         except Exception:
             return ""
-
         try:
             processed = U.preprocess_ocr_image(file_bytes)
             texts: List[str] = []
-
             for target_name, target_bytes in [("processed.png", processed), ("original.png", file_bytes)]:
                 res = requests.post(
                     "https://api.ocr.space/parse/image",
                     files={"filename": (target_name, target_bytes)},
-                    data={
-                        "apikey": api_key,
-                        "language": "eng",
-                        "isOverlayRequired": False,
-                        "OCREngine": 2,
-                        "scale": True,
-                        "detectOrientation": True,
-                    },
+                    data={"apikey": api_key, "language": "eng", "isOverlayRequired": False, "OCREngine": 2, "scale": True, "detectOrientation": True},
                     timeout=60,
                 )
                 data = res.json()
@@ -394,14 +356,12 @@ class ExternalService:
                     txt = str(p.get("ParsedText", "")).strip()
                     if txt:
                         texts.append(txt)
-
             uniq, seen = [], set()
             for t in texts:
                 key = t.strip()
                 if key and key not in seen:
                     seen.add(key)
                     uniq.append(key)
-
             return "\n".join(uniq)
         except Exception:
             return ""
@@ -467,16 +427,13 @@ class GSheetService:
             ws = self.book.add_worksheet(title=name, rows=3000, cols=max(30, len(headers) + 10))
             ws.append_row(headers, value_input_option="USER_ENTERED")
             return
-
         try:
             first = ws.row_values(1)
         except APIError:
             return
-
         if not first:
             ws.append_row(headers, value_input_option="USER_ENTERED")
             return
-
         colset = [str(c).strip() for c in first if str(c).strip()]
         missing = [h for h in headers if h not in colset]
         if missing:
@@ -490,10 +447,8 @@ class GSheetService:
             raise RuntimeError(f"Google Sheets 読み取りエラー: {_self.actual_name(key)} を取得できません。") from e
         except Exception as e:
             raise RuntimeError(f"{_self.actual_name(key)} の読み取り中にエラーが発生しました: {e}") from e
-
         if not values:
             return pd.DataFrame()
-
         return U.clean_cols(pd.DataFrame(values[1:], columns=values[0]))
 
     def write_df(self, key: str, df: pd.DataFrame) -> None:
@@ -530,7 +485,6 @@ class Repository:
         except Exception as e:
             st.error(str(e))
             return pd.DataFrame(columns=AppConfig.HEADERS["SETTINGS"])
-
         if df.empty:
             return pd.DataFrame(columns=AppConfig.HEADERS["SETTINGS"])
 
@@ -636,7 +590,6 @@ class Repository:
         except Exception as e:
             st.error(str(e))
             return pd.DataFrame(columns=AppConfig.HEADERS["MEMBERS"])
-
         if df.empty:
             return pd.DataFrame(columns=AppConfig.HEADERS["MEMBERS"])
 
@@ -666,10 +619,8 @@ class Repository:
         except Exception as e:
             st.error(str(e))
             return pd.DataFrame(columns=AppConfig.HEADERS["LEDGER"])
-
         if df.empty:
             return pd.DataFrame(columns=AppConfig.HEADERS["LEDGER"])
-
         for c in AppConfig.HEADERS["LEDGER"]:
             if c not in df.columns:
                 df[c] = ""
@@ -682,7 +633,6 @@ class Repository:
         except Exception as e:
             st.error(str(e))
             return pd.DataFrame(columns=AppConfig.HEADERS["LINEUSERS"])
-
         if df.empty:
             return pd.DataFrame(columns=AppConfig.HEADERS["LINEUSERS"])
 
@@ -690,7 +640,6 @@ class Repository:
             df = df.rename(columns={"LineID": "Line_User_ID"})
         if "Line_User" not in df.columns and "LINE_DisplayName" in df.columns:
             df = df.rename(columns={"LINE_DisplayName": "Line_User"})
-
         if "Line_User_ID" not in df.columns:
             df["Line_User_ID"] = ""
         if "Line_User" not in df.columns:
@@ -712,30 +661,14 @@ class Repository:
         out["LINE_DisplayName"] = out["LINE_DisplayName"].astype(str)
         self.gs.write_df("APR_SUMMARY", out)
 
-    def append_ledger(
-        self,
-        dt_jst: str,
-        project: str,
-        person_name: str,
-        typ: str,
-        amount: float,
-        note: str,
-        evidence_url: str = "",
-        line_user_id: str = "",
-        line_display_name: str = "",
-        source: str = AppConfig.SOURCE["APP"],
-    ) -> None:
+    def append_ledger(self, dt_jst: str, project: str, person_name: str, typ: str, amount: float, note: str, evidence_url: str = "", line_user_id: str = "", line_display_name: str = "", source: str = AppConfig.SOURCE["APP"]) -> None:
         if not str(project).strip():
             raise ValueError("project が空です")
         if not str(person_name).strip():
             raise ValueError("person_name が空です")
         if not str(typ).strip():
             raise ValueError("typ が空です")
-
-        self.gs.append_row(
-            "LEDGER",
-            [dt_jst, project, person_name, typ, float(amount), note, evidence_url or "", line_user_id or "", line_display_name or "", source],
-        )
+        self.gs.append_row("LEDGER", [dt_jst, project, person_name, typ, float(amount), note, evidence_url or "", line_user_id or "", line_display_name or "", source])
 
     def active_projects(self, settings_df: pd.DataFrame) -> List[str]:
         if settings_df.empty:
@@ -760,15 +693,12 @@ class Repository:
         ledger_df = self.load_ledger()
         if ledger_df.empty:
             return set()
-
         df = ledger_df[
             (ledger_df["Type"].astype(str).str.strip() == AppConfig.TYPE["APR"]) &
             (ledger_df["Datetime_JST"].astype(str).str.startswith(date_jst))
         ].copy()
-
         if df.empty:
             return set()
-
         return set(zip(df["Project_Name"].astype(str).str.strip(), df["PersonName"].astype(str).str.strip()))
 
     def reset_today_apr_records(self, date_jst: str, project: str) -> Tuple[int, int]:
@@ -785,24 +715,13 @@ class Repository:
         if any(c not in headers for c in need_cols):
             return 0, 0
 
-        idx_dt = headers.index("Datetime_JST")
-        idx_project = headers.index("Project_Name")
-        idx_type = headers.index("Type")
-        idx_note = headers.index("Note")
-
-        kept_rows = [headers]
-        deleted_apr, deleted_line = 0, 0
+        idx_dt, idx_project, idx_type, idx_note = headers.index("Datetime_JST"), headers.index("Project_Name"), headers.index("Type"), headers.index("Note")
+        kept_rows, deleted_apr, deleted_line = [headers], 0, 0
 
         for row in values[1:]:
             row = row + [""] * (len(headers) - len(row))
-            dt_v = str(row[idx_dt]).strip()
-            project_v = str(row[idx_project]).strip()
-            type_v = str(row[idx_type]).strip()
-            note_v = str(row[idx_note]).strip()
-
-            is_today = dt_v.startswith(date_jst)
-            is_project = project_v == str(project).strip()
-
+            dt_v, project_v, type_v, note_v = str(row[idx_dt]).strip(), str(row[idx_project]).strip(), str(row[idx_type]).strip(), str(row[idx_note]).strip()
+            is_today, is_project = dt_v.startswith(date_jst), project_v == str(project).strip()
             delete_apr = is_today and is_project and type_v == AppConfig.TYPE["APR"]
             delete_line = is_today and is_project and type_v == AppConfig.TYPE["LINE"] and AppConfig.APR_LINE_NOTE_KEYWORD in note_v
 
@@ -812,7 +731,6 @@ class Repository:
             if delete_line:
                 deleted_line += 1
                 continue
-
             kept_rows.append(row[:len(headers)])
 
         if deleted_apr > 0 or deleted_line > 0:
@@ -828,9 +746,8 @@ class Repository:
 class FinanceEngine:
     def calc_project_apr(self, mem: pd.DataFrame, apr_percent: float, project_net_factor: float, project_name: str) -> pd.DataFrame:
         out = mem.copy()
-
         if str(project_name).strip().upper() == AppConfig.PROJECT["PERSONAL"]:
-            out["Factor"] = out["Rank"].map(lambda x: U.rank_factor(x))
+            out["Factor"] = out["Rank"].map(U.rank_factor)
             out["DailyAPR"] = (out["Principal"] * (apr_percent / 100.0) * out["Factor"]) / 365.0
             out["CalcMode"] = "PERSONAL"
             return out
@@ -838,10 +755,7 @@ class FinanceEngine:
         total_principal, count = float(out["Principal"].sum()), len(out)
         factor = float(project_net_factor if project_net_factor > 0 else AppConfig.FACTOR["MASTER"])
         total_group_reward = (total_principal * (apr_percent / 100.0) * factor) / 365.0
-
-        out["Factor"] = factor
-        out["DailyAPR"] = (total_group_reward / count) if count > 0 else 0.0
-        out["CalcMode"] = "GROUP_EQUAL"
+        out["Factor"], out["DailyAPR"], out["CalcMode"] = factor, ((total_group_reward / count) if count > 0 else 0.0), "GROUP_EQUAL"
         return out
 
     def build_apr_summary(self, ledger_df: pd.DataFrame, members_df: pd.DataFrame) -> pd.DataFrame:
@@ -876,7 +790,6 @@ class FinanceEngine:
             (ledger_df["Type"].astype(str).str.strip() == AppConfig.TYPE["APR"]) &
             (~ledger_df["Note"].astype(str).str.contains("COMPOUNDED", na=False))
         ].copy()
-
         if target.empty:
             return 0, 0.0
 
@@ -886,14 +799,10 @@ class FinanceEngine:
 
         ts, updated_count, total_added = U.fmt_dt(U.now_jst()), 0, 0.0
         add_map = dict(zip(sums["PersonName"].astype(str).str.strip(), U.to_num_series(sums["Amount"])))
-
-        mask_project = members_df["Project_Name"].astype(str).str.strip() == str(project).strip()
-        mask_person = members_df["PersonName"].astype(str).str.strip().isin(add_map.keys())
-        mask = mask_project & mask_person
+        mask = (members_df["Project_Name"].astype(str).str.strip() == str(project).strip()) & (members_df["PersonName"].astype(str).str.strip().isin(add_map.keys()))
 
         if mask.any():
-            idxs = members_df[mask].index.tolist()
-            for idx in idxs:
+            for idx in members_df[mask].index.tolist():
                 person = str(members_df.loc[idx, "PersonName"]).strip()
                 addv = float(add_map.get(person, 0.0))
                 if addv == 0:
@@ -905,7 +814,6 @@ class FinanceEngine:
 
         if updated_count > 0:
             repo.write_members(members_df)
-
             ws = repo.gs.ws("LEDGER")
             values = ws.get_all_values()
             if values and len(values) >= 2:
@@ -916,65 +824,68 @@ class FinanceEngine:
                         row = values[row_no - 1]
                         if len(row) < len(headers):
                             row = row + [""] * (len(headers) - len(row))
-
-                        r_project = str(row[headers.index("Project_Name")]).strip()
-                        r_type = str(row[headers.index("Type")]).strip()
-                        r_note = str(row[headers.index("Note")]).strip()
-
+                        r_project, r_type, r_note = str(row[headers.index("Project_Name")]).strip(), str(row[headers.index("Type")]).strip(), str(row[headers.index("Note")]).strip()
                         if r_project == str(project).strip() and r_type == AppConfig.TYPE["APR"] and "COMPOUNDED" not in r_note:
                             ws.update_cell(row_no, note_idx, (r_note + " | " if r_note else "") + f"COMPOUNDED:{ts}")
-
             repo.gs.clear_cache()
 
         return updated_count, total_added
 
 
 # =========================================================
-# SESSION DATA MANAGER
+# DATA STORE
 # =========================================================
-class SessionData:
-    @staticmethod
-    def clear_all() -> None:
-        for k in AppConfig.SESSION_DATA_KEYS:
-            if k in st.session_state:
-                del st.session_state[k]
+class DataStore:
+    def __init__(self, repo: Repository, engine: FinanceEngine):
+        self.repo, self.engine = repo, engine
 
-    @staticmethod
-    def sync_all(repo: Repository, engine: FinanceEngine, force: bool = False) -> Dict[str, pd.DataFrame]:
-        if force or "settings_df" not in st.session_state:
-            st.session_state["settings_df"] = repo.repair_settings(repo.load_settings())
-        if force or "members_df" not in st.session_state:
-            st.session_state["members_df"] = repo.load_members()
-        if force or "ledger_df" not in st.session_state:
-            st.session_state["ledger_df"] = repo.load_ledger()
-        if force or "line_users_df" not in st.session_state:
-            st.session_state["line_users_df"] = repo.load_line_users()
+    def clear(self) -> None:
+        for key in AppConfig.SESSION_KEYS.values():
+            if key in st.session_state:
+                del st.session_state[key]
 
-        st.session_state["apr_summary_df"] = engine.build_apr_summary(
-            st.session_state["ledger_df"], st.session_state["members_df"]
-        )
+    def load(self, force: bool = False) -> Dict[str, pd.DataFrame]:
+        if force or AppConfig.SESSION_KEYS["SETTINGS"] not in st.session_state:
+            st.session_state[AppConfig.SESSION_KEYS["SETTINGS"]] = self.repo.repair_settings(self.repo.load_settings())
+        if force or AppConfig.SESSION_KEYS["MEMBERS"] not in st.session_state:
+            st.session_state[AppConfig.SESSION_KEYS["MEMBERS"]] = self.repo.load_members()
+        if force or AppConfig.SESSION_KEYS["LEDGER"] not in st.session_state:
+            st.session_state[AppConfig.SESSION_KEYS["LEDGER"]] = self.repo.load_ledger()
+        if force or AppConfig.SESSION_KEYS["LINEUSERS"] not in st.session_state:
+            st.session_state[AppConfig.SESSION_KEYS["LINEUSERS"]] = self.repo.load_line_users()
+
+        settings_df = st.session_state[AppConfig.SESSION_KEYS["SETTINGS"]]
+        members_df = st.session_state[AppConfig.SESSION_KEYS["MEMBERS"]]
+        ledger_df = st.session_state[AppConfig.SESSION_KEYS["LEDGER"]]
+        line_users_df = st.session_state[AppConfig.SESSION_KEYS["LINEUSERS"]]
+        apr_summary_df = self.engine.build_apr_summary(ledger_df, members_df)
+        st.session_state[AppConfig.SESSION_KEYS["APR_SUMMARY"]] = apr_summary_df
 
         return {
-            "settings_df": st.session_state["settings_df"],
-            "members_df": st.session_state["members_df"],
-            "ledger_df": st.session_state["ledger_df"],
-            "apr_summary_df": st.session_state["apr_summary_df"],
-            "line_users_df": st.session_state["line_users_df"],
+            "settings_df": settings_df,
+            "members_df": members_df,
+            "ledger_df": ledger_df,
+            "line_users_df": line_users_df,
+            "apr_summary_df": apr_summary_df,
         }
 
-    @staticmethod
-    def after_write(repo: Repository, engine: FinanceEngine) -> Dict[str, pd.DataFrame]:
-        repo.gs.clear_cache()
-        SessionData.clear_all()
-        return SessionData.sync_all(repo, engine, force=True)
+    def refresh(self) -> Dict[str, pd.DataFrame]:
+        self.repo.gs.clear_cache()
+        self.clear()
+        return self.load(force=True)
+
+    def persist_and_refresh(self) -> Dict[str, pd.DataFrame]:
+        data = self.refresh()
+        self.repo.write_apr_summary(data["apr_summary_df"])
+        return self.refresh()
 
 
 # =========================================================
 # UI
 # =========================================================
 class AppUI:
-    def __init__(self, repo: Repository, engine: FinanceEngine):
-        self.repo, self.engine = repo, engine
+    def __init__(self, repo: Repository, engine: FinanceEngine, store: DataStore):
+        self.repo, self.engine, self.store = repo, engine, store
 
     def render_dashboard(self, members_df: pd.DataFrame, ledger_df: pd.DataFrame, apr_summary_df: pd.DataFrame) -> None:
         st.subheader("📊 管理画面ダッシュボード")
@@ -1032,13 +943,11 @@ class AppUI:
 
         st.divider()
         st.markdown("#### LINE通知履歴")
-
         c_hist1, c_hist2 = st.columns([1, 1])
         with c_hist1:
             if st.button("LINE送信履歴をリセット表示", use_container_width=True):
                 st.session_state["hide_line_history"] = True
                 st.rerun()
-
         with c_hist2:
             if st.button("LINE送信履歴を再表示", use_container_width=True):
                 st.session_state["hide_line_history"] = False
@@ -1107,17 +1016,14 @@ class AppUI:
             row = settings_df[settings_df["Project_Name"] == str(p)].iloc[0]
             project_net_factor = float(row.get("Net_Factor", AppConfig.FACTOR["MASTER"]))
             compound_timing = U.normalize_compound(row.get("Compound_Timing", AppConfig.COMPOUND["NONE"]))
-
             mem = self.repo.project_members_active(members_df, p)
             if mem.empty:
                 continue
 
             mem_calc = self.engine.calc_project_apr(mem, float(apr), project_net_factor, p)
-
             for _, r in mem_calc.iterrows():
                 person = str(r["PersonName"]).strip()
                 is_done = (str(p).strip(), person) in existing_apr_keys
-
                 if is_done:
                     skipped_members += 1
                 else:
@@ -1141,15 +1047,8 @@ class AppUI:
             st.warning("送信対象に 🟢運用中 のメンバーがいません。")
             return
 
-        st.markdown(
-            f"送信対象プロジェクト数: {len(target_projects)} / "
-            f"本日未記録の対象人数: {total_members} / "
-            f"本日記録済み人数: {skipped_members}"
-        )
-        st.markdown(
-            f"本日新規記録対象の総元本: {U.fmt_usd(total_principal)} / "
-            f"本日新規記録対象の総配当: {U.fmt_usd(total_reward)}"
-        )
+        st.markdown(f"送信対象プロジェクト数: {len(target_projects)} / 本日未記録の対象人数: {total_members} / 本日記録済み人数: {skipped_members}")
+        st.markdown(f"本日新規記録対象の総元本: {U.fmt_usd(total_principal)} / 本日新規記録対象の総配当: {U.fmt_usd(total_reward)}")
 
         with st.expander("個人別の本日配当（確認）", expanded=False):
             st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
@@ -1160,10 +1059,7 @@ class AppUI:
             if st.button("本日のAPR記録をリセット"):
                 try:
                     deleted_apr, deleted_line = self.repo.reset_today_apr_records(today_key, project)
-                    data = SessionData.after_write(self.repo, self.engine)
-                    self.repo.write_apr_summary(data["apr_summary_df"])
-                    data = SessionData.after_write(self.repo, self.engine)
-
+                    self.store.persist_and_refresh()
                     if deleted_apr == 0 and deleted_line == 0:
                         st.info("削除対象はありません。")
                     else:
@@ -1192,13 +1088,11 @@ class AppUI:
                     row = settings_df[settings_df["Project_Name"] == str(p)].iloc[0]
                     project_net_factor = float(row.get("Net_Factor", AppConfig.FACTOR["MASTER"]))
                     compound_timing = U.normalize_compound(row.get("Compound_Timing", AppConfig.COMPOUND["NONE"]))
-
                     mem = self.repo.project_members_active(members_df, p)
                     if mem.empty:
                         continue
 
                     mem_calc = self.engine.calc_project_apr(mem, float(apr), project_net_factor, p)
-
                     for _, r in mem_calc.iterrows():
                         person = str(r["PersonName"]).strip()
                         uid = str(r["Line_User_ID"]).strip()
@@ -1252,14 +1146,8 @@ class AppUI:
                             members_df.loc[i, "UpdatedAt_JST"] = ts
                     self.repo.write_members(members_df)
 
-                data = SessionData.after_write(self.repo, self.engine)
-                self.repo.write_apr_summary(data["apr_summary_df"])
-                SessionData.after_write(self.repo, self.engine)
-
-                st.success(
-                    f"APR記録:{apr_ledger_count}件 / LINE履歴記録:{line_log_count}件 / "
-                    f"送信成功:{success} / 送信失敗:{fail} / 重複スキップ:{skip_count}件"
-                )
+                self.store.persist_and_refresh()
+                st.success(f"APR記録:{apr_ledger_count}件 / LINE履歴記録:{line_log_count}件 / 送信成功:{success} / 送信失敗:{fail} / 重複スキップ:{skip_count}件")
                 st.rerun()
 
             except Exception as e:
@@ -1269,14 +1157,13 @@ class AppUI:
         if send_scope == "選択中プロジェクトのみ":
             row = settings_df[settings_df["Project_Name"] == str(project)].iloc[0]
             compound_timing = U.normalize_compound(row.get("Compound_Timing", AppConfig.COMPOUND["NONE"]))
-
             if compound_timing == AppConfig.COMPOUND["MONTHLY"]:
                 st.divider()
                 st.markdown("#### 月次複利反映")
                 if st.button("未反映APRを元本へ反映"):
                     try:
                         count, total_added = self.engine.apply_monthly_compound(self.repo, members_df, project)
-                        SessionData.after_write(self.repo, self.engine)
+                        self.store.persist_and_refresh()
                         if count == 0:
                             st.info("未反映のAPRはありません。")
                         else:
@@ -1288,7 +1175,6 @@ class AppUI:
 
     def render_cash(self, settings_df: pd.DataFrame, members_df: pd.DataFrame) -> None:
         st.subheader("💸 入金 / 出金（個別LINE通知）")
-
         projects = self.repo.active_projects(settings_df)
         if not projects:
             st.warning("有効なプロジェクトがありません。")
@@ -1353,7 +1239,7 @@ class AppUI:
                     code, line_note = 0, "LINE未送信: Line_User_IDなし"
 
                 self.repo.append_ledger(ts, project, person, AppConfig.TYPE["LINE"], 0, line_note, evidence_url or "", uid, str(row["LINE_DisplayName"]).strip())
-                SessionData.after_write(self.repo, self.engine)
+                self.store.persist_and_refresh()
 
                 if code == 200:
                     st.success("入出金保存＆LINE送信記録完了")
@@ -1364,15 +1250,14 @@ class AppUI:
                 st.error(f"入出金処理でエラー: {e}")
                 st.stop()
 
-    def render_admin(self, settings_df: pd.DataFrame, members_df: pd.DataFrame, line_users_df: pd.DataFrame) -> pd.DataFrame:
+    def render_admin(self, settings_df: pd.DataFrame, members_df: pd.DataFrame, line_users_df: pd.DataFrame) -> None:
         st.subheader("⚙️ 管理")
-
         cfix1, _ = st.columns([1, 2])
         with cfix1:
             if st.button("Settingsを自動修復", use_container_width=True):
                 try:
                     self.repo.repair_settings(self.repo.load_settings())
-                    SessionData.after_write(self.repo, self.engine)
+                    self.store.persist_and_refresh()
                     st.success(f"{self.repo.gs.names.SETTINGS} を修復しました。")
                     st.rerun()
                 except Exception as e:
@@ -1381,7 +1266,7 @@ class AppUI:
         projects = self.repo.active_projects(settings_df)
         if not projects:
             st.warning("有効なプロジェクトがありません。")
-            return members_df
+            return
 
         project = st.selectbox("対象プロジェクト", projects, key="admin_project")
 
@@ -1408,8 +1293,7 @@ class AppUI:
             st.info("メンバーがいないため送信できません。")
         else:
             target_mode = st.radio("対象", ["🟢運用中のみ", "全メンバー（停止含む）"], horizontal=True)
-            cand = view_all.copy() if target_mode.startswith("全") else view_all[view_all["IsActive"] == True].copy()
-            cand = cand.reset_index(drop=True)
+            cand = view_all.copy() if target_mode.startswith("全") else view_all[view_all["IsActive"] == True].copy().reset_index(drop=True)
 
             def label_row(r: pd.Series) -> str:
                 name = str(r.get("PersonName", "")).strip()
@@ -1443,7 +1327,7 @@ class AppUI:
                     evidence_url = ExternalService.upload_imgbb(img.getvalue()) if img else None
                     if img and not evidence_url:
                         st.error("画像アップロードに失敗しました。")
-                        return members_df
+                        return
 
                     token = ExternalService.get_line_token(AdminAuth.current_namespace())
                     label_to_row = {label_row(cand.loc[i]): cand.loc[i] for i in range(len(cand))}
@@ -1478,7 +1362,7 @@ class AppUI:
                             fail += 1
                             failed_list.append(f"{lab}（HTTP {code}）")
 
-                    SessionData.after_write(self.repo, self.engine)
+                    self.store.persist_and_refresh()
                     if fail == 0:
                         st.success(f"送信完了（成功:{success} / 失敗:{fail} / Ledger記録:{line_log_count}）")
                     else:
@@ -1489,29 +1373,37 @@ class AppUI:
         st.divider()
         if not view_all.empty:
             st.markdown("#### 状態切替")
-            c1, c2, c3 = st.columns([3, 2, 1])
-            with c1:
-                target_name = st.selectbox("対象メンバー", view_all["PersonName"].astype(str).tolist(), key=f"status_target_{project}")
-            cur_row = view_all[view_all["PersonName"].astype(str) == str(target_name)].iloc[0]
-            with c2:
-                new_status = st.selectbox("状態", [AppConfig.STATUS["ON"], AppConfig.STATUS["OFF"]], index=0 if U.truthy(cur_row["IsActive"]) else 1, key=f"status_value_{project}")
-            with c3:
-                st.write("")
-                st.write("")
-                if st.button("状態を保存", use_container_width=True, key=f"save_status_only_{project}"):
-                    row_id, ts = int(cur_row["_row_id"]), U.fmt_dt(U.now_jst())
-                    members_df.loc[row_id, "IsActive"] = U.status_to_bool(new_status)
-                    members_df.loc[row_id, "UpdatedAt_JST"] = ts
 
-                    msg = self.repo.validate_no_dup_lineid(members_df, project)
-                    if msg:
-                        st.error(msg)
-                        return members_df
+            status_options = []
+            for _, r in view_all.iterrows():
+                person_name = str(r["PersonName"]).strip()
+                status_label = U.bool_to_status(r["IsActive"])
+                status_options.append(f"{person_name} ｜ {status_label}")
 
-                    self.repo.write_members(members_df)
-                    SessionData.after_write(self.repo, self.engine)
-                    st.success(f"{target_name} の状態を更新しました。")
-                    st.rerun()
+            selected_label = st.selectbox("対象メンバー", status_options, key=f"status_target_{project}")
+            selected_name = str(selected_label).split("｜")[0].strip()
+
+            cur_row = view_all[view_all["PersonName"].astype(str).str.strip() == selected_name].iloc[0]
+            current_status = U.bool_to_status(cur_row["IsActive"])
+            next_status = AppConfig.STATUS["OFF"] if U.truthy(cur_row["IsActive"]) else AppConfig.STATUS["ON"]
+            button_label = f"{current_status} → {next_status}"
+
+            if st.button(button_label, use_container_width=True, key=f"toggle_status_{project}"):
+                row_id = int(cur_row["_row_id"])
+                ts = U.fmt_dt(U.now_jst())
+
+                members_df.loc[row_id, "IsActive"] = not U.truthy(members_df.loc[row_id, "IsActive"])
+                members_df.loc[row_id, "UpdatedAt_JST"] = ts
+
+                msg = self.repo.validate_no_dup_lineid(members_df, project)
+                if msg:
+                    st.error(msg)
+                    return
+
+                self.repo.write_members(members_df)
+                self.store.persist_and_refresh()
+                st.success(f"{selected_name} を {next_status} に更新しました。")
+                st.rerun()
 
         st.divider()
         if not view_all.empty:
@@ -1539,7 +1431,7 @@ class AppUI:
             cancel = c2.button("編集を破棄（再読み込み）", use_container_width=True, key=f"cancel_members_{project}")
 
             if cancel:
-                SessionData.after_write(self.repo, self.engine)
+                self.store.refresh()
                 st.rerun()
 
             if save:
@@ -1559,10 +1451,10 @@ class AppUI:
                 msg = self.repo.validate_no_dup_lineid(members_df, project)
                 if msg:
                     st.error(msg)
-                    return members_df
+                    return
 
                 self.repo.write_members(members_df)
-                SessionData.after_write(self.repo, self.engine)
+                self.store.persist_and_refresh()
                 st.success("保存しました。")
                 st.rerun()
 
@@ -1578,7 +1470,7 @@ class AppUI:
             project_candidates = [p for p in all_projects if str(p).strip().upper() != AppConfig.PROJECT["PERSONAL"]]
             if not project_candidates:
                 st.warning("PERSONAL以外のプロジェクトがありません。")
-                return members_df
+                return
             selected_project = st.selectbox("登録するプロジェクト", project_candidates, key="member_add_target_project")
 
         if line_users:
@@ -1591,7 +1483,6 @@ class AppUI:
                 st.session_state["prefill_line_name"] = name
 
         pre_uid, pre_name = st.session_state.get("prefill_line_uid", ""), st.session_state.get("prefill_line_name", "")
-
         with st.form("member_add", clear_on_submit=False):
             person = st.text_input("PersonName（個人名）")
             principal = st.number_input("Principal（残高）", min_value=0.0, value=0.0, step=100.0)
@@ -1604,7 +1495,7 @@ class AppUI:
         if submit:
             if not person or not line_uid:
                 st.error("PersonName と Line_User_ID は必須です。")
-                return members_df
+                return
 
             exists = members_df[
                 (members_df["Project_Name"] == str(selected_project)) &
@@ -1612,7 +1503,7 @@ class AppUI:
             ]
             if not exists.empty:
                 st.warning("このプロジェクト内に同じ Line_User_ID が既に存在します。")
-                return members_df
+                return
 
             ts = U.fmt_dt(U.now_jst())
             new_row = {
@@ -1631,16 +1522,14 @@ class AppUI:
             msg = self.repo.validate_no_dup_lineid(members_df, selected_project)
             if msg:
                 st.error(msg)
-                return members_df
+                return
 
             self.repo.write_members(members_df)
-            SessionData.after_write(self.repo, self.engine)
+            self.store.persist_and_refresh()
             st.success(f"追加しました。登録先: {selected_project}")
             st.rerun()
 
-        return members_df
-
-    def render_help(self) -> None:
+    def render_help(self, gs: GSheetService) -> None:
         st.subheader("❓ ヘルプ / 使い方")
         st.caption(f"{AppConfig.RANK_LABEL} / 管理者: {AdminAuth.current_label()}")
 
@@ -1654,17 +1543,17 @@ class AppUI:
         with st.expander("1. 現在の接続情報", expanded=False):
             st.code(
                 f"""参照シート
-Settings     = {self.repo.gs.names.SETTINGS}
-Members      = {self.repo.gs.names.MEMBERS}
-Ledger       = {self.repo.gs.names.LEDGER}
-LineUsers    = {self.repo.gs.names.LINEUSERS}
-APR_Summary  = {self.repo.gs.names.APR_SUMMARY}
+Settings     = {gs.names.SETTINGS}
+Members      = {gs.names.MEMBERS}
+Ledger       = {gs.names.LEDGER}
+LineUsers    = {gs.names.LINEUSERS}
+APR_Summary  = {gs.names.APR_SUMMARY}
 
 Spreadsheet ID
-{self.repo.gs.spreadsheet_id}
+{gs.spreadsheet_id}
 
 Spreadsheet URL
-{self.repo.gs.spreadsheet_url()}
+{gs.spreadsheet_url()}
 """
             )
 
@@ -1738,114 +1627,101 @@ LINEユーザー情報を `LineUsers` シートへ自動登録し、管理画面
             )
             st.code("\t".join(AppConfig.HEADERS["LINEUSERS"]))
 
-        with st.expander("6. よくあるトラブル", expanded=False):
-            st.markdown(
-                """
-### APR画面にプロジェクトが出ない
-- `Settings__A` など対象シートの `Active` が `TRUE` になっているか確認
-- `Project_Name` が空欄でないか確認
-- Settingsが壊れている場合は管理画面の `Settingsを自動修復` を押してください
 
-### LINEが送れない
-- `Members` の `Line_User_ID` が本物のIDか確認
-- namespaceに対応する LINE token が secrets に入っているか確認
+# =========================================================
+# APP CONTROLLER
+# =========================================================
+class AppController:
+    def __init__(self):
+        self.gs: Optional[GSheetService] = None
+        self.repo: Optional[Repository] = None
+        self.engine: Optional[FinanceEngine] = None
+        self.store: Optional[DataStore] = None
+        self.ui: Optional[AppUI] = None
 
-### monthly なのに元本が増えない
-- monthly は APR確定だけでは元本へ反映しません
-- APR画面の「未反映APRを元本へ反映」を実行してください
+    def setup_page(self) -> None:
+        st.set_page_config(page_title=AppConfig.APP_TITLE, layout=AppConfig.PAGE_LAYOUT, page_icon=AppConfig.APP_ICON)
+        st.title(f"{AppConfig.APP_ICON} {AppConfig.APP_TITLE}")
 
-### Ledger / LINE通知履歴 / サマリーに出ない
-- B方式では PERSONAL シートではなく `Ledger__A` と `APR_Summary__A` を見ます
-- APR確定時は `Type=APR` が Ledger に記録されます
-- LINE送信結果は `Type=LINE` が Ledger に記録されます
-- サマリーは Ledger の `Type=APR` を集計します
+    def setup_auth(self) -> None:
+        AdminAuth.require_login()
+        st.markdown(
+            """
+            <style>
+              section[data-testid="stSidebar"] div[role="radiogroup"] > label { margin: 10px 0 !important; padding: 6px 8px !important; }
+              section[data-testid="stSidebar"] div[role="radiogroup"] > label p { font-size: 16px !important; }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        with st.sidebar:
+            st.caption(f"👤 {AdminAuth.current_label()}")
+            if st.button("🔓 ログアウト", use_container_width=True):
+                st.session_state["admin_ok"] = False
+                st.session_state["admin_name"] = ""
+                st.session_state["admin_namespace"] = ""
+                for key in AppConfig.SESSION_KEYS.values():
+                    if key in st.session_state:
+                        del st.session_state[key]
+                st.rerun()
 
-### LINE送信履歴を消したい
-- ダッシュボードの「LINE送信履歴をリセット表示」は画面表示だけを消します
-- シートのLedger記録は削除しません
-"""
-            )
+    def setup_state(self) -> None:
+        if "page" not in st.session_state:
+            st.session_state["page"] = AppConfig.PAGE["DASHBOARD"]
+        if "hide_line_history" not in st.session_state:
+            st.session_state["hide_line_history"] = False
+
+    def setup_services(self) -> None:
+        con = st.secrets.get("connections", {}).get("gsheets", {})
+        sid = U.extract_sheet_id(str(con.get("spreadsheet", "")).strip())
+        if not sid:
+            st.error("Secrets の [connections.gsheets].spreadsheet が未設定です。")
+            st.stop()
+
+        try:
+            self.gs = GSheetService(spreadsheet_id=sid, namespace=AdminAuth.current_namespace())
+        except Exception as e:
+            msg = str(e)
+            if "Quota exceeded" in msg or "429" in msg:
+                st.error("Google Sheets API の読み取り上限に達しています。1〜2分待ってから再読み込みしてください。")
+            else:
+                st.error(f"Spreadsheet を開けません。: {e}")
+            st.stop()
+
+        self.repo = Repository(self.gs)
+        self.engine = FinanceEngine()
+        self.store = DataStore(self.repo, self.engine)
+        self.ui = AppUI(self.repo, self.engine, self.store)
+
+    def run(self) -> None:
+        self.setup_page()
+        self.setup_auth()
+        self.setup_state()
+        self.setup_services()
+
+        data = self.store.load(force=False)
+        menu = [AppConfig.PAGE["DASHBOARD"], AppConfig.PAGE["APR"], AppConfig.PAGE["CASH"], AppConfig.PAGE["ADMIN"], AppConfig.PAGE["HELP"]]
+        page = st.sidebar.radio("メニュー", options=menu, index=menu.index(st.session_state["page"]) if st.session_state["page"] in menu else 0)
+        st.session_state["page"] = page
+
+        if page == AppConfig.PAGE["DASHBOARD"]:
+            self.repo.write_apr_summary(data["apr_summary_df"])
+            self.ui.render_dashboard(data["members_df"], data["ledger_df"], data["apr_summary_df"])
+        elif page == AppConfig.PAGE["APR"]:
+            self.ui.render_apr(data["settings_df"], data["members_df"])
+        elif page == AppConfig.PAGE["CASH"]:
+            self.ui.render_cash(data["settings_df"], data["members_df"])
+        elif page == AppConfig.PAGE["ADMIN"]:
+            self.ui.render_admin(data["settings_df"], data["members_df"], data["line_users_df"])
+        else:
+            self.ui.render_help(self.gs)
 
 
 # =========================================================
 # MAIN
 # =========================================================
 def main() -> None:
-    st.set_page_config(page_title=AppConfig.APP_TITLE, layout=AppConfig.PAGE_LAYOUT, page_icon=AppConfig.APP_ICON)
-    st.title(f"{AppConfig.APP_ICON} {AppConfig.APP_TITLE}")
-
-    AdminAuth.require_login()
-
-    st.markdown(
-        """
-        <style>
-          section[data-testid="stSidebar"] div[role="radiogroup"] > label { margin: 10px 0 !important; padding: 6px 8px !important; }
-          section[data-testid="stSidebar"] div[role="radiogroup"] > label p { font-size: 16px !important; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    with st.sidebar:
-        st.caption(f"👤 {AdminAuth.current_label()}")
-        if st.button("🔓 ログアウト", use_container_width=True):
-            st.session_state["admin_ok"] = False
-            st.session_state["admin_name"] = ""
-            st.session_state["admin_namespace"] = ""
-            SessionData.clear_all()
-            st.rerun()
-
-    if "page" not in st.session_state:
-        st.session_state["page"] = AppConfig.PAGE["DASHBOARD"]
-    if "hide_line_history" not in st.session_state:
-        st.session_state["hide_line_history"] = False
-
-    con = st.secrets.get("connections", {}).get("gsheets", {})
-    sid = U.extract_sheet_id(str(con.get("spreadsheet", "")).strip())
-    if not sid:
-        st.error("Secrets の [connections.gsheets].spreadsheet が未設定です。")
-        st.stop()
-
-    try:
-        gs = GSheetService(spreadsheet_id=sid, namespace=AdminAuth.current_namespace())
-    except Exception as e:
-        msg = str(e)
-        if "Quota exceeded" in msg or "429" in msg:
-            st.error("Google Sheets API の読み取り上限に達しています。1〜2分待ってから再読み込みしてください。")
-        else:
-            st.error(f"Spreadsheet を開けません。: {e}")
-        st.stop()
-
-    repo = Repository(gs)
-    engine = FinanceEngine()
-    ui = AppUI(repo, engine)
-
-    data = SessionData.sync_all(repo, engine, force=False)
-    settings_df, members_df, ledger_df, apr_summary_df, line_users_df = (
-        data["settings_df"], data["members_df"], data["ledger_df"], data["apr_summary_df"], data["line_users_df"]
-    )
-
-    menu = [
-        AppConfig.PAGE["DASHBOARD"],
-        AppConfig.PAGE["APR"],
-        AppConfig.PAGE["CASH"],
-        AppConfig.PAGE["ADMIN"],
-        AppConfig.PAGE["HELP"],
-    ]
-    page = st.sidebar.radio("メニュー", options=menu, index=menu.index(st.session_state["page"]) if st.session_state["page"] in menu else 0)
-    st.session_state["page"] = page
-
-    if page == AppConfig.PAGE["DASHBOARD"]:
-        repo.write_apr_summary(apr_summary_df)
-        ui.render_dashboard(members_df, ledger_df, apr_summary_df)
-    elif page == AppConfig.PAGE["APR"]:
-        ui.render_apr(settings_df, members_df)
-    elif page == AppConfig.PAGE["CASH"]:
-        ui.render_cash(settings_df, members_df)
-    elif page == AppConfig.PAGE["ADMIN"]:
-        ui.render_admin(settings_df, members_df, line_users_df)
-    else:
-        ui.render_help()
+    AppController().run()
 
 
 if __name__ == "__main__":
