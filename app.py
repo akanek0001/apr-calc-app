@@ -1654,57 +1654,12 @@ class AppUI:
     def render_admin(self, settings_df: pd.DataFrame, members_df: pd.DataFrame, line_users_df: pd.DataFrame) -> None:
         st.subheader("⚙️ 管理")
 
-        cfix1, _ = st.columns([1, 2])
-        with cfix1:
-            if st.button("Settingsを自動修復", use_container_width=True):
-                try:
-                    self.repo.repair_settings(self.repo.load_settings())
-                    self.store.persist_and_refresh()
-                    st.success(f"{self.repo.gs.names.SETTINGS} を修復しました。")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Settings修復でエラー: {e}")
-
         projects = self.repo.active_projects(settings_df)
         if not projects:
             st.warning("有効なプロジェクトがありません。")
             return
 
         project = st.selectbox("対象プロジェクト", projects, key="admin_project")
-
-        row_setting = settings_df[settings_df["Project_Name"] == project].iloc[0]
-        st.markdown("#### OCR設定")
-        ocr_edit = pd.DataFrame(
-            [
-                {
-                    "Crop_Left_Ratio_PC": row_setting.get("Crop_Left_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Left_Ratio_PC"]),
-                    "Crop_Top_Ratio_PC": row_setting.get("Crop_Top_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Top_Ratio_PC"]),
-                    "Crop_Right_Ratio_PC": row_setting.get("Crop_Right_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Right_Ratio_PC"]),
-                    "Crop_Bottom_Ratio_PC": row_setting.get("Crop_Bottom_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Bottom_Ratio_PC"]),
-                    "Crop_Left_Ratio_Mobile": row_setting.get("Crop_Left_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Left_Ratio_Mobile"]),
-                    "Crop_Top_Ratio_Mobile": row_setting.get("Crop_Top_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Top_Ratio_Mobile"]),
-                    "Crop_Right_Ratio_Mobile": row_setting.get("Crop_Right_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Right_Ratio_Mobile"]),
-                    "Crop_Bottom_Ratio_Mobile": row_setting.get("Crop_Bottom_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Bottom_Ratio_Mobile"]),
-                }
-            ]
-        )
-
-        edited_ocr = st.data_editor(
-            ocr_edit,
-            use_container_width=True,
-            hide_index=True,
-            num_rows="fixed",
-            key=f"ocr_editor_{project}",
-        )
-        if st.button("OCR設定を保存", key=f"save_ocr_{project}", use_container_width=True):
-            idx = settings_df[settings_df["Project_Name"] == project].index[0]
-            for col, default in {**AppConfig.OCR_DEFAULTS_PC, **AppConfig.OCR_DEFAULTS_MOBILE}.items():
-                settings_df.loc[idx, col] = U.to_ratio(edited_ocr.iloc[0][col], default)
-            settings_df.loc[idx, "UpdatedAt_JST"] = U.fmt_dt(U.now_jst())
-            self.repo.write_settings(settings_df)
-            self.store.persist_and_refresh()
-            st.success("OCR設定を保存しました。")
-            st.rerun()
 
         line_users: List[Tuple[str, str, str]] = []
         if not line_users_df.empty:
@@ -1971,7 +1926,7 @@ class AppUI:
             st.success(f"追加しました。登録先: {selected_project}")
             st.rerun()
 
-    def render_help(self, gs: GSheetService) -> None:
+    def render_help(self, gs: GSheetService, settings_df: pd.DataFrame) -> None:
         st.subheader("❓ ヘルプ / 使い方")
         st.caption(f"{AppConfig.RANK_LABEL} / 管理者: {AdminAuth.current_label()}")
 
@@ -2069,6 +2024,147 @@ LINEユーザー情報を `LineUsers` シートへ自動登録し、管理画面
             )
             st.code("\t".join(AppConfig.HEADERS["LINEUSERS"]))
 
+        with st.expander("6. Settings自動修復", expanded=False):
+            st.markdown(
+                """
+Settings シートの不足列補完、PERSONAL行の不足補完、OCR初期座標の補完を行います。
+シート構造が崩れたときはこちらを実行してください。
+"""
+            )
+            if st.button("Settingsを自動修復", key="help_fix_settings", use_container_width=True):
+                try:
+                    self.repo.repair_settings(self.repo.load_settings())
+                    self.store.persist_and_refresh()
+                    st.success(f"{self.repo.gs.names.SETTINGS} を修復しました。")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Settings修復でエラー: {e}")
+
+        with st.expander("7. OCR設定（座標設定）", expanded=False):
+            projects = self.repo.active_projects(settings_df)
+            if not projects:
+                st.warning("有効なプロジェクトがありません。")
+            else:
+                ocr_project = st.selectbox("OCR設定対象プロジェクト", projects, key="help_ocr_project")
+                row_setting = settings_df[settings_df["Project_Name"] == ocr_project].iloc[0]
+
+                st.markdown("#### 現在値")
+                current_vals = pd.DataFrame(
+                    [
+                        {
+                            "Crop_Left_Ratio_PC": row_setting.get("Crop_Left_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Left_Ratio_PC"]),
+                            "Crop_Top_Ratio_PC": row_setting.get("Crop_Top_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Top_Ratio_PC"]),
+                            "Crop_Right_Ratio_PC": row_setting.get("Crop_Right_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Right_Ratio_PC"]),
+                            "Crop_Bottom_Ratio_PC": row_setting.get("Crop_Bottom_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Bottom_Ratio_PC"]),
+                            "Crop_Left_Ratio_Mobile": row_setting.get("Crop_Left_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Left_Ratio_Mobile"]),
+                            "Crop_Top_Ratio_Mobile": row_setting.get("Crop_Top_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Top_Ratio_Mobile"]),
+                            "Crop_Right_Ratio_Mobile": row_setting.get("Crop_Right_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Right_Ratio_Mobile"]),
+                            "Crop_Bottom_Ratio_Mobile": row_setting.get("Crop_Bottom_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Bottom_Ratio_Mobile"]),
+                        }
+                    ]
+                )
+                st.dataframe(current_vals, use_container_width=True, hide_index=True)
+
+                st.markdown("#### OCR確認用画像（任意）")
+                preview = st.file_uploader("画像をアップロードするとプレビュー表示します", type=["png", "jpg", "jpeg"], key="help_ocr_preview")
+                if preview is not None:
+                    try:
+                        img = Image.open(preview)
+                        st.image(img, caption="OCR確認画像", use_container_width=True)
+                        w, h = img.size
+                        st.caption(f"画像サイズ: {w} x {h}")
+                    except Exception:
+                        st.warning("画像のプレビューに失敗しました。")
+
+                st.markdown("#### 座標設定（PC）")
+                c1, c2, c3, c4 = st.columns(4)
+                pc_left = c1.number_input(
+                    "Crop_Left_Ratio_PC",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=float(row_setting.get("Crop_Left_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Left_Ratio_PC"])),
+                    step=0.01,
+                    key=f"help_pc_left_{ocr_project}",
+                )
+                pc_top = c2.number_input(
+                    "Crop_Top_Ratio_PC",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=float(row_setting.get("Crop_Top_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Top_Ratio_PC"])),
+                    step=0.01,
+                    key=f"help_pc_top_{ocr_project}",
+                )
+                pc_right = c3.number_input(
+                    "Crop_Right_Ratio_PC",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=float(row_setting.get("Crop_Right_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Right_Ratio_PC"])),
+                    step=0.01,
+                    key=f"help_pc_right_{ocr_project}",
+                )
+                pc_bottom = c4.number_input(
+                    "Crop_Bottom_Ratio_PC",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=float(row_setting.get("Crop_Bottom_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Bottom_Ratio_PC"])),
+                    step=0.01,
+                    key=f"help_pc_bottom_{ocr_project}",
+                )
+
+                st.markdown("#### 座標設定（Mobile）")
+                c5, c6, c7, c8 = st.columns(4)
+                mobile_left = c5.number_input(
+                    "Crop_Left_Ratio_Mobile",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=float(row_setting.get("Crop_Left_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Left_Ratio_Mobile"])),
+                    step=0.01,
+                    key=f"help_mobile_left_{ocr_project}",
+                )
+                mobile_top = c6.number_input(
+                    "Crop_Top_Ratio_Mobile",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=float(row_setting.get("Crop_Top_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Top_Ratio_Mobile"])),
+                    step=0.01,
+                    key=f"help_mobile_top_{ocr_project}",
+                )
+                mobile_right = c7.number_input(
+                    "Crop_Right_Ratio_Mobile",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=float(row_setting.get("Crop_Right_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Right_Ratio_Mobile"])),
+                    step=0.01,
+                    key=f"help_mobile_right_{ocr_project}",
+                )
+                mobile_bottom = c8.number_input(
+                    "Crop_Bottom_Ratio_Mobile",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=float(row_setting.get("Crop_Bottom_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Bottom_Ratio_Mobile"])),
+                    step=0.01,
+                    key=f"help_mobile_bottom_{ocr_project}",
+                )
+
+                if st.button("OCR座標を保存", key=f"help_save_ocr_{ocr_project}", use_container_width=True):
+                    try:
+                        idx = settings_df[settings_df["Project_Name"] == ocr_project].index[0]
+                        settings_df.loc[idx, "Crop_Left_Ratio_PC"] = U.to_ratio(pc_left, AppConfig.OCR_DEFAULTS_PC["Crop_Left_Ratio_PC"])
+                        settings_df.loc[idx, "Crop_Top_Ratio_PC"] = U.to_ratio(pc_top, AppConfig.OCR_DEFAULTS_PC["Crop_Top_Ratio_PC"])
+                        settings_df.loc[idx, "Crop_Right_Ratio_PC"] = U.to_ratio(pc_right, AppConfig.OCR_DEFAULTS_PC["Crop_Right_Ratio_PC"])
+                        settings_df.loc[idx, "Crop_Bottom_Ratio_PC"] = U.to_ratio(pc_bottom, AppConfig.OCR_DEFAULTS_PC["Crop_Bottom_Ratio_PC"])
+                        settings_df.loc[idx, "Crop_Left_Ratio_Mobile"] = U.to_ratio(mobile_left, AppConfig.OCR_DEFAULTS_MOBILE["Crop_Left_Ratio_Mobile"])
+                        settings_df.loc[idx, "Crop_Top_Ratio_Mobile"] = U.to_ratio(mobile_top, AppConfig.OCR_DEFAULTS_MOBILE["Crop_Top_Ratio_Mobile"])
+                        settings_df.loc[idx, "Crop_Right_Ratio_Mobile"] = U.to_ratio(mobile_right, AppConfig.OCR_DEFAULTS_MOBILE["Crop_Right_Ratio_Mobile"])
+                        settings_df.loc[idx, "Crop_Bottom_Ratio_Mobile"] = U.to_ratio(mobile_bottom, AppConfig.OCR_DEFAULTS_MOBILE["Crop_Bottom_Ratio_Mobile"])
+                        settings_df.loc[idx, "UpdatedAt_JST"] = U.fmt_dt(U.now_jst())
+                        self.repo.write_settings(settings_df)
+                        self.store.persist_and_refresh()
+                        st.success("OCR設定を保存しました。")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"OCR設定保存でエラー: {e}")
+
 
 # =========================================================
 # APP CONTROLLER
@@ -2162,7 +2258,7 @@ class AppController:
         elif page == AppConfig.PAGE["ADMIN"]:
             self.ui.render_admin(data["settings_df"], data["members_df"], data["line_users_df"])
         else:
-            self.ui.render_help(self.gs)
+            self.ui.render_help(self.gs, data["settings_df"])
 
 
 # =========================================================
