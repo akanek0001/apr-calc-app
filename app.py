@@ -13,7 +13,7 @@ import re
 import pandas as pd
 import requests
 import streamlit as st
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageDraw
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -123,6 +123,13 @@ class AppConfig:
         "Crop_Top_Ratio_Mobile": 0.23,
         "Crop_Right_Ratio_Mobile": 0.92,
         "Crop_Bottom_Ratio_Mobile": 0.355,
+    }
+
+    # SmartVaultモバイル専用 固定OCRボックス
+    SMARTVAULT_BOXES_MOBILE = {
+        "TOTAL_LIQUIDITY": {"left": 0.05, "top": 0.25, "right": 0.40, "bottom": 0.34},
+        "YESTERDAY_PROFIT": {"left": 0.41, "top": 0.25, "right": 0.69, "bottom": 0.34},
+        "APR": {"left": 0.70, "top": 0.25, "right": 0.93, "bottom": 0.34},
     }
 
 
@@ -339,7 +346,6 @@ class U:
             return []
 
         norm = str(text)
-
         replace_map = {
             "％": "%",
             "O": "0",
@@ -390,6 +396,78 @@ class U:
             return (2, x)
 
         return sorted(vals, key=score)
+
+    @staticmethod
+    def extract_usd_candidates(text: str) -> List[float]:
+        if not text:
+            return []
+
+        norm = str(text)
+        replace_map = {
+            "＄": "$",
+            "O": "0",
+            "o": "0",
+            "Q": "0",
+            "D": "0",
+            "I": "1",
+            "l": "1",
+            "|": "1",
+            "S": "5",
+            "s": "5",
+            ",": ".",
+        }
+        for k, v in replace_map.items():
+            norm = norm.replace(k, v)
+
+        patterns = [
+            r"\$(\d+(?:\.\d+)?)",
+            r"(\d{1,10}\.\d{1,4})",
+        ]
+
+        vals: List[float] = []
+        seen = set()
+
+        for pat in patterns:
+            for v in re.findall(pat, norm):
+                try:
+                    f = float(v)
+                    if 0 <= f <= 1000000000:
+                        key = round(f, 6)
+                        if key not in seen:
+                            seen.add(key)
+                            vals.append(f)
+                except Exception:
+                    pass
+
+        return vals
+
+    @staticmethod
+    def pick_best_usd(vals: List[float], expected: float) -> Optional[float]:
+        if not vals:
+            return None
+        return sorted(vals, key=lambda x: abs(float(x) - float(expected)))[0]
+
+    @staticmethod
+    def draw_ocr_boxes(file_bytes: bytes, boxes: Dict[str, Dict[str, float]]) -> bytes:
+        try:
+            img = Image.open(BytesIO(file_bytes)).convert("RGB")
+            draw = ImageDraw.Draw(img)
+            w, h = img.size
+
+            for label, box in boxes.items():
+                left = int(w * box["left"])
+                top = int(h * box["top"])
+                right = int(w * box["right"])
+                bottom = int(h * box["bottom"])
+
+                draw.rectangle((left, top, right, bottom), outline="red", width=4)
+                draw.text((left, max(0, top - 20)), label, fill="red")
+
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
+        except Exception:
+            return file_bytes
 
 
 # =========================================================
@@ -1216,6 +1294,43 @@ class AppUI:
         self.engine = engine
         self.store = store
 
+    def _ocr_crop_text(self, file_bytes: bytes, box: Dict[str, float]) -> str:
+        return ExternalService.ocr_space_extract_text_with_crop(
+            file_bytes=file_bytes,
+            crop_left_ratio=box["left"],
+            crop_top_ratio=box["top"],
+            crop_right_ratio=box["right"],
+            crop_bottom_ratio=box["bottom"],
+        )
+
+    def _ocr_smartvault_mobile_metrics(self, file_bytes: bytes) -> Dict[str, Any]:
+        boxes = AppConfig.SMARTVAULT_BOXES_MOBILE
+
+        total_text = self._ocr_crop_text(file_bytes, boxes["TOTAL_LIQUIDITY"])
+        profit_text = self._ocr_crop_text(file_bytes, boxes["YESTERDAY_PROFIT"])
+        apr_text = self._ocr_crop_text(file_bytes, boxes["APR"])
+
+        total_vals = U.extract_usd_candidates(total_text)
+        profit_vals = U.extract_usd_candidates(profit_text)
+        apr_vals = U.extract_percent_candidates(apr_text)
+
+        total_liquidity = U.pick_best_usd(total_vals, 50000.0)
+        yesterday_profit = U.pick_best_usd(profit_vals, 100.0)
+        apr_value = apr_vals[0] if apr_vals else None
+
+        boxed_preview = U.draw_ocr_boxes(file_bytes, boxes)
+
+        return {
+            "boxes": boxes,
+            "total_text": total_text,
+            "profit_text": profit_text,
+            "apr_text": apr_text,
+            "total_liquidity": total_liquidity,
+            "yesterday_profit": yesterday_profit,
+            "apr_value": apr_value,
+            "boxed_preview": boxed_preview,
+        }
+
     def render_dashboard(self, members_df: pd.DataFrame, ledger_df: pd.DataFrame, apr_summary_df: pd.DataFrame) -> None:
         st.subheader("📊 管理画面ダッシュボード")
         st.caption("総資産 / 本日APR / グループ別残高 / 個人残高 / 個人別累計APR / LINE通知履歴")
@@ -1328,6 +1443,8 @@ class AppUI:
         uploaded = st.file_uploader("エビデンス画像（任意）", type=["png", "jpg", "jpeg"], key="apr_img")
 
         if uploaded is not None and st.button("OCRで%候補を抽出"):
+            file_bytes = uploaded.getvalue()
+
             crop_left_ratio = AppConfig.OCR_DEFAULTS_PC["Crop_Left_Ratio_PC"]
             crop_top_ratio = AppConfig.OCR_DEFAULTS_PC["Crop_Top_Ratio_PC"]
             crop_right_ratio = AppConfig.OCR_DEFAULTS_PC["Crop_Right_Ratio_PC"]
@@ -1336,21 +1453,45 @@ class AppUI:
             try:
                 srow = settings_df[settings_df["Project_Name"] == str(project)].iloc[0]
 
-                if U.is_mobile_tall_image(uploaded.getvalue()):
-                    crop_left_ratio = U.to_ratio(srow.get("Crop_Left_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Left_Ratio_Mobile"]), AppConfig.OCR_DEFAULTS_MOBILE["Crop_Left_Ratio_Mobile"])
-                    crop_top_ratio = U.to_ratio(srow.get("Crop_Top_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Top_Ratio_Mobile"]), AppConfig.OCR_DEFAULTS_MOBILE["Crop_Top_Ratio_Mobile"])
-                    crop_right_ratio = U.to_ratio(srow.get("Crop_Right_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Right_Ratio_Mobile"]), AppConfig.OCR_DEFAULTS_MOBILE["Crop_Right_Ratio_Mobile"])
-                    crop_bottom_ratio = U.to_ratio(srow.get("Crop_Bottom_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Bottom_Ratio_Mobile"]), AppConfig.OCR_DEFAULTS_MOBILE["Crop_Bottom_Ratio_Mobile"])
+                if U.is_mobile_tall_image(file_bytes):
+                    crop_left_ratio = U.to_ratio(
+                        srow.get("Crop_Left_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Left_Ratio_Mobile"]),
+                        AppConfig.OCR_DEFAULTS_MOBILE["Crop_Left_Ratio_Mobile"],
+                    )
+                    crop_top_ratio = U.to_ratio(
+                        srow.get("Crop_Top_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Top_Ratio_Mobile"]),
+                        AppConfig.OCR_DEFAULTS_MOBILE["Crop_Top_Ratio_Mobile"],
+                    )
+                    crop_right_ratio = U.to_ratio(
+                        srow.get("Crop_Right_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Right_Ratio_Mobile"]),
+                        AppConfig.OCR_DEFAULTS_MOBILE["Crop_Right_Ratio_Mobile"],
+                    )
+                    crop_bottom_ratio = U.to_ratio(
+                        srow.get("Crop_Bottom_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Bottom_Ratio_Mobile"]),
+                        AppConfig.OCR_DEFAULTS_MOBILE["Crop_Bottom_Ratio_Mobile"],
+                    )
                 else:
-                    crop_left_ratio = U.to_ratio(srow.get("Crop_Left_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Left_Ratio_PC"]), AppConfig.OCR_DEFAULTS_PC["Crop_Left_Ratio_PC"])
-                    crop_top_ratio = U.to_ratio(srow.get("Crop_Top_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Top_Ratio_PC"]), AppConfig.OCR_DEFAULTS_PC["Crop_Top_Ratio_PC"])
-                    crop_right_ratio = U.to_ratio(srow.get("Crop_Right_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Right_Ratio_PC"]), AppConfig.OCR_DEFAULTS_PC["Crop_Right_Ratio_PC"])
-                    crop_bottom_ratio = U.to_ratio(srow.get("Crop_Bottom_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Bottom_Ratio_PC"]), AppConfig.OCR_DEFAULTS_PC["Crop_Bottom_Ratio_PC"])
+                    crop_left_ratio = U.to_ratio(
+                        srow.get("Crop_Left_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Left_Ratio_PC"]),
+                        AppConfig.OCR_DEFAULTS_PC["Crop_Left_Ratio_PC"],
+                    )
+                    crop_top_ratio = U.to_ratio(
+                        srow.get("Crop_Top_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Top_Ratio_PC"]),
+                        AppConfig.OCR_DEFAULTS_PC["Crop_Top_Ratio_PC"],
+                    )
+                    crop_right_ratio = U.to_ratio(
+                        srow.get("Crop_Right_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Right_Ratio_PC"]),
+                        AppConfig.OCR_DEFAULTS_PC["Crop_Right_Ratio_PC"],
+                    )
+                    crop_bottom_ratio = U.to_ratio(
+                        srow.get("Crop_Bottom_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Bottom_Ratio_PC"]),
+                        AppConfig.OCR_DEFAULTS_PC["Crop_Bottom_Ratio_PC"],
+                    )
             except Exception:
                 pass
 
             raw_text = ExternalService.ocr_space_extract_text_with_crop(
-                uploaded.getvalue(),
+                file_bytes=file_bytes,
                 crop_left_ratio=crop_left_ratio,
                 crop_top_ratio=crop_top_ratio,
                 crop_right_ratio=crop_right_ratio,
@@ -1359,22 +1500,76 @@ class AppUI:
             candidates = U.extract_percent_candidates(raw_text)
 
             if raw_text:
-                with st.expander("OCR生テキスト", expanded=False):
+                with st.expander("OCR生テキスト（通常範囲）", expanded=False):
                     st.text(raw_text)
 
             st.info(
                 f"OCR切り抜き範囲: left={crop_left_ratio:.3f}, top={crop_top_ratio:.3f}, right={crop_right_ratio:.3f}, bottom={crop_bottom_ratio:.3f}"
             )
 
-            if candidates:
-                st.success("OCRで%候補を抽出しました。")
-                st.write("候補:", candidates)
-                best = candidates[0]
-                st.info(f"最有力候補: {best}%")
-                st.session_state["apr1"] = str(best)
-                st.rerun()
+            if U.is_mobile_tall_image(file_bytes):
+                smart = self._ocr_smartvault_mobile_metrics(file_bytes)
+
+                st.markdown("#### SmartVaultモバイル専用OCR結果")
+                st.image(smart["boxed_preview"], caption="赤枠 = OCR対象範囲", use_container_width=True)
+
+                c_a, c_b, c_c = st.columns(3)
+                with c_a:
+                    if smart["total_liquidity"] is not None:
+                        st.success(f"総流動性: {U.fmt_usd(float(smart['total_liquidity']))}")
+                    else:
+                        st.warning("総流動性: 未検出")
+
+                with c_b:
+                    if smart["yesterday_profit"] is not None:
+                        st.success(f"昨日の収益: {U.fmt_usd(float(smart['yesterday_profit']))}")
+                    else:
+                        st.warning("昨日の収益: 未検出")
+
+                with c_c:
+                    if smart["apr_value"] is not None:
+                        st.success(f"APR: {float(smart['apr_value']):.2f}%")
+                    else:
+                        st.warning("APR: 未検出")
+
+                st.caption(
+                    f"総流動性範囲 left={smart['boxes']['TOTAL_LIQUIDITY']['left']:.2f}, top={smart['boxes']['TOTAL_LIQUIDITY']['top']:.2f}, right={smart['boxes']['TOTAL_LIQUIDITY']['right']:.2f}, bottom={smart['boxes']['TOTAL_LIQUIDITY']['bottom']:.2f}"
+                )
+                st.caption(
+                    f"昨日の収益範囲 left={smart['boxes']['YESTERDAY_PROFIT']['left']:.2f}, top={smart['boxes']['YESTERDAY_PROFIT']['top']:.2f}, right={smart['boxes']['YESTERDAY_PROFIT']['right']:.2f}, bottom={smart['boxes']['YESTERDAY_PROFIT']['bottom']:.2f}"
+                )
+                st.caption(
+                    f"APR範囲 left={smart['boxes']['APR']['left']:.2f}, top={smart['boxes']['APR']['top']:.2f}, right={smart['boxes']['APR']['right']:.2f}, bottom={smart['boxes']['APR']['bottom']:.2f}"
+                )
+
+                with st.expander("OCR生テキスト（総流動性）", expanded=False):
+                    st.text(smart["total_text"] or "")
+                with st.expander("OCR生テキスト（昨日の収益）", expanded=False):
+                    st.text(smart["profit_text"] or "")
+                with st.expander("OCR生テキスト（APR）", expanded=False):
+                    st.text(smart["apr_text"] or "")
+
+                if smart["apr_value"] is not None:
+                    st.session_state["apr1"] = str(float(smart["apr_value"]))
+                    st.info(f"APR要素1へ自動反映: {float(smart['apr_value']):.2f}%")
+                    st.rerun()
+                elif candidates:
+                    best = candidates[0]
+                    st.success(f"通常OCRからAPR候補を検出: {best}%")
+                    st.session_state["apr1"] = str(best)
+                    st.rerun()
+                else:
+                    st.warning("APR候補は見つかりませんでした。")
             else:
-                st.warning("％付きの数値候補は見つかりませんでした。")
+                if candidates:
+                    st.success("OCRで%候補を抽出しました。")
+                    st.write("候補:", candidates)
+                    best = candidates[0]
+                    st.info(f"最有力候補: {best}%")
+                    st.session_state["apr1"] = str(best)
+                    st.rerun()
+                else:
+                    st.warning("％付きの数値候補は見つかりませんでした。")
 
         target_projects = projects if send_scope == "全有効プロジェクト" else [project]
         today_key = U.fmt_date(U.now_jst())
@@ -1990,6 +2185,11 @@ Spreadsheet URL
 
 ### OCR
 Smart Vault画面は PC / Mobile 別の比率座標で APR領域を切り抜いて OCR.space に送っています。
+さらにモバイル画面では SmartVault専用に
+- 総流動性
+- 昨日の収益
+- APR
+をピンポイントOCRできます。
 
 ### PERSONAL
 個人ごとの元本で計算します。
@@ -2040,130 +2240,194 @@ Settings シートの不足列補完、PERSONAL行の不足補完、OCR初期座
                 except Exception as e:
                     st.error(f"Settings修復でエラー: {e}")
 
-        with st.expander("7. OCR設定（座標設定）", expanded=False):
+        with st.expander("7. OCR設定（座標設定 + 赤枠プレビュー）", expanded=False):
             projects = self.repo.active_projects(settings_df)
             if not projects:
                 st.warning("有効なプロジェクトがありません。")
-            else:
-                ocr_project = st.selectbox("OCR設定対象プロジェクト", projects, key="help_ocr_project")
-                row_setting = settings_df[settings_df["Project_Name"] == ocr_project].iloc[0]
+                return
 
-                st.markdown("#### 現在値")
-                current_vals = pd.DataFrame(
-                    [
-                        {
-                            "Crop_Left_Ratio_PC": row_setting.get("Crop_Left_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Left_Ratio_PC"]),
-                            "Crop_Top_Ratio_PC": row_setting.get("Crop_Top_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Top_Ratio_PC"]),
-                            "Crop_Right_Ratio_PC": row_setting.get("Crop_Right_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Right_Ratio_PC"]),
-                            "Crop_Bottom_Ratio_PC": row_setting.get("Crop_Bottom_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Bottom_Ratio_PC"]),
-                            "Crop_Left_Ratio_Mobile": row_setting.get("Crop_Left_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Left_Ratio_Mobile"]),
-                            "Crop_Top_Ratio_Mobile": row_setting.get("Crop_Top_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Top_Ratio_Mobile"]),
-                            "Crop_Right_Ratio_Mobile": row_setting.get("Crop_Right_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Right_Ratio_Mobile"]),
-                            "Crop_Bottom_Ratio_Mobile": row_setting.get("Crop_Bottom_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Bottom_Ratio_Mobile"]),
+            ocr_project = st.selectbox("OCR設定対象プロジェクト", projects, key="help_ocr_project")
+            row_setting = settings_df[settings_df["Project_Name"] == ocr_project].iloc[0]
+
+            st.markdown("#### 現在値")
+            current_vals = pd.DataFrame(
+                [
+                    {
+                        "Crop_Left_Ratio_PC": row_setting.get("Crop_Left_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Left_Ratio_PC"]),
+                        "Crop_Top_Ratio_PC": row_setting.get("Crop_Top_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Top_Ratio_PC"]),
+                        "Crop_Right_Ratio_PC": row_setting.get("Crop_Right_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Right_Ratio_PC"]),
+                        "Crop_Bottom_Ratio_PC": row_setting.get("Crop_Bottom_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Bottom_Ratio_PC"]),
+                        "Crop_Left_Ratio_Mobile": row_setting.get("Crop_Left_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Left_Ratio_Mobile"]),
+                        "Crop_Top_Ratio_Mobile": row_setting.get("Crop_Top_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Top_Ratio_Mobile"]),
+                        "Crop_Right_Ratio_Mobile": row_setting.get("Crop_Right_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Right_Ratio_Mobile"]),
+                        "Crop_Bottom_Ratio_Mobile": row_setting.get("Crop_Bottom_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Bottom_Ratio_Mobile"]),
+                    }
+                ]
+            )
+            st.dataframe(current_vals, use_container_width=True, hide_index=True)
+
+            st.markdown("#### SmartVaultモバイル専用 固定赤枠座標")
+            st.code(
+                f"""TOTAL_LIQUIDITY
+left={AppConfig.SMARTVAULT_BOXES_MOBILE['TOTAL_LIQUIDITY']['left']:.2f}
+top={AppConfig.SMARTVAULT_BOXES_MOBILE['TOTAL_LIQUIDITY']['top']:.2f}
+right={AppConfig.SMARTVAULT_BOXES_MOBILE['TOTAL_LIQUIDITY']['right']:.2f}
+bottom={AppConfig.SMARTVAULT_BOXES_MOBILE['TOTAL_LIQUIDITY']['bottom']:.2f}
+
+YESTERDAY_PROFIT
+left={AppConfig.SMARTVAULT_BOXES_MOBILE['YESTERDAY_PROFIT']['left']:.2f}
+top={AppConfig.SMARTVAULT_BOXES_MOBILE['YESTERDAY_PROFIT']['top']:.2f}
+right={AppConfig.SMARTVAULT_BOXES_MOBILE['YESTERDAY_PROFIT']['right']:.2f}
+bottom={AppConfig.SMARTVAULT_BOXES_MOBILE['YESTERDAY_PROFIT']['bottom']:.2f}
+
+APR
+left={AppConfig.SMARTVAULT_BOXES_MOBILE['APR']['left']:.2f}
+top={AppConfig.SMARTVAULT_BOXES_MOBILE['APR']['top']:.2f}
+right={AppConfig.SMARTVAULT_BOXES_MOBILE['APR']['right']:.2f}
+bottom={AppConfig.SMARTVAULT_BOXES_MOBILE['APR']['bottom']:.2f}
+"""
+            )
+
+            st.markdown("#### 座標入力")
+
+            st.markdown("##### PC")
+            c1, c2, c3, c4 = st.columns(4)
+            pc_left = c1.number_input(
+                "Crop_Left_Ratio_PC",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(row_setting.get("Crop_Left_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Left_Ratio_PC"])),
+                step=0.01,
+                key=f"help_pc_left_{ocr_project}",
+            )
+            pc_top = c2.number_input(
+                "Crop_Top_Ratio_PC",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(row_setting.get("Crop_Top_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Top_Ratio_PC"])),
+                step=0.01,
+                key=f"help_pc_top_{ocr_project}",
+            )
+            pc_right = c3.number_input(
+                "Crop_Right_Ratio_PC",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(row_setting.get("Crop_Right_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Right_Ratio_PC"])),
+                step=0.01,
+                key=f"help_pc_right_{ocr_project}",
+            )
+            pc_bottom = c4.number_input(
+                "Crop_Bottom_Ratio_PC",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(row_setting.get("Crop_Bottom_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Bottom_Ratio_PC"])),
+                step=0.01,
+                key=f"help_pc_bottom_{ocr_project}",
+            )
+
+            st.markdown("##### Mobile")
+            c5, c6, c7, c8 = st.columns(4)
+            mobile_left = c5.number_input(
+                "Crop_Left_Ratio_Mobile",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(row_setting.get("Crop_Left_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Left_Ratio_Mobile"])),
+                step=0.01,
+                key=f"help_mobile_left_{ocr_project}",
+            )
+            mobile_top = c6.number_input(
+                "Crop_Top_Ratio_Mobile",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(row_setting.get("Crop_Top_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Top_Ratio_Mobile"])),
+                step=0.01,
+                key=f"help_mobile_top_{ocr_project}",
+            )
+            mobile_right = c7.number_input(
+                "Crop_Right_Ratio_Mobile",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(row_setting.get("Crop_Right_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Right_Ratio_Mobile"])),
+                step=0.01,
+                key=f"help_mobile_right_{ocr_project}",
+            )
+            mobile_bottom = c8.number_input(
+                "Crop_Bottom_Ratio_Mobile",
+                min_value=0.0,
+                max_value=1.0,
+                value=float(row_setting.get("Crop_Bottom_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Bottom_Ratio_Mobile"])),
+                step=0.01,
+                key=f"help_mobile_bottom_{ocr_project}",
+            )
+
+            st.markdown("#### OCR確認用画像アップロード")
+            preview = st.file_uploader(
+                "画像をアップロードすると赤枠プレビューします",
+                type=["png", "jpg", "jpeg"],
+                key="help_ocr_preview",
+            )
+
+            if preview is not None:
+                try:
+                    file_bytes = preview.getvalue()
+
+                    custom_mobile_box = {
+                        "CUSTOM_MOBILE": {
+                            "left": float(mobile_left),
+                            "top": float(mobile_top),
+                            "right": float(mobile_right),
+                            "bottom": float(mobile_bottom),
                         }
-                    ]
-                )
-                st.dataframe(current_vals, use_container_width=True, hide_index=True)
+                    }
+                    custom_pc_box = {
+                        "CUSTOM_PC": {
+                            "left": float(pc_left),
+                            "top": float(pc_top),
+                            "right": float(pc_right),
+                            "bottom": float(pc_bottom),
+                        }
+                    }
 
-                st.markdown("#### OCR確認用画像（任意）")
-                preview = st.file_uploader("画像をアップロードするとプレビュー表示します", type=["png", "jpg", "jpeg"], key="help_ocr_preview")
-                if preview is not None:
-                    try:
-                        img = Image.open(preview)
-                        st.image(img, caption="OCR確認画像", use_container_width=True)
-                        w, h = img.size
-                        st.caption(f"画像サイズ: {w} x {h}")
-                    except Exception:
-                        st.warning("画像のプレビューに失敗しました。")
+                    smartvault_boxes = AppConfig.SMARTVAULT_BOXES_MOBILE
 
-                st.markdown("#### 座標設定（PC）")
-                c1, c2, c3, c4 = st.columns(4)
-                pc_left = c1.number_input(
-                    "Crop_Left_Ratio_PC",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=float(row_setting.get("Crop_Left_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Left_Ratio_PC"])),
-                    step=0.01,
-                    key=f"help_pc_left_{ocr_project}",
-                )
-                pc_top = c2.number_input(
-                    "Crop_Top_Ratio_PC",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=float(row_setting.get("Crop_Top_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Top_Ratio_PC"])),
-                    step=0.01,
-                    key=f"help_pc_top_{ocr_project}",
-                )
-                pc_right = c3.number_input(
-                    "Crop_Right_Ratio_PC",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=float(row_setting.get("Crop_Right_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Right_Ratio_PC"])),
-                    step=0.01,
-                    key=f"help_pc_right_{ocr_project}",
-                )
-                pc_bottom = c4.number_input(
-                    "Crop_Bottom_Ratio_PC",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=float(row_setting.get("Crop_Bottom_Ratio_PC", AppConfig.OCR_DEFAULTS_PC["Crop_Bottom_Ratio_PC"])),
-                    step=0.01,
-                    key=f"help_pc_bottom_{ocr_project}",
-                )
+                    st.markdown("##### 元画像")
+                    st.image(file_bytes, caption="元画像", use_container_width=True)
 
-                st.markdown("#### 座標設定（Mobile）")
-                c5, c6, c7, c8 = st.columns(4)
-                mobile_left = c5.number_input(
-                    "Crop_Left_Ratio_Mobile",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=float(row_setting.get("Crop_Left_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Left_Ratio_Mobile"])),
-                    step=0.01,
-                    key=f"help_mobile_left_{ocr_project}",
-                )
-                mobile_top = c6.number_input(
-                    "Crop_Top_Ratio_Mobile",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=float(row_setting.get("Crop_Top_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Top_Ratio_Mobile"])),
-                    step=0.01,
-                    key=f"help_mobile_top_{ocr_project}",
-                )
-                mobile_right = c7.number_input(
-                    "Crop_Right_Ratio_Mobile",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=float(row_setting.get("Crop_Right_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Right_Ratio_Mobile"])),
-                    step=0.01,
-                    key=f"help_mobile_right_{ocr_project}",
-                )
-                mobile_bottom = c8.number_input(
-                    "Crop_Bottom_Ratio_Mobile",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=float(row_setting.get("Crop_Bottom_Ratio_Mobile", AppConfig.OCR_DEFAULTS_MOBILE["Crop_Bottom_Ratio_Mobile"])),
-                    step=0.01,
-                    key=f"help_mobile_bottom_{ocr_project}",
-                )
+                    st.markdown("##### SmartVault固定赤枠プレビュー")
+                    smart_boxed = U.draw_ocr_boxes(file_bytes, smartvault_boxes)
+                    st.image(smart_boxed, caption="SmartVault固定赤枠", use_container_width=True)
 
-                if st.button("OCR座標を保存", key=f"help_save_ocr_{ocr_project}", use_container_width=True):
-                    try:
-                        idx = settings_df[settings_df["Project_Name"] == ocr_project].index[0]
-                        settings_df.loc[idx, "Crop_Left_Ratio_PC"] = U.to_ratio(pc_left, AppConfig.OCR_DEFAULTS_PC["Crop_Left_Ratio_PC"])
-                        settings_df.loc[idx, "Crop_Top_Ratio_PC"] = U.to_ratio(pc_top, AppConfig.OCR_DEFAULTS_PC["Crop_Top_Ratio_PC"])
-                        settings_df.loc[idx, "Crop_Right_Ratio_PC"] = U.to_ratio(pc_right, AppConfig.OCR_DEFAULTS_PC["Crop_Right_Ratio_PC"])
-                        settings_df.loc[idx, "Crop_Bottom_Ratio_PC"] = U.to_ratio(pc_bottom, AppConfig.OCR_DEFAULTS_PC["Crop_Bottom_Ratio_PC"])
-                        settings_df.loc[idx, "Crop_Left_Ratio_Mobile"] = U.to_ratio(mobile_left, AppConfig.OCR_DEFAULTS_MOBILE["Crop_Left_Ratio_Mobile"])
-                        settings_df.loc[idx, "Crop_Top_Ratio_Mobile"] = U.to_ratio(mobile_top, AppConfig.OCR_DEFAULTS_MOBILE["Crop_Top_Ratio_Mobile"])
-                        settings_df.loc[idx, "Crop_Right_Ratio_Mobile"] = U.to_ratio(mobile_right, AppConfig.OCR_DEFAULTS_MOBILE["Crop_Right_Ratio_Mobile"])
-                        settings_df.loc[idx, "Crop_Bottom_Ratio_Mobile"] = U.to_ratio(mobile_bottom, AppConfig.OCR_DEFAULTS_MOBILE["Crop_Bottom_Ratio_Mobile"])
-                        settings_df.loc[idx, "UpdatedAt_JST"] = U.fmt_dt(U.now_jst())
-                        self.repo.write_settings(settings_df)
-                        self.store.persist_and_refresh()
-                        st.success("OCR設定を保存しました。")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"OCR設定保存でエラー: {e}")
+                    st.markdown("##### あなたのMobile座標 赤枠プレビュー")
+                    mobile_boxed = U.draw_ocr_boxes(file_bytes, custom_mobile_box)
+                    st.image(mobile_boxed, caption="現在のMobile設定", use_container_width=True)
+
+                    st.markdown("##### あなたのPC座標 赤枠プレビュー")
+                    pc_boxed = U.draw_ocr_boxes(file_bytes, custom_pc_box)
+                    st.image(pc_boxed, caption="現在のPC設定", use_container_width=True)
+
+                except Exception as e:
+                    st.error(f"赤枠プレビュー表示でエラー: {e}")
+
+            if st.button("OCR座標を保存", key=f"help_save_ocr_{ocr_project}", use_container_width=True):
+                try:
+                    idx = settings_df[settings_df["Project_Name"] == ocr_project].index[0]
+                    settings_df.loc[idx, "Crop_Left_Ratio_PC"] = U.to_ratio(pc_left, AppConfig.OCR_DEFAULTS_PC["Crop_Left_Ratio_PC"])
+                    settings_df.loc[idx, "Crop_Top_Ratio_PC"] = U.to_ratio(pc_top, AppConfig.OCR_DEFAULTS_PC["Crop_Top_Ratio_PC"])
+                    settings_df.loc[idx, "Crop_Right_Ratio_PC"] = U.to_ratio(pc_right, AppConfig.OCR_DEFAULTS_PC["Crop_Right_Ratio_PC"])
+                    settings_df.loc[idx, "Crop_Bottom_Ratio_PC"] = U.to_ratio(pc_bottom, AppConfig.OCR_DEFAULTS_PC["Crop_Bottom_Ratio_PC"])
+
+                    settings_df.loc[idx, "Crop_Left_Ratio_Mobile"] = U.to_ratio(mobile_left, AppConfig.OCR_DEFAULTS_MOBILE["Crop_Left_Ratio_Mobile"])
+                    settings_df.loc[idx, "Crop_Top_Ratio_Mobile"] = U.to_ratio(mobile_top, AppConfig.OCR_DEFAULTS_MOBILE["Crop_Top_Ratio_Mobile"])
+                    settings_df.loc[idx, "Crop_Right_Ratio_Mobile"] = U.to_ratio(mobile_right, AppConfig.OCR_DEFAULTS_MOBILE["Crop_Right_Ratio_Mobile"])
+                    settings_df.loc[idx, "Crop_Bottom_Ratio_Mobile"] = U.to_ratio(mobile_bottom, AppConfig.OCR_DEFAULTS_MOBILE["Crop_Bottom_Ratio_Mobile"])
+                    settings_df.loc[idx, "UpdatedAt_JST"] = U.fmt_dt(U.now_jst())
+
+                    self.repo.write_settings(settings_df)
+                    self.store.persist_and_refresh()
+                    st.success("OCR設定を保存しました。")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"OCR設定保存でエラー: {e}")
 
 
 # =========================================================
