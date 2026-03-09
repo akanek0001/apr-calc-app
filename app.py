@@ -47,6 +47,7 @@ class AppConfig:
         "LEDGER": "Ledger",
         "LINEUSERS": "LineUsers",
         "APR_SUMMARY": "APR_Summary",
+        "SMARTVAULT_HISTORY": "SmartVault_History",
     }
 
     HEADERS = {
@@ -91,6 +92,21 @@ class AppConfig:
         ],
         "LINEUSERS": ["Date", "Time", "Type", "Line_User_ID", "Line_User"],
         "APR_SUMMARY": ["Date_JST", "PersonName", "Total_APR", "APR_Count", "Asset_Ratio", "LINE_DisplayName"],
+        "SMARTVAULT_HISTORY": [
+            "Datetime_JST",
+            "Project_Name",
+            "Liquidity",
+            "Yesterday_Profit",
+            "APR",
+            "Source_Mode",
+            "OCR_Liquidity",
+            "OCR_Yesterday_Profit",
+            "OCR_APR",
+            "Evidence_URL",
+            "Admin_Name",
+            "Admin_Namespace",
+            "Note",
+        ],
     }
 
     PAGE = {
@@ -125,7 +141,6 @@ class AppConfig:
         "Crop_Bottom_Ratio_Mobile": 0.355,
     }
 
-    # SmartVaultモバイル専用 固定OCRボックス
     SMARTVAULT_BOXES_MOBILE = {
         "TOTAL_LIQUIDITY": {"left": 0.05, "top": 0.25, "right": 0.40, "bottom": 0.34},
         "YESTERDAY_PROFIT": {"left": 0.41, "top": 0.25, "right": 0.69, "bottom": 0.34},
@@ -346,6 +361,7 @@ class U:
             return []
 
         norm = str(text)
+
         replace_map = {
             "％": "%",
             "O": "0",
@@ -403,8 +419,11 @@ class U:
             return []
 
         norm = str(text)
+
         replace_map = {
             "＄": "$",
+            "，": ",",
+            "。": ".",
             "O": "0",
             "o": "0",
             "Q": "0",
@@ -414,14 +433,15 @@ class U:
             "|": "1",
             "S": "5",
             "s": "5",
-            ",": ".",
         }
         for k, v in replace_map.items():
             norm = norm.replace(k, v)
 
+        norm = re.sub(r"[ \t\u3000]+", " ", norm)
+
         patterns = [
-            r"\$(\d+(?:\.\d+)?)",
-            r"(\d{1,10}\.\d{1,4})",
+            r"\$?\s*(\d{1,3}(?:,\d{3})+(?:\.\d+)?)",
+            r"\$?\s*(\d+\.\d+)",
         ]
 
         vals: List[float] = []
@@ -430,7 +450,7 @@ class U:
         for pat in patterns:
             for v in re.findall(pat, norm):
                 try:
-                    f = float(v)
+                    f = float(str(v).replace(",", ""))
                     if 0 <= f <= 1000000000:
                         key = round(f, 6)
                         if key not in seen:
@@ -442,10 +462,27 @@ class U:
         return vals
 
     @staticmethod
-    def pick_best_usd(vals: List[float], expected: float) -> Optional[float]:
+    def pick_total_liquidity(vals: List[float]) -> Optional[float]:
         if not vals:
             return None
-        return sorted(vals, key=lambda x: abs(float(x) - float(expected)))[0]
+        positives = [float(v) for v in vals if float(v) > 0]
+        if not positives:
+            return None
+        return max(positives)
+
+    @staticmethod
+    def pick_yesterday_profit(vals: List[float]) -> Optional[float]:
+        if not vals:
+            return None
+
+        candidates = [float(v) for v in vals if float(v) >= 0]
+        if not candidates:
+            return None
+
+        small_first = [v for v in candidates if v <= 1000000]
+        if small_first:
+            return sorted(small_first)[0] if len(small_first) == 1 else min(small_first, key=lambda x: len(str(int(x))))
+        return min(candidates)
 
     @staticmethod
     def draw_ocr_boxes(file_bytes: bytes, boxes: Dict[str, Dict[str, float]]) -> bytes:
@@ -468,6 +505,28 @@ class U:
             return buf.getvalue()
         except Exception:
             return file_bytes
+
+    @staticmethod
+    def detect_source_mode(
+        final_liquidity: float,
+        final_profit: float,
+        final_apr: float,
+        ocr_liquidity: Optional[float],
+        ocr_profit: Optional[float],
+        ocr_apr: Optional[float],
+    ) -> str:
+        has_ocr = any(v is not None for v in [ocr_liquidity, ocr_profit, ocr_apr])
+        if not has_ocr:
+            return "manual"
+
+        def same(a: Optional[float], b: float) -> bool:
+            if a is None:
+                return False
+            return abs(float(a) - float(b)) < 1e-9
+
+        if same(ocr_liquidity, final_liquidity) and same(ocr_profit, final_profit) and same(ocr_apr, final_apr):
+            return "ocr"
+        return "ocr+manual"
 
 
 # =========================================================
@@ -541,6 +600,10 @@ class AdminAuth:
         name = str(st.session_state.get("admin_name", "")).strip() or "Admin"
         ns = str(st.session_state.get("admin_namespace", "")).strip() or "default"
         return f"{name}（namespace: {ns}）"
+
+    @staticmethod
+    def current_name() -> str:
+        return str(st.session_state.get("admin_name", "")).strip() or "Admin"
 
     @staticmethod
     def current_namespace() -> str:
@@ -670,6 +733,7 @@ class SheetNames:
     LEDGER: str
     LINEUSERS: str
     APR_SUMMARY: str
+    SMARTVAULT_HISTORY: str
 
 
 class GSheetService:
@@ -682,6 +746,7 @@ class GSheetService:
             LEDGER=U.sheet_name(AppConfig.SHEET["LEDGER"], namespace),
             LINEUSERS=U.sheet_name(AppConfig.SHEET["LINEUSERS"], namespace),
             APR_SUMMARY=U.sheet_name(AppConfig.SHEET["APR_SUMMARY"], namespace),
+            SMARTVAULT_HISTORY=U.sheet_name(AppConfig.SHEET["SMARTVAULT_HISTORY"], namespace),
         )
 
         con = st.secrets.get("connections", {}).get("gsheets", {})
@@ -697,7 +762,10 @@ class GSheetService:
         self.gc = gspread.authorize(creds)
         self.book = self.gc.open_by_key(self.spreadsheet_id)
 
-        ensure_key = f"_sheet_ensured_{self.names.SETTINGS}_{self.names.MEMBERS}_{self.names.LEDGER}_{self.names.LINEUSERS}_{self.names.APR_SUMMARY}"
+        ensure_key = (
+            f"_sheet_ensured_{self.names.SETTINGS}_{self.names.MEMBERS}_{self.names.LEDGER}_"
+            f"{self.names.LINEUSERS}_{self.names.APR_SUMMARY}_{self.names.SMARTVAULT_HISTORY}"
+        )
         if not st.session_state.get(ensure_key, False):
             for key in AppConfig.HEADERS:
                 self.ensure_sheet(key)
@@ -1058,6 +1126,41 @@ class Repository:
             [dt_jst, project, person_name, typ, float(amount), note, evidence_url or "", line_user_id or "", line_display_name or "", source],
         )
 
+    def append_smartvault_history(
+        self,
+        dt_jst: str,
+        project: str,
+        liquidity: float,
+        yesterday_profit: float,
+        apr: float,
+        source_mode: str,
+        ocr_liquidity: Optional[float],
+        ocr_yesterday_profit: Optional[float],
+        ocr_apr: Optional[float],
+        evidence_url: str,
+        admin_name: str,
+        admin_namespace: str,
+        note: str = "",
+    ) -> None:
+        self.gs.append_row(
+            "SMARTVAULT_HISTORY",
+            [
+                dt_jst,
+                project,
+                float(liquidity),
+                float(yesterday_profit),
+                float(apr),
+                str(source_mode),
+                "" if ocr_liquidity is None else float(ocr_liquidity),
+                "" if ocr_yesterday_profit is None else float(ocr_yesterday_profit),
+                "" if ocr_apr is None else float(ocr_apr),
+                evidence_url or "",
+                admin_name or "",
+                admin_namespace or "",
+                note or "",
+            ],
+        )
+
     def active_projects(self, settings_df: pd.DataFrame) -> List[str]:
         if settings_df.empty:
             return []
@@ -1314,8 +1417,8 @@ class AppUI:
         profit_vals = U.extract_usd_candidates(profit_text)
         apr_vals = U.extract_percent_candidates(apr_text)
 
-        total_liquidity = U.pick_best_usd(total_vals, 50000.0)
-        yesterday_profit = U.pick_best_usd(profit_vals, 100.0)
+        total_liquidity = U.pick_total_liquidity(total_vals)
+        yesterday_profit = U.pick_yesterday_profit(profit_vals)
         apr_value = apr_vals[0] if apr_vals else None
 
         boxed_preview = U.draw_ocr_boxes(file_bytes, boxes)
@@ -1325,6 +1428,9 @@ class AppUI:
             "total_text": total_text,
             "profit_text": profit_text,
             "apr_text": apr_text,
+            "total_vals": total_vals,
+            "profit_vals": profit_vals,
+            "apr_vals": apr_vals,
             "total_liquidity": total_liquidity,
             "yesterday_profit": yesterday_profit,
             "apr_value": apr_value,
@@ -1422,27 +1528,47 @@ class AppUI:
         project = st.selectbox("基準プロジェクト", projects)
         send_scope = st.radio("送信対象", ["選択中プロジェクトのみ", "全有効プロジェクト"], horizontal=True)
 
-        st.markdown("#### 本日のAPR要素（単純合算）")
-        c1, c2 = st.columns(2)
+        st.markdown("#### 流動性 / 昨日の収益 / APR（別取得・手動設定可）")
+        c1, c2, c3 = st.columns(3)
         with c1:
-            apr1_raw = st.text_input("APR要素1（%）", value=st.session_state.get("apr1", ""), key="apr1")
-            apr2_raw = st.text_input("APR要素2（%）", value=st.session_state.get("apr2", ""), key="apr2")
-            apr3_raw = st.text_input("APR要素3（%）", value=st.session_state.get("apr3", ""), key="apr3")
+            total_liquidity_raw = st.text_input(
+                "流動性（手動設定可）",
+                value=st.session_state.get("sv_total_liquidity", ""),
+                key="sv_total_liquidity",
+                placeholder="$78,354.35",
+            )
         with c2:
-            apr4_raw = st.text_input("APR要素4（%）", value=st.session_state.get("apr4", ""), key="apr4")
-            apr5_raw = st.text_input("APR要素5（%）", value=st.session_state.get("apr5", ""), key="apr5")
+            yesterday_profit_raw = st.text_input(
+                "昨日の収益（手動設定可）",
+                value=st.session_state.get("sv_yesterday_profit", ""),
+                key="sv_yesterday_profit",
+                placeholder="$90.87",
+            )
+        with c3:
+            apr_raw = st.text_input(
+                "APR（%・手動設定可）",
+                value=st.session_state.get("sv_apr", ""),
+                key="sv_apr",
+                placeholder="42.33",
+            )
 
-        apr1 = U.apr_val(apr1_raw)
-        apr2 = U.apr_val(apr2_raw)
-        apr3 = U.apr_val(apr3_raw)
-        apr4 = U.apr_val(apr4_raw)
-        apr5 = U.apr_val(apr5_raw)
-        apr = float(apr1 + apr2 + apr3 + apr4 + apr5)
-        st.info(f"最終APR = {apr1:.4f} + {apr2:.4f} + {apr3:.4f} + {apr4:.4f} + {apr5:.4f} = {apr:.4f}%")
+        total_liquidity = U.to_f(total_liquidity_raw)
+        yesterday_profit = U.to_f(yesterday_profit_raw)
+        apr = U.apr_val(apr_raw)
+
+        ocr_liquidity = st.session_state.get("ocr_total_liquidity")
+        ocr_yesterday_profit = st.session_state.get("ocr_yesterday_profit")
+        ocr_apr = st.session_state.get("ocr_apr")
+
+        st.info(
+            f"流動性 = {U.fmt_usd(total_liquidity)} / "
+            f"昨日の収益 = {U.fmt_usd(yesterday_profit)} / "
+            f"最終APR = {apr:.4f}%"
+        )
 
         uploaded = st.file_uploader("エビデンス画像（任意）", type=["png", "jpg", "jpeg"], key="apr_img")
 
-        if uploaded is not None and st.button("OCRで%候補を抽出"):
+        if uploaded is not None and st.button("OCRで別取得"):
             file_bytes = uploaded.getvalue()
 
             crop_left_ratio = AppConfig.OCR_DEFAULTS_PC["Crop_Left_Ratio_PC"]
@@ -1497,7 +1623,6 @@ class AppUI:
                 crop_right_ratio=crop_right_ratio,
                 crop_bottom_ratio=crop_bottom_ratio,
             )
-            candidates = U.extract_percent_candidates(raw_text)
 
             if raw_text:
                 with st.expander("OCR生テキスト（通常範囲）", expanded=False):
@@ -1516,9 +1641,9 @@ class AppUI:
                 c_a, c_b, c_c = st.columns(3)
                 with c_a:
                     if smart["total_liquidity"] is not None:
-                        st.success(f"総流動性: {U.fmt_usd(float(smart['total_liquidity']))}")
+                        st.success(f"流動性: {U.fmt_usd(float(smart['total_liquidity']))}")
                     else:
-                        st.warning("総流動性: 未検出")
+                        st.warning("流動性: 未検出")
 
                 with c_b:
                     if smart["yesterday_profit"] is not None:
@@ -1533,7 +1658,7 @@ class AppUI:
                         st.warning("APR: 未検出")
 
                 st.caption(
-                    f"総流動性範囲 left={smart['boxes']['TOTAL_LIQUIDITY']['left']:.2f}, top={smart['boxes']['TOTAL_LIQUIDITY']['top']:.2f}, right={smart['boxes']['TOTAL_LIQUIDITY']['right']:.2f}, bottom={smart['boxes']['TOTAL_LIQUIDITY']['bottom']:.2f}"
+                    f"流動性範囲 left={smart['boxes']['TOTAL_LIQUIDITY']['left']:.2f}, top={smart['boxes']['TOTAL_LIQUIDITY']['top']:.2f}, right={smart['boxes']['TOTAL_LIQUIDITY']['right']:.2f}, bottom={smart['boxes']['TOTAL_LIQUIDITY']['bottom']:.2f}"
                 )
                 st.caption(
                     f"昨日の収益範囲 left={smart['boxes']['YESTERDAY_PROFIT']['left']:.2f}, top={smart['boxes']['YESTERDAY_PROFIT']['top']:.2f}, right={smart['boxes']['YESTERDAY_PROFIT']['right']:.2f}, bottom={smart['boxes']['YESTERDAY_PROFIT']['bottom']:.2f}"
@@ -1542,34 +1667,34 @@ class AppUI:
                     f"APR範囲 left={smart['boxes']['APR']['left']:.2f}, top={smart['boxes']['APR']['top']:.2f}, right={smart['boxes']['APR']['right']:.2f}, bottom={smart['boxes']['APR']['bottom']:.2f}"
                 )
 
-                with st.expander("OCR生テキスト（総流動性）", expanded=False):
+                with st.expander("OCR生テキスト（流動性）", expanded=False):
                     st.text(smart["total_text"] or "")
                 with st.expander("OCR生テキスト（昨日の収益）", expanded=False):
                     st.text(smart["profit_text"] or "")
                 with st.expander("OCR生テキスト（APR）", expanded=False):
                     st.text(smart["apr_text"] or "")
 
+                if smart["total_liquidity"] is not None:
+                    st.session_state["sv_total_liquidity"] = f"{float(smart['total_liquidity']):,.2f}"
+                    st.session_state["ocr_total_liquidity"] = float(smart["total_liquidity"])
+                if smart["yesterday_profit"] is not None:
+                    st.session_state["sv_yesterday_profit"] = f"{float(smart['yesterday_profit']):,.2f}"
+                    st.session_state["ocr_yesterday_profit"] = float(smart["yesterday_profit"])
                 if smart["apr_value"] is not None:
-                    st.session_state["apr1"] = str(float(smart["apr_value"]))
-                    st.info(f"APR要素1へ自動反映: {float(smart['apr_value']):.2f}%")
-                    st.rerun()
-                elif candidates:
-                    best = candidates[0]
+                    st.session_state["sv_apr"] = f"{float(smart['apr_value']):.4f}"
+                    st.session_state["ocr_apr"] = float(smart["apr_value"])
+
+                st.rerun()
+            else:
+                apr_candidates = U.extract_percent_candidates(raw_text)
+                if apr_candidates:
+                    best = apr_candidates[0]
                     st.success(f"通常OCRからAPR候補を検出: {best}%")
-                    st.session_state["apr1"] = str(best)
+                    st.session_state["sv_apr"] = f"{float(best):.4f}"
+                    st.session_state["ocr_apr"] = float(best)
                     st.rerun()
                 else:
                     st.warning("APR候補は見つかりませんでした。")
-            else:
-                if candidates:
-                    st.success("OCRで%候補を抽出しました。")
-                    st.write("候補:", candidates)
-                    best = candidates[0]
-                    st.info(f"最有力候補: {best}%")
-                    st.session_state["apr1"] = str(best)
-                    st.rerun()
-                else:
-                    st.warning("％付きの数値候補は見つかりませんでした。")
 
         target_projects = projects if send_scope == "全有効プロジェクト" else [project]
         today_key = U.fmt_date(U.now_jst())
@@ -1607,6 +1732,9 @@ class AppUI:
                         "DailyAPR": U.fmt_usd(float(r["DailyAPR"])),
                         "Line_User_ID": str(r["Line_User_ID"]).strip(),
                         "LINE_DisplayName": str(r["LINE_DisplayName"]).strip(),
+                        "流動性": U.fmt_usd(float(total_liquidity)),
+                        "昨日の収益": U.fmt_usd(float(yesterday_profit)),
+                        "APR": f"{apr:.4f}%",
                         "本日APR状態": "本日記録済み" if is_done else "未記録",
                     }
                 )
@@ -1639,6 +1767,7 @@ class AppUI:
             st.markdown(
                 f"""
 **本日対象サマリー**  
+流動性: **{U.fmt_usd(total_liquidity)}**　/　昨日の収益: **{U.fmt_usd(yesterday_profit)}**　/　最終APR: **{apr:.4f}%**  
 総投資額: **{U.fmt_usd(total_principal)}**　/　APR合計: **{U.fmt_usd(total_reward)}**　/　実効APR: **{apr_percent_display:.4f}%**
 """
             )
@@ -1648,6 +1777,10 @@ class AppUI:
 
         if st.button("APRを確定して対象全員にLINE送信"):
             try:
+                if apr <= 0:
+                    st.warning("APRが0以下です。")
+                    return
+
                 evidence_url = None
                 if uploaded:
                     evidence_url = ExternalService.upload_imgbb(uploaded.getvalue())
@@ -1655,11 +1788,36 @@ class AppUI:
                         st.error("画像アップロードに失敗しました。")
                         return
 
+                source_mode = U.detect_source_mode(
+                    final_liquidity=float(total_liquidity),
+                    final_profit=float(yesterday_profit),
+                    final_apr=float(apr),
+                    ocr_liquidity=st.session_state.get("ocr_total_liquidity"),
+                    ocr_profit=st.session_state.get("ocr_yesterday_profit"),
+                    ocr_apr=st.session_state.get("ocr_apr"),
+                )
+
                 ts = U.fmt_dt(U.now_jst())
                 apr_ledger_count, line_log_count, success, fail, skip_count = 0, 0, 0, 0, 0
                 existing_apr_keys = self.repo.existing_apr_keys_for_date(today_key)
                 token = ExternalService.get_line_token(AdminAuth.current_namespace())
                 daily_add_map: Dict[Tuple[str, str], float] = {}
+
+                self.repo.append_smartvault_history(
+                    dt_jst=ts,
+                    project=project,
+                    liquidity=float(total_liquidity),
+                    yesterday_profit=float(yesterday_profit),
+                    apr=float(apr),
+                    source_mode=source_mode,
+                    ocr_liquidity=st.session_state.get("ocr_total_liquidity"),
+                    ocr_yesterday_profit=st.session_state.get("ocr_yesterday_profit"),
+                    ocr_apr=st.session_state.get("ocr_apr"),
+                    evidence_url=evidence_url or "",
+                    admin_name=AdminAuth.current_name(),
+                    admin_namespace=AdminAuth.current_namespace(),
+                    note="APR確定時に保存",
+                )
 
                 for p in target_projects:
                     row = settings_df[settings_df["Project_Name"] == str(p)].iloc[0]
@@ -1682,7 +1840,13 @@ class AppUI:
                             skip_count += 1
                             continue
 
-                        note = f"APR:{apr}%, Mode:{r['CalcMode']}, Rank:{r['Rank']}, Factor:{r['Factor']}, CompoundTiming:{compound_timing}"
+                        note = (
+                            f"APR:{apr}%, "
+                            f"Liquidity:{total_liquidity}, "
+                            f"YesterdayProfit:{yesterday_profit}, "
+                            f"SourceMode:{source_mode}, "
+                            f"Mode:{r['CalcMode']}, Rank:{r['Rank']}, Factor:{r['Factor']}, CompoundTiming:{compound_timing}"
+                        )
                         self.repo.append_ledger(ts, p, person, AppConfig.TYPE["APR"], daily_apr, note, evidence_url or "", uid, disp)
                         existing_apr_keys.add(apr_key)
                         apr_ledger_count += 1
@@ -1697,7 +1861,9 @@ class AppUI:
                             "🏦【APR収益報告】\n"
                             f"{person} 様\n"
                             f"報告日時: {U.now_jst().strftime('%Y/%m/%d %H:%M')}\n"
-                            f"APR: {apr:.1f}%\n"
+                            f"流動性: {U.fmt_usd(total_liquidity)}\n"
+                            f"昨日の収益: {U.fmt_usd(yesterday_profit)}\n"
+                            f"APR: {apr:.4f}%\n"
                             f"本日配当: {U.fmt_usd(daily_apr)}\n"
                             f"現在運用額: {U.fmt_usd(current_principal)}\n"
                             f"複利タイプ: {U.compound_label(compound_timing)}\n"
@@ -1710,7 +1876,12 @@ class AppUI:
                             code, line_note = 0, "LINE未送信: Line_User_IDなし"
                         else:
                             code = ExternalService.send_line_push(token, uid, personalized_msg, evidence_url)
-                            line_note = f"HTTP:{code}, APR:{apr}%, CompoundTiming:{compound_timing}"
+                            line_note = (
+                                f"HTTP:{code}, "
+                                f"Liquidity:{total_liquidity}, "
+                                f"YesterdayProfit:{yesterday_profit}, "
+                                f"APR:{apr}%, SourceMode:{source_mode}, CompoundTiming:{compound_timing}"
+                            )
 
                         self.repo.append_ledger(ts, p, person, AppConfig.TYPE["LINE"], 0, line_note, evidence_url or "", uid, disp)
                         line_log_count += 1
@@ -2135,11 +2306,12 @@ class AppUI:
         with st.expander("1. 現在の接続情報", expanded=False):
             st.code(
                 f"""参照シート
-Settings     = {gs.names.SETTINGS}
-Members      = {gs.names.MEMBERS}
-Ledger       = {gs.names.LEDGER}
-LineUsers    = {gs.names.LINEUSERS}
-APR_Summary  = {gs.names.APR_SUMMARY}
+Settings           = {gs.names.SETTINGS}
+Members            = {gs.names.MEMBERS}
+Ledger             = {gs.names.LEDGER}
+LineUsers          = {gs.names.LINEUSERS}
+APR_Summary        = {gs.names.APR_SUMMARY}
+SmartVault_History = {gs.names.SMARTVAULT_HISTORY}
 
 Spreadsheet ID
 {gs.spreadsheet_id}
@@ -2160,6 +2332,8 @@ Spreadsheet URL
             st.code("\t".join(AppConfig.HEADERS["LINEUSERS"]))
             st.markdown("### APR Summary")
             st.code("\t".join(AppConfig.HEADERS["APR_SUMMARY"]))
+            st.markdown("### SmartVault_History")
+            st.code("\t".join(AppConfig.HEADERS["SMARTVAULT_HISTORY"]))
 
         with st.expander("3. Compound_Timing の意味", expanded=False):
             st.markdown(
@@ -2178,18 +2352,28 @@ Spreadsheet URL
         with st.expander("4. APR計算ロジック", expanded=False):
             st.markdown(
                 """
-### APRの決め方
-本日の最終APRは、APR要素1〜5を単純合算して決めます。
+### 入力項目
+APR画面では以下を管理します。
 
-`最終APR = APR1 + APR2 + APR3 + APR4 + APR5`
+- 流動性
+- 昨日の収益
+- APR
+
+いずれも手動入力できます。画像を入れた場合は OCRで別取得 もできます。
 
 ### OCR
-Smart Vault画面は PC / Mobile 別の比率座標で APR領域を切り抜いて OCR.space に送っています。
-さらにモバイル画面では SmartVault専用に
+Smart Vaultモバイル画面では固定ボックスで
 - 総流動性
 - 昨日の収益
 - APR
-をピンポイントOCRできます。
+を別々にOCRしています。
+
+### SmartVault履歴
+APR確定時に `SmartVault_History` シートへ
+- 最終採用値
+- OCR取得値
+- Source_Mode（manual / ocr / ocr+manual）
+を保存します。
 
 ### PERSONAL
 個人ごとの元本で計算します。
