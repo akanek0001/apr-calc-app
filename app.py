@@ -1829,7 +1829,18 @@ class AppUI:
                 ts = U.fmt_dt(U.now_jst())
                 apr_ledger_count, line_log_count, success, fail, skip_count = 0, 0, 0, 0, 0
                 existing_apr_keys = self.repo.existing_apr_keys_for_date(today_key)
-                token = ExternalService.get_line_token(AdminAuth.current_namespace())
+               
+                
+                
+                
+                
+                #token = ExternalService.get_line_token(AdminAuth.current_namespace())#
+token = ExternalService.get_line_token("A")
+
+
+
+
+                
                 daily_add_map: Dict[Tuple[str, str], float] = {}
 
                 self.repo.append_smartvault_history(
@@ -2017,7 +2028,14 @@ class AppUI:
                 )
                 self.repo.write_members(members_df)
 
-                token = ExternalService.get_line_token(AdminAuth.current_namespace())
+                #token = ExternalService.get_line_token(AdminAuth.current_namespace())#
+token = ExternalService.get_line_token("A")
+
+
+
+
+
+                
                 uid = str(row["Line_User_ID"]).strip()
                 msg = (
                     "💸【入出金通知】\n"
@@ -2120,7 +2138,13 @@ class AppUI:
                         st.error("画像アップロードに失敗しました。")
                         return
 
-                    token = ExternalService.get_line_token(AdminAuth.current_namespace())
+                   # token = ExternalService.get_line_token(AdminAuth.current_namespace())#
+token = ExternalService.get_line_token("A")
+
+
+
+
+                    
                     label_to_row = {label_row(cand.loc[i]): cand.loc[i] for i in range(len(cand))}
                     success, fail, failed_list, ts, line_log_count = 0, 0, [], U.fmt_dt(U.now_jst()), 0
 
