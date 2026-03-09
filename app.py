@@ -617,46 +617,18 @@ class AdminAuth:
 class ExternalService:
     @staticmethod
     def get_line_token(ns: str) -> str:
-        try:
-            tokens = st.secrets["line"]["tokens"]
-            if ns in tokens:
-                return str(tokens[ns]).strip()
-            return ""
-        except Exception:
-            return ""
+        line = st.secrets.get("line", {}) or {}
+        tokens = line.get("tokens")
+        if tokens:
+            tok = str(tokens.get(ns, "")).strip()
+            if tok:
+                return tok
+        legacy = str(line.get("channel_access_token", "")).strip()
+        if legacy:
+            return legacy
+        st.error("LINEトークンが未設定です。")
+        st.stop()
 
-    @staticmethod
-    def send_line_push(token: str, user_id: str, text: str, image_url: Optional[str] = None) -> int:
-        if not user_id:
-            return 400
-
-        url = "https://api.line.me/v2/bot/message/push"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-        }
-
-        messages = [{"type": "text", "text": text}]
-        if image_url:
-            messages.append({
-                "type": "image",
-                "originalContentUrl": image_url,
-                "previewImageUrl": image_url,
-            })
-
-        data = {
-            "to": str(user_id),
-            "messages": messages,
-        }
-
-        try:
-            r = requests.post(url, headers=headers, json=data, timeout=25)
-            return r.status_code
-        except Exception:
-            return 500
-# =========================================================
-# EXTERNAL SERVICE  変更部分
-# =========================================================
     @staticmethod
     def send_line_push(token: str, user_id: str, text: str, image_url: Optional[str] = None) -> int:
         if not user_id:
@@ -1829,18 +1801,7 @@ class AppUI:
                 ts = U.fmt_dt(U.now_jst())
                 apr_ledger_count, line_log_count, success, fail, skip_count = 0, 0, 0, 0, 0
                 existing_apr_keys = self.repo.existing_apr_keys_for_date(today_key)
-               
-                
-                
-                
-                
-                #token = ExternalService.get_line_token(AdminAuth.current_namespace())#
-token = ExternalService.get_line_token("A")
-
-
-
-
-                
+                token = ExternalService.get_line_token(AdminAuth.current_namespace())
                 daily_add_map: Dict[Tuple[str, str], float] = {}
 
                 self.repo.append_smartvault_history(
@@ -2028,14 +1989,7 @@ token = ExternalService.get_line_token("A")
                 )
                 self.repo.write_members(members_df)
 
-                #token = ExternalService.get_line_token(AdminAuth.current_namespace())#
-token = ExternalService.get_line_token("A")
-
-
-
-
-
-                
+                token = ExternalService.get_line_token(AdminAuth.current_namespace())
                 uid = str(row["Line_User_ID"]).strip()
                 msg = (
                     "💸【入出金通知】\n"
@@ -2138,13 +2092,7 @@ token = ExternalService.get_line_token("A")
                         st.error("画像アップロードに失敗しました。")
                         return
 
-                   # token = ExternalService.get_line_token(AdminAuth.current_namespace())#
-token = ExternalService.get_line_token("A")
-
-
-
-
-                    
+                    token = ExternalService.get_line_token(AdminAuth.current_namespace())
                     label_to_row = {label_row(cand.loc[i]): cand.loc[i] for i in range(len(cand))}
                     success, fail, failed_list, ts, line_log_count = 0, 0, [], U.fmt_dt(U.now_jst()), 0
 
