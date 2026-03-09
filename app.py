@@ -76,6 +76,7 @@ class AppConfig:
             "Rank",
             "IsActive",
             "CreatedAt_JST",
+            
             "UpdatedAt_JST",
         ],
         "LEDGER": [
@@ -616,18 +617,46 @@ class AdminAuth:
 class ExternalService:
     @staticmethod
     def get_line_token(ns: str) -> str:
-        line = st.secrets.get("line", {}) or {}
-        tokens = line.get("tokens")
-        if tokens:
-            tok = str(tokens.get(ns, "")).strip()
-            if tok:
-                return tok
-        legacy = str(line.get("channel_access_token", "")).strip()
-        if legacy:
-            return legacy
-        st.error("LINEトークンが未設定です。")
-        st.stop()
+        try:
+            tokens = st.secrets["line"]["tokens"]
+            if ns in tokens:
+                return str(tokens[ns]).strip()
+            return ""
+        except Exception:
+            return ""
 
+    @staticmethod
+    def send_line_push(token: str, user_id: str, text: str, image_url: Optional[str] = None) -> int:
+        if not user_id:
+            return 400
+
+        url = "https://api.line.me/v2/bot/message/push"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        }
+
+        messages = [{"type": "text", "text": text}]
+        if image_url:
+            messages.append({
+                "type": "image",
+                "originalContentUrl": image_url,
+                "previewImageUrl": image_url,
+            })
+
+        data = {
+            "to": str(user_id),
+            "messages": messages,
+        }
+
+        try:
+            r = requests.post(url, headers=headers, json=data, timeout=25)
+            return r.status_code
+        except Exception:
+            return 500
+# =========================================================
+# EXTERNAL SERVICE  変更部分
+# =========================================================
     @staticmethod
     def send_line_push(token: str, user_id: str, text: str, image_url: Optional[str] = None) -> int:
         if not user_id:
